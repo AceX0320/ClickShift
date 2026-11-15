@@ -536,11 +536,12 @@ def _install_win11_shell_extension() -> bool:
         cer_path = shell_dir / "ConFasShell.cer"
         manifest_path = shell_dir / "AppxManifest.xml"
 
-        # 1. Try direct registration without elevation first (succeeds if Developer Mode or cert already trusted)
-        direct_cmd = (
-            f'Add-AppxPackage -Path "{msix_path}" -ExternalLocation "{shell_dir}" -ForceApplicationShutdown -ErrorAction Stop'
+        # 1. Remove any stale version and try direct registration into WindowsApps first
+        prep_remove = 'Get-AppxPackage -Name "ConFas.ShellExtension" -ErrorAction SilentlyContinue | Remove-AppxPackage -ErrorAction SilentlyContinue; '
+        direct_cmd = prep_remove + (
+            f'Add-AppxPackage -Path "{msix_path}" -ForceApplicationShutdown -ErrorAction Stop'
             if msix_path.exists()
-            else f'Add-AppxPackage -Register "{manifest_path}" -ExternalLocation "{shell_dir}" -ForceApplicationShutdown -ErrorAction Stop'
+            else f'Add-AppxPackage -Register "{manifest_path}" -ForceApplicationShutdown -ErrorAction Stop'
         )
         r = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", direct_cmd],
@@ -598,16 +599,57 @@ def _remove_win11_shell_extension() -> None:
         pass
 
 
+def _purge_duplicate_class_verbs() -> None:
+    """Remove any ConFas* verbs from HKCU\\Software\\Classes\\<subkey>\\shell
+    (outside SystemFileAssociations) so the classic menu never shows duplicate entries.
+    """
+    if not IS_WINDOWS or winreg is None:
+        return
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Classes") as root:
+            subs: list[str] = []
+            i = 0
+            while True:
+                try:
+                    subs.append(winreg.EnumKey(root, i))
+                    i += 1
+                except OSError:
+                    break
+        for sub in subs:
+            if sub.lower() == "systemfileassociations":
+                continue
+            sh_path = rf"Software\Classes\{sub}\shell"
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, sh_path) as sh_key:
+                    verbs: list[str] = []
+                    j = 0
+                    while True:
+                        try:
+                            v = winreg.EnumKey(sh_key, j)
+                            j += 1
+                            if v.lower().startswith("confas"):
+                                verbs.append(v)
+                        except OSError:
+                            break
+                for v in verbs:
+                    _delete_key_tree(winreg.HKEY_CURRENT_USER, rf"{sh_path}\{v}")
+            except OSError:
+                continue
+    except Exception:
+        pass
+
+
 def install_context_menu(extensions: Optional[list[str]] = None) -> int:
     """Create the single expandable 'Convert with ConFas >' menu on both the
     Windows 11 primary context menu (via ConFasShell.dll IExplorerCommand) and
     the secondary classic menu (via cascading SubCommands), removing any
-    duplicate flat verb entries.
+    duplicate flat or ProgID verb entries.
     Returns number of extensions handled.
     """
     if not IS_WINDOWS:
         return 0
     _save_exe_path_registry()
+    _purge_duplicate_class_verbs()
     exts = extensions or MENU_EXTENSIONS
     n = 0
     for ext in exts:

@@ -33,21 +33,22 @@ struct ExtRule {
 };
 
 static const ExtRule kRules[] = {
-    {L"pdf",  L"docx", {L"docx", L"txt", L"md", L"html", L"png", L"jpg", L"webp", L"csv", L"odt", L"rtf", nullptr}},
-    {L"docx", L"pdf",  {L"pdf", L"txt", L"md", L"html", L"odt", L"rtf", nullptr}},
-    {L"doc",  L"docx", {L"docx", L"pdf", L"txt", L"md", L"html", L"odt", L"rtf", nullptr}},
+    {L"pdf",  L"docx", {L"docx", L"txt", L"md", L"html", L"csv", L"png", L"jpg", L"webp", L"odt", L"rtf", nullptr}},
+    {L"docx", L"pdf",  {L"pdf", L"txt", L"md", L"html", L"rtf", L"odt", nullptr}},
+    {L"doc",  L"docx", {L"pdf", L"docx", L"txt", L"md", L"html", L"rtf", L"odt", nullptr}},
     {L"odt",  L"docx", {L"docx", L"pdf", L"txt", L"md", L"html", L"rtf", nullptr}},
     {L"rtf",  L"docx", {L"docx", L"pdf", L"txt", L"md", L"html", L"odt", nullptr}},
-    {L"xlsx", L"pdf",  {L"pdf", L"csv", L"html", L"ods", nullptr}},
-    {L"xls",  L"xlsx", {L"xlsx", L"pdf", L"csv", L"html", L"ods", nullptr}},
-    {L"ods",  L"xlsx", {L"xlsx", L"pdf", L"csv", L"html", nullptr}},
+    {L"xlsx", L"pdf",  {L"pdf", L"csv", L"ods", L"txt", L"html", nullptr}},
+    {L"xls",  L"xlsx", {L"xlsx", L"pdf", L"csv", L"ods", L"txt", L"html", nullptr}},
+    {L"ods",  L"xlsx", {L"xlsx", L"pdf", L"csv", L"txt", L"html", nullptr}},
     {L"pptx", L"pdf",  {L"pdf", L"odp", nullptr}},
     {L"ppt",  L"pptx", {L"pptx", L"pdf", L"odp", nullptr}},
     {L"odp",  L"pptx", {L"pptx", L"pdf", nullptr}},
-    {L"csv",  L"xlsx", {L"xlsx", L"pdf", L"docx", L"html", L"txt", L"md", L"ods", nullptr}},
-    {L"tsv",  L"xlsx", {L"xlsx", L"csv", L"pdf", L"docx", L"html", L"txt", nullptr}},
+    {L"csv",  L"xlsx", {L"xlsx", L"pdf", L"ods", L"txt", L"html", L"docx", nullptr}},
+    {L"tsv",  L"xlsx", {L"xlsx", L"pdf", L"csv", L"ods", L"txt", L"html", nullptr}},
     {L"txt",  L"docx", {L"docx", L"pdf", L"md", L"html", L"rtf", L"odt", nullptr}},
     {L"md",   L"docx", {L"docx", L"pdf", L"html", L"txt", L"rtf", L"odt", nullptr}},
+    {L"markdown", L"docx", {L"docx", L"pdf", L"html", L"txt", L"rtf", L"odt", nullptr}},
     {L"rst",  L"docx", {L"docx", L"pdf", L"html", L"txt", L"md", nullptr}},
     {L"log",  L"txt",  {L"txt", L"docx", L"pdf", L"html", nullptr}},
     {L"html", L"docx", {L"docx", L"pdf", L"txt", L"md", L"odt", L"rtf", nullptr}},
@@ -58,19 +59,25 @@ static const ExtRule kRules[] = {
     {L"yml",  L"txt",  {L"txt", L"docx", L"pdf", L"html", L"md", nullptr}},
     {L"ini",  L"txt",  {L"txt", L"docx", L"pdf", L"html", nullptr}},
     {L"cfg",  L"txt",  {L"txt", L"docx", L"pdf", L"html", nullptr}},
-    {L"epub", L"docx", {L"docx", L"txt", L"html", L"md", L"pdf", nullptr}},
-    {L"png",  L"webp", {L"webp", L"jpg", L"pdf", L"avif", L"bmp", L"tiff", L"ico", L"gif", nullptr}},
-    {L"jpg",  L"webp", {L"webp", L"png", L"pdf", L"avif", L"bmp", L"tiff", L"ico", L"gif", nullptr}},
-    {L"jpeg", L"webp", {L"webp", L"png", L"pdf", L"avif", L"bmp", L"tiff", L"ico", L"gif", nullptr}},
-    {L"webp", L"png",  {L"png", L"jpg", L"pdf", L"avif", L"bmp", L"tiff", L"ico", L"gif", nullptr}},
-    {L"gif",  L"webp", {L"webp", L"png", L"jpg", L"pdf", L"bmp", L"tiff", nullptr}},
-    {L"bmp",  L"png",  {L"png", L"webp", L"jpg", L"pdf", L"tiff", L"ico", nullptr}},
-    {L"tif",  L"png",  {L"png", L"webp", L"jpg", L"pdf", L"bmp", nullptr}},
-    {L"tiff", L"png",  {L"png", L"webp", L"jpg", L"pdf", L"bmp", nullptr}},
-    {L"ico",  L"png",  {L"png", L"webp", L"jpg", L"bmp", nullptr}},
-    {L"avif", L"png",  {L"png", L"webp", L"jpg", L"pdf", nullptr}},
-    {L"heic", L"jpg",  {L"jpg", L"png", L"webp", L"pdf", nullptr}},
-    {L"jxl",  L"png",  {L"png", L"webp", L"jpg", L"pdf", nullptr}},
+    {L"epub", L"docx", {L"docx", L"pdf", L"txt", L"html", L"md", nullptr}},
+    {L"png",  L"webp", {L"webp", L"jpg", L"pdf", L"avif", L"jxl", L"tiff", L"bmp", L"ico", L"gif", nullptr}},
+    {L"jpg",  L"webp", {L"webp", L"png", L"pdf", L"avif", L"jxl", L"tiff", L"bmp", L"ico", L"gif", nullptr}},
+    {L"jpeg", L"webp", {L"webp", L"png", L"pdf", L"avif", L"jxl", L"tiff", L"bmp", L"ico", L"gif", nullptr}},
+    {L"webp", L"png",  {L"png", L"jpg", L"pdf", L"avif", L"jxl", L"tiff", L"bmp", L"ico", L"gif", nullptr}},
+    {L"gif",  L"webp", {L"webp", L"png", L"jpg", L"pdf", L"avif", L"jxl", L"tiff", L"bmp", L"ico", nullptr}},
+    {L"bmp",  L"png",  {L"png", L"webp", L"jpg", L"pdf", L"avif", L"jxl", L"tiff", L"ico", L"gif", nullptr}},
+    {L"tif",  L"png",  {L"png", L"webp", L"jpg", L"pdf", L"avif", L"jxl", L"bmp", L"ico", L"gif", nullptr}},
+    {L"tiff", L"png",  {L"png", L"webp", L"jpg", L"pdf", L"avif", L"jxl", L"bmp", L"ico", L"gif", nullptr}},
+    {L"ico",  L"png",  {L"png", L"webp", L"jpg", L"pdf", L"bmp", nullptr}},
+    {L"avif", L"png",  {L"png", L"jpg", L"webp", L"pdf", L"jxl", L"tiff", L"bmp", L"ico", L"gif", nullptr}},
+    {L"heic", L"jpg",  {L"jpg", L"png", L"webp", L"pdf", L"avif", L"jxl", L"tiff", L"bmp", nullptr}},
+    {L"jxl",  L"png",  {L"png", L"jpg", L"webp", L"pdf", L"avif", L"tiff", L"bmp", L"ico", nullptr}},
+};
+
+static const wchar_t* kAllTargets[] = {
+    L"docx", L"pdf", L"xlsx", L"pptx", L"txt", L"md", L"html", L"csv",
+    L"png", L"jpg", L"webp", L"odt", L"ods", L"odp", L"rtf",
+    L"avif", L"jxl", L"tiff", L"bmp", L"ico", L"gif", nullptr
 };
 
 static std::wstring ToLower(const std::wstring& s) {
@@ -93,18 +100,31 @@ static const ExtRule* FindRule(const std::wstring& ext) {
     return nullptr;
 }
 
+static bool RuleHasTarget(const ExtRule* rule, const std::wstring& target) {
+    if (!rule) return true;
+    for (int i = 0; rule->targets[i] != nullptr; ++i) {
+        if (target == rule->targets[i]) return true;
+    }
+    return false;
+}
+
 static std::wstring ExtractExtFromArray(IShellItemArray* psiArray) {
     if (!psiArray) return L"";
     IShellItem* psi = nullptr;
     if (FAILED(psiArray->GetItemAt(0, &psi)) || !psi) return L"";
-    LPWSTR pszPath = nullptr;
     std::wstring ext;
-    if (SUCCEEDED(psi->GetDisplayName(SIGDN_FILESYSPATH, &pszPath)) && pszPath) {
-        LPCWSTR dot = PathFindExtensionW(pszPath);
-        if (dot && *dot == L'.') {
-            ext = ToLower(dot + 1);
+    const SIGDN modes[] = {SIGDN_FILESYSPATH, SIGDN_PARENTRELATIVEPARSING, SIGDN_NORMALDISPLAY};
+    for (SIGDN mode : modes) {
+        LPWSTR pszPath = nullptr;
+        if (SUCCEEDED(psi->GetDisplayName(mode, &pszPath)) && pszPath) {
+            LPCWSTR dot = PathFindExtensionW(pszPath);
+            if (dot && *dot == L'.' && dot[1] != 0) {
+                ext = ToLower(dot + 1);
+                CoTaskMemFree(pszPath);
+                break;
+            }
+            CoTaskMemFree(pszPath);
         }
-        CoTaskMemFree(pszPath);
     }
     psi->Release();
     return ext;
@@ -130,7 +150,6 @@ static std::wstring GetCachedExt() {
 }
 
 static std::wstring GetConFasExePath() {
-    // 1. Check HKCU\Software\ConFas -> ExePath
     wchar_t buf[MAX_PATH * 2] = {0};
     DWORD cb = sizeof(buf);
     if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\ConFas", L"ExePath",
@@ -139,7 +158,6 @@ static std::wstring GetConFasExePath() {
             return std::wstring(buf);
         }
     }
-    // 2. Check %LOCALAPPDATA%\ConFas\ConFas.exe
     wchar_t localApp[MAX_PATH] = {0};
     if (GetEnvironmentVariableW(L"LOCALAPPDATA", localApp, MAX_PATH) > 0) {
         std::wstring candidate = std::wstring(localApp) + L"\\ConFas\\ConFas.exe";
@@ -147,7 +165,6 @@ static std::wstring GetConFasExePath() {
             return candidate;
         }
     }
-    // 3. Check HKCU\Software\Microsoft\Windows\CurrentVersion\Run -> ConFas
     cb = sizeof(buf);
     if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
                      L"ConFas", RRF_RT_REG_SZ, nullptr, buf, &cb) == ERROR_SUCCESS && buf[0]) {
@@ -228,8 +245,9 @@ static void LaunchConFas(IShellItemArray* psiArray, const std::wstring& target, 
 // ---------------------------------------------------------------------------
 // Sub-command item (Auto, Convert to <EXT>, or Choose format...)
 // ---------------------------------------------------------------------------
-class ConFasSubCommand : public IExplorerCommand {
+class ConFasSubCommand : public IExplorerCommand, public IObjectWithSite {
     LONG m_cRef;
+    IUnknown* m_pSite;
     std::wstring m_title;
     std::wstring m_target;
     bool m_isAuto;
@@ -237,19 +255,24 @@ class ConFasSubCommand : public IExplorerCommand {
 
 public:
     ConFasSubCommand(const std::wstring& title, const std::wstring& target, bool isAuto, bool isChoose)
-        : m_cRef(1), m_title(title), m_target(target), m_isAuto(isAuto), m_isChoose(isChoose) {
+        : m_cRef(1), m_pSite(nullptr), m_title(title), m_target(target), m_isAuto(isAuto), m_isChoose(isChoose) {
         InterlockedIncrement(&g_cDllRef);
     }
 
     ~ConFasSubCommand() {
+        if (m_pSite) m_pSite->Release();
         InterlockedDecrement(&g_cDllRef);
     }
 
-    // IUnknown
     IFACEMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
         if (!ppv) return E_POINTER;
         if (riid == IID_IUnknown || riid == IID_IExplorerCommand) {
             *ppv = static_cast<IExplorerCommand*>(this);
+            AddRef();
+            return S_OK;
+        }
+        if (riid == IID_IObjectWithSite) {
+            *ppv = static_cast<IObjectWithSite*>(this);
             AddRef();
             return S_OK;
         }
@@ -267,15 +290,31 @@ public:
         return c;
     }
 
+    // IObjectWithSite
+    IFACEMETHODIMP SetSite(IUnknown* pUnkSite) override {
+        if (m_pSite) m_pSite->Release();
+        m_pSite = pUnkSite;
+        if (m_pSite) m_pSite->AddRef();
+        return S_OK;
+    }
+
+    IFACEMETHODIMP GetSite(REFIID riid, void** ppvSite) override {
+        if (!ppvSite) return E_POINTER;
+        *ppvSite = nullptr;
+        if (!m_pSite) return E_FAIL;
+        return m_pSite->QueryInterface(riid, ppvSite);
+    }
+
     // IExplorerCommand
     IFACEMETHODIMP GetTitle(IShellItemArray* psiItemArray, LPWSTR* ppszName) override {
         if (!ppszName) return E_POINTER;
         if (m_isAuto) {
             std::wstring ext = ExtractExtFromArray(psiItemArray);
-            if (ext.empty()) ext = GetCachedExt();
+            if (!ext.empty()) SetCachedExt(ext);
+            else ext = GetCachedExt();
             const ExtRule* rule = FindRule(ext);
             if (rule && rule->defaultTarget) {
-                std::wstring dyn = L"Auto \x2014 Convert to " + ToUpper(rule->defaultTarget);
+                std::wstring dyn = L"Auto - Convert to " + ToUpper(rule->defaultTarget) + L" (latest format)";
                 return SHStrDupW(dyn.c_str(), ppszName);
             }
         }
@@ -300,6 +339,16 @@ public:
 
     IFACEMETHODIMP GetState(IShellItemArray* psiItemArray, BOOL, EXPCMDSTATE* pCmdState) override {
         if (!pCmdState) return E_POINTER;
+        std::wstring ext = ExtractExtFromArray(psiItemArray);
+        if (!ext.empty()) SetCachedExt(ext);
+        else ext = GetCachedExt();
+        if (!m_isAuto && !m_isChoose && !ext.empty()) {
+            const ExtRule* rule = FindRule(ext);
+            if (rule && !RuleHasTarget(rule, m_target)) {
+                *pCmdState = ECS_HIDDEN;
+                return S_OK;
+            }
+        }
         *pCmdState = ECS_ENABLED;
         return S_OK;
     }
@@ -333,9 +382,9 @@ public:
     ConFasEnumCommands(const std::wstring& ext) : m_cRef(1), m_idx(0) {
         InterlockedIncrement(&g_cDllRef);
         const ExtRule* rule = FindRule(ext);
-        std::wstring autoTitle = L"Auto \x2014 Convert to latest format";
+        std::wstring autoTitle = L"Auto - Convert to latest format";
         if (rule && rule->defaultTarget) {
-            autoTitle = L"Auto \x2014 Convert to " + ToUpper(rule->defaultTarget);
+            autoTitle = L"Auto - Convert to " + ToUpper(rule->defaultTarget) + L" (latest format)";
         }
         m_cmds.push_back(new ConFasSubCommand(autoTitle, L"", true, false));
 
@@ -346,9 +395,8 @@ public:
                 m_cmds.push_back(new ConFasSubCommand(label, t, false, false));
             }
         } else {
-            const wchar_t* fallback[] = {L"pdf", L"docx", L"xlsx", L"pptx", L"txt", L"md", L"html", L"png", L"jpg", L"webp", L"csv", nullptr};
-            for (int i = 0; fallback[i] != nullptr; ++i) {
-                std::wstring t = fallback[i];
+            for (int i = 0; kAllTargets[i] != nullptr; ++i) {
+                std::wstring t = kAllTargets[i];
                 std::wstring label = L"Convert to " + ToUpper(t);
                 m_cmds.push_back(new ConFasSubCommand(label, t, false, false));
             }
@@ -384,6 +432,7 @@ public:
 
     IFACEMETHODIMP Next(ULONG celt, IExplorerCommand** pUICommand, ULONG* pceltFetched) override {
         if (!pUICommand) return E_POINTER;
+        for (ULONG i = 0; i < celt; ++i) pUICommand[i] = nullptr;
         ULONG fetched = 0;
         while (fetched < celt && m_idx < m_cmds.size()) {
             pUICommand[fetched] = m_cmds[m_idx];
@@ -414,16 +463,18 @@ public:
 // ---------------------------------------------------------------------------
 // Root "Convert with ConFas >" command
 // ---------------------------------------------------------------------------
-class ConFasRootCommand : public IExplorerCommand {
+class ConFasRootCommand : public IExplorerCommand, public IObjectWithSite {
     LONG m_cRef;
+    IUnknown* m_pSite;
     std::wstring m_ext;
 
 public:
-    ConFasRootCommand() : m_cRef(1) {
+    ConFasRootCommand() : m_cRef(1), m_pSite(nullptr) {
         InterlockedIncrement(&g_cDllRef);
     }
 
     ~ConFasRootCommand() {
+        if (m_pSite) m_pSite->Release();
         InterlockedDecrement(&g_cDllRef);
     }
 
@@ -431,6 +482,11 @@ public:
         if (!ppv) return E_POINTER;
         if (riid == IID_IUnknown || riid == IID_IExplorerCommand) {
             *ppv = static_cast<IExplorerCommand*>(this);
+            AddRef();
+            return S_OK;
+        }
+        if (riid == IID_IObjectWithSite) {
+            *ppv = static_cast<IObjectWithSite*>(this);
             AddRef();
             return S_OK;
         }
@@ -448,6 +504,22 @@ public:
         return c;
     }
 
+    // IObjectWithSite
+    IFACEMETHODIMP SetSite(IUnknown* pUnkSite) override {
+        if (m_pSite) m_pSite->Release();
+        m_pSite = pUnkSite;
+        if (m_pSite) m_pSite->AddRef();
+        return S_OK;
+    }
+
+    IFACEMETHODIMP GetSite(REFIID riid, void** ppvSite) override {
+        if (!ppvSite) return E_POINTER;
+        *ppvSite = nullptr;
+        if (!m_pSite) return E_FAIL;
+        return m_pSite->QueryInterface(riid, ppvSite);
+    }
+
+    // IExplorerCommand
     IFACEMETHODIMP GetTitle(IShellItemArray* psiItemArray, LPWSTR* ppszName) override {
         if (!ppszName) return E_POINTER;
         std::wstring ext = ExtractExtFromArray(psiItemArray);
