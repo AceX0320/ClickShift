@@ -538,9 +538,9 @@ def _install_win11_shell_extension() -> bool:
 
         # 1. Try direct registration without elevation first (succeeds if Developer Mode or cert already trusted)
         direct_cmd = (
-            f'Add-AppxPackage -Path "{msix_path}" -ForceApplicationShutdown -ErrorAction Stop'
+            f'Add-AppxPackage -Path "{msix_path}" -ExternalLocation "{shell_dir}" -ForceApplicationShutdown -ErrorAction Stop'
             if msix_path.exists()
-            else f'Add-AppxPackage -Register "{manifest_path}" -ForceApplicationShutdown -ErrorAction Stop'
+            else f'Add-AppxPackage -Register "{manifest_path}" -ExternalLocation "{shell_dir}" -ForceApplicationShutdown -ErrorAction Stop'
         )
         r = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", direct_cmd],
@@ -612,18 +612,21 @@ def install_context_menu(extensions: Optional[list[str]] = None) -> int:
     n = 0
     for ext in exts:
         locations = _verb_locations(ext)
+        primary_loc = rf"Software\Classes\SystemFileAssociations\.{ext}"
         targets = menu_targets(ext)
         default_t = targets[0] if targets else None
         ok = False
         for loc in locations:
-            # Remove any legacy flat top-level verbs so ConFas only appears once (as the expandable menu)
+            # Remove any legacy flat top-level verbs and any duplicate ProgID cascading menus
             for verb, _label, _cmd in _verbs_for(ext):
                 _delete_verb(loc, verb)
-            try:
-                _write_cascading_menu(loc, targets, default_t)
-                ok = True
-            except Exception as exc:
-                _log(f"cascading menu .{ext} failed at {loc}: {exc}")
+            if loc != primary_loc:
+                _delete_verb(loc, VERB_MENU)
+        try:
+            _write_cascading_menu(primary_loc, targets, default_t)
+            ok = True
+        except Exception as exc:
+            _log(f"cascading menu .{ext} failed at {primary_loc}: {exc}")
         try:
             _register_openwith(ext)
         except Exception as exc:
