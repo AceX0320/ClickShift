@@ -175,7 +175,7 @@ def test_run_interactive_update_handles_frozen_apply(tmp_path, monkeypatch):
     monkeypatch.setattr(updater, "apply_windows_update", lambda s, t, pid_to_wait=None: applied.append((s, t)))
     stopped = []
 
-    monkeypatch.setattr(updater.os, "name", "nt", raising=False)
+    monkeypatch.setattr(updater.sys, "platform", "win32")
     monkeypatch.setattr(updater.tempfile, "gettempdir", lambda: str(tmp_path))
     target = tmp_path / "ConFas.exe"
     res = updater.run_interactive_update(

@@ -441,144 +441,151 @@ class InstallProgressPopup:
             self._closed.set()
             return
 
-        root = tk.Tk()
-        root.title(self.title)
-        root.resizable(False, False)
-        root.configure(bg="#0F172A")
-        try:
-            ico = find_icon_path()
-            if ico is not None:
-                root.iconbitmap(default=str(ico))
-        except Exception:
-            pass
+        def _run_mainloop() -> None:
+            root = tk.Tk()
+            root.title(self.title)
+            root.resizable(False, False)
+            root.configure(bg="#0F172A")
+            try:
+                ico = find_icon_path()
+                if ico is not None:
+                    root.iconbitmap(default=str(ico))
+            except Exception:
+                pass
 
-        width, height = 430, 178
-        sx = root.winfo_screenwidth()
-        sy = root.winfo_screenheight()
-        root.geometry(f"{width}x{height}+{(sx - width) // 2}+{(sy - height) // 2}")
-        try:
-            root.attributes("-topmost", True)
-        except Exception:
-            pass
+            width, height = 430, 178
+            sx = root.winfo_screenwidth()
+            sy = root.winfo_screenheight()
+            root.geometry(f"{width}x{height}+{(sx - width) // 2}+{(sy - height) // 2}")
+            try:
+                root.attributes("-topmost", True)
+            except Exception:
+                pass
 
-        style = ttk.Style(root)
-        try:
-            style.theme_use("clam")
-        except Exception:
-            pass
-        style.configure(
-            "ConFas.Horizontal.TProgressbar",
-            troughcolor="#1E293B",
-            background="#38BDF8",
-            bordercolor="#1E293B",
-            lightcolor="#38BDF8",
-            darkcolor="#0284C7",
-            thickness=10,
-        )
+            style = ttk.Style(root)
+            try:
+                style.theme_use("clam")
+            except Exception:
+                pass
+            style.configure(
+                "ConFas.Horizontal.TProgressbar",
+                troughcolor="#1E293B",
+                background="#38BDF8",
+                bordercolor="#1E293B",
+                lightcolor="#38BDF8",
+                darkcolor="#0284C7",
+                thickness=10,
+            )
 
-        frame = tk.Frame(root, bg="#0F172A", padx=22, pady=18)
-        frame.pack(fill="both", expand=True)
+            frame = tk.Frame(root, bg="#0F172A", padx=22, pady=18)
+            frame.pack(fill="both", expand=True)
 
-        tk.Label(
-            frame,
-            text=self.heading,
-            bg="#0F172A",
-            fg="#F8FAFC",
-            font=("Segoe UI", 12, "bold"),
-            anchor="w",
-        ).pack(fill="x")
+            tk.Label(
+                frame,
+                text=self.heading,
+                bg="#0F172A",
+                fg="#F8FAFC",
+                font=("Segoe UI", 12, "bold"),
+                anchor="w",
+            ).pack(fill="x")
 
-        status_lbl = tk.Label(
-            frame,
-            text="Starting...",
-            bg="#0F172A",
-            fg="#CBD5E1",
-            font=("Segoe UI", 9),
-            anchor="w",
-        )
-        status_lbl.pack(fill="x", pady=(8, 8))
+            status_lbl = tk.Label(
+                frame,
+                text="Starting...",
+                bg="#0F172A",
+                fg="#CBD5E1",
+                font=("Segoe UI", 9),
+                anchor="w",
+            )
+            status_lbl.pack(fill="x", pady=(8, 8))
 
-        bar_mode = {"indeterminate": True}
-        bar = ttk.Progressbar(
-            frame,
-            style="ConFas.Horizontal.TProgressbar",
-            orient="horizontal",
-            length=386,
-            mode="indeterminate",
-            maximum=100,
-        )
-        bar.pack(fill="x")
-        bar.start(14)
+            bar_mode = {"indeterminate": True}
+            bar = ttk.Progressbar(
+                frame,
+                style="ConFas.Horizontal.TProgressbar",
+                orient="horizontal",
+                length=386,
+                mode="indeterminate",
+                maximum=100,
+            )
+            bar.pack(fill="x")
+            bar.start(14)
 
-        detail_lbl = tk.Label(
-            frame,
-            text=f"ConFas v{__version__}",
-            bg="#0F172A",
-            fg="#64748B",
-            font=("Segoe UI", 8),
-            anchor="w",
-        )
-        detail_lbl.pack(fill="x", pady=(8, 0))
+            detail_lbl = tk.Label(
+                frame,
+                text=f"ConFas v{__version__}",
+                bg="#0F172A",
+                fg="#64748B",
+                font=("Segoe UI", 8),
+                anchor="w",
+            )
+            detail_lbl.pack(fill="x", pady=(8, 0))
 
-        self._ready.set()
+            self._ready.set()
 
-        def poll() -> None:
-            while True:
+            def _destroy_cleanly() -> None:
                 try:
-                    kind, payload = self._q.get_nowait()
-                except queue.Empty:
-                    break
+                    bar.stop()
+                except Exception:
+                    pass
+                try:
+                    root.destroy()
+                except Exception:
+                    pass
 
-                if kind == "update":
-                    status_text, pct, detail_text = payload  # type: ignore[misc]
-                    if status_text:
-                        status_lbl.configure(text=str(status_text))
-                    if detail_text:
-                        detail_lbl.configure(text=str(detail_text))
-                    if pct is not None:
+            def poll() -> None:
+                while True:
+                    try:
+                        kind, payload = self._q.get_nowait()
+                    except queue.Empty:
+                        break
+
+                    if kind == "update":
+                        status_text, pct, detail_text = payload  # type: ignore[misc]
+                        if status_text:
+                            status_lbl.configure(text=str(status_text))
+                        if detail_text:
+                            detail_lbl.configure(text=str(detail_text))
+                        if pct is not None:
+                            if bar_mode["indeterminate"]:
+                                bar.stop()
+                                bar.configure(mode="determinate")
+                                bar_mode["indeterminate"] = False
+                            bar["value"] = max(0.0, min(100.0, float(pct)))
+                    elif kind == "complete":
+                        msg, delay_s = payload  # type: ignore[misc]
                         if bar_mode["indeterminate"]:
                             bar.stop()
                             bar.configure(mode="determinate")
                             bar_mode["indeterminate"] = False
-                        bar["value"] = max(0.0, min(100.0, float(pct)))
-                elif kind == "complete":
-                    msg, delay_s = payload  # type: ignore[misc]
-                    if bar_mode["indeterminate"]:
-                        bar.stop()
-                        bar.configure(mode="determinate")
-                        bar_mode["indeterminate"] = False
-                    bar["value"] = 100.0
-                    status_lbl.configure(text=str(msg))
-                    detail_lbl.configure(text="Ready in system tray")
-                    root.after(int(max(0.1, float(delay_s)) * 1000), root.destroy)
-                    return
-                elif kind == "error":
-                    msg, delay_s = payload  # type: ignore[misc]
-                    if bar_mode["indeterminate"]:
-                        bar.stop()
-                        bar.configure(mode="determinate")
-                        bar_mode["indeterminate"] = False
-                    status_lbl.configure(text=str(msg))
-                    detail_lbl.configure(text="Setup encountered an error")
-                    root.after(int(max(0.2, float(delay_s)) * 1000), root.destroy)
-                    return
-                elif kind == "close":
-                    root.destroy()
-                    return
+                        bar["value"] = 100.0
+                        status_lbl.configure(text=str(msg))
+                        detail_lbl.configure(text="Ready in system tray")
+                        root.after(int(max(0.1, float(delay_s)) * 1000), _destroy_cleanly)
+                        return
+                    elif kind == "error":
+                        msg, delay_s = payload  # type: ignore[misc]
+                        if bar_mode["indeterminate"]:
+                            bar.stop()
+                            bar.configure(mode="determinate")
+                            bar_mode["indeterminate"] = False
+                        status_lbl.configure(text=str(msg))
+                        detail_lbl.configure(text="Setup encountered an error")
+                        root.after(int(max(0.2, float(delay_s)) * 1000), _destroy_cleanly)
+                        return
+                    elif kind == "close":
+                        _destroy_cleanly()
+                        return
+
+                root.after(45, poll)
 
             root.after(45, poll)
-
-        root.after(45, poll)
-        try:
             root.mainloop()
+
+        import gc
+        try:
+            _run_mainloop()
         finally:
-            import gc
-            try:
-                bar.stop()
-            except Exception:
-                pass
-            poll = None  # type: ignore[assignment]
-            del status_lbl, detail_lbl, bar, style, frame, root
             gc.collect()
             self._closed.set()
 
@@ -745,7 +752,7 @@ def run_interactive_update(
         return decision
 
     frozen = getattr(sys, "frozen", False) if is_frozen is None else is_frozen
-    if not frozen or os.name != "nt":
+    if not frozen or sys.platform != "win32":
         webbrowser.open(info.html_url or RELEASES_PAGE_URL)
         return "opened_browser"
 
