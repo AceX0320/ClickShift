@@ -300,6 +300,210 @@ def _patch_pdf2docx_compat() -> None:
                 setattr(cls, "get_area", lambda self: abs(self))
     except Exception:
         pass
+    _patch_pdf2docx_opacity()
+
+
+def _blend_on_white(color: Any, opacity: Any) -> Any:
+    """Composite an RGB(0..1) colour with ``opacity`` over a white page."""
+    if not color or opacity is None:
+        return color
+    try:
+        op = float(opacity)
+    except (TypeError, ValueError):
+        return color
+    if op >= 0.999:
+        return color
+    op = max(0.0, op)
+    return tuple(1.0 - op * (1.0 - float(c)) for c in color)
+
+
+def _flatten_path_opacity(raw_paths: Any) -> Any:
+    """pdf2docx ignores fill/stroke opacity, so a 10%-opaque dark box (a common
+    way to draw light-grey panels) becomes solid charcoal cell shading in
+    Word. Pre-blend translucent colours over white and drop invisible paths."""
+    out = []
+    for p in raw_paths or []:
+        if not isinstance(p, dict):
+            out.append(p)
+            continue
+        fop = p.get("fill_opacity")
+        sop = p.get("stroke_opacity")
+        fill_visible = p.get("fill") is not None and (fop is None or fop > 0.01)
+        stroke_visible = p.get("color") is not None and (sop is None or sop > 0.01)
+        if (p.get("fill") is not None or p.get("color") is not None) and not (fill_visible or stroke_visible):
+            continue  # fully transparent path: nothing to render
+        p = dict(p)
+        if p.get("fill") is not None:
+            p["fill"] = _blend_on_white(p["fill"], fop) if fill_visible else None
+            p["fill_opacity"] = 1.0
+        if p.get("color") is not None:
+            p["color"] = _blend_on_white(p["color"], sop) if stroke_visible else None
+            p["stroke_opacity"] = 1.0
+        out.append(p)
+    return out
+
+
+def _patch_pdf2docx_opacity() -> None:
+    try:
+        mod: Any = importlib.import_module("pdf2docx.page.RawPageFitz")
+        paths_mod: Any = importlib.import_module("pdf2docx.shape.Paths")
+    except Exception:
+        return
+    cls = getattr(mod, "RawPageFitz", None)
+    if cls is None or getattr(cls, "_confas_opacity_patched", False):
+        return
+
+    def _init_paths(self: Any, **settings: Any) -> Any:
+        raw_paths = _flatten_path_opacity(self.page_engine.get_cdrawings())
+        return paths_mod.Paths(parent=self).restore(raw_paths)
+
+    cls._init_paths = _init_paths
+    cls._confas_opacity_patched = True
+
+
+_W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+_MAX_MERGE_GAP_TWIPS = 300  # spacer paragraphs up to 15pt are part of one box
+
+
+def _merge_shaded_line_tables(xml: bytes) -> tuple[bytes, int]:
+    """pdf2docx emits one single-cell table per text line when text sits on a
+    shaded panel, which Word renders as ragged per-line "highlight" strips.
+    Merge runs of such tables (same fill, separated only by small empty spacer
+    paragraphs) into one full-width shaded cell. Returns (xml, merged_count)."""
+    etree: Any = importlib.import_module("lxml.etree")
+    w = "{%s}" % _W_NS
+    root = etree.fromstring(xml)
+
+    def ival(el: Any, attr: str = "w") -> int:
+        if el is None:
+            return 0
+        try:
+            return int(float(el.get(w + attr) or 0))
+        except ValueError:
+            return 0
+
+    def single_cell_fill(tbl: Any) -> Optional[str]:
+        rows = tbl.findall(w + "tr")
+        if len(rows) != 1:
+            return None
+        cells = rows[0].findall(w + "tc")
+        if len(cells) != 1:
+            return None
+        shd = cells[0].find(f"{w}tcPr/{w}shd")
+        fill = (shd.get(w + "fill") if shd is not None else None) or ""
+        if not fill or fill.lower() == "auto":
+            return None
+        return fill.lower()
+
+    def small_spacer(p: Any) -> bool:
+        if p.tag != w + "p":
+            return False
+        if any((t.text or "").strip() for t in p.iter(w + "t")):
+            return False
+        if p.find(f".//{w}drawing") is not None or p.find(f".//{w}pict") is not None:
+            return False
+        sp = p.find(f"{w}pPr/{w}spacing")
+        if sp is None or sp.get(w + "lineRule") != "exact":
+            return False
+        total = ival(sp, "line") + ival(sp, "before") + ival(sp, "after")
+        return total <= _MAX_MERGE_GAP_TWIPS
+
+    def geometry(tbl: Any) -> tuple[int, int]:
+        ind = ival(tbl.find(f"{w}tblPr/{w}tblInd"))
+        tcw = ival(tbl.find(f"{w}tr/{w}tc/{w}tcPr/{w}tcW"))
+        return ind, tcw
+
+    merged = 0
+    for body in list(root.iter(w + "body", w + "tc", w + "txbxContent")):
+        children = list(body)
+        i = 0
+        while i < len(children):
+            el = children[i]
+            fill = single_cell_fill(el) if el.tag == w + "tbl" else None
+            if not fill:
+                i += 1
+                continue
+            group = [el]
+            spacers: list[list[Any]] = []
+            j = i + 1
+            while j < len(children):
+                pending = []
+                k = j
+                while k < len(children) and small_spacer(children[k]):
+                    pending.append(children[k])
+                    k += 1
+                if k < len(children) and children[k].tag == w + "tbl" and single_cell_fill(children[k]) == fill:
+                    spacers.append(pending)
+                    group.append(children[k])
+                    j = k + 1
+                else:
+                    break
+            if len(group) < 2:
+                i += 1
+                continue
+            geos = [geometry(t) for t in group]
+            left = min(g[0] for g in geos)
+            right = max(g[0] + g[1] for g in geos)
+            first = group[0]
+            cell = first.find(f"{w}tr/{w}tc")
+            # first table: anchor at the leftmost edge, widen, free the row height
+            for idx, (tbl, (ind, _)) in enumerate(zip(group, geos)):
+                shift = ind - left
+                if shift:
+                    for pind in tbl.iter(w + "ind"):
+                        pind.set(w + "left", str(ival(pind, "left") + shift))
+                if idx == 0:
+                    continue
+                for sp in spacers[idx - 1]:
+                    cell.append(sp)
+                src_cell = tbl.find(f"{w}tr/{w}tc")
+                for child in list(src_cell):
+                    if child.tag != w + "tcPr":
+                        cell.append(child)
+                tbl.getparent().remove(tbl)
+            tbl_ind = first.find(f"{w}tblPr/{w}tblInd")
+            if tbl_ind is not None:
+                tbl_ind.set(w + "w", str(left))
+            tcw = cell.find(f"{w}tcPr/{w}tcW")
+            if tcw is not None:
+                tcw.set(w + "w", str(right - left))
+            for gc in first.iter(w + "gridCol"):
+                gc.set(w + "w", str(max(ival(gc), right - left)))
+            for trh in first.iter(w + "trHeight"):
+                trh.getparent().remove(trh)
+            merged += len(group) - 1
+            children = list(body)
+            i = children.index(first) + 1
+    if not merged:
+        return xml, 0
+    return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True), merged
+
+
+def _postprocess_pdf2docx(dst: Path) -> None:
+    """Rewrite word/document.xml in-place with layout clean-ups (best effort)."""
+    tmp_name: Optional[str] = None
+    try:
+        with zipfile.ZipFile(dst) as zin:
+            xml = zin.read("word/document.xml")
+            new_xml, merged = _merge_shaded_line_tables(xml)
+            if not merged:
+                return
+            fd, tmp_name = tempfile.mkstemp(suffix=".docx", dir=str(dst.parent))
+            os.close(fd)
+            with zipfile.ZipFile(tmp_name, "w", zipfile.ZIP_DEFLATED) as zout:
+                for item in zin.infolist():
+                    data = new_xml if item.filename == "word/document.xml" else zin.read(item.filename)
+                    zout.writestr(item, data)
+        os.replace(tmp_name, str(dst))
+        tmp_name = None
+    except Exception:  # never fail a conversion because of cosmetics
+        pass
+    finally:
+        if tmp_name:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
 
 
 BACKENDS = Backends()
@@ -595,6 +799,7 @@ def conv_pdf2docx(src: Path, dst: Path) -> None:
         cv.close()
     if not dst.exists() or dst.stat().st_size == 0:
         raise RuntimeError("pdf2docx produced no output file")
+    _postprocess_pdf2docx(dst)
     # Check if pdf2docx produced a blank document (e.g. scanned/complex PDF)
     if BACKENDS.python_docx:
         try:

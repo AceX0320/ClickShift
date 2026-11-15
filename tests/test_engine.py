@@ -99,3 +99,49 @@ def test_pdf_to_docx_routes_present(engine):
     routes = [r.name for r in _routes_for(".pdf", ".docx")]
     assert routes, "PDF -> DOCX must have conversion routes"
     assert any(r in routes for r in ("pdf2docx", "pymupdf-docx", "pypdf-docx", "office-com", "libreoffice"))
+
+
+# ---- pdf2docx shading fixes (translucent panels -> per-line dark highlight) -- #
+
+def test_translucent_fill_blended_over_white():
+    from confas.engine import _flatten_path_opacity
+    dark = (0.145, 0.157, 0.169)
+    out = _flatten_path_opacity([
+        {"fill": dark, "fill_opacity": 0.1, "color": None},
+        {"fill": (1, 0, 0), "fill_opacity": 1.0},
+        {"fill": dark, "fill_opacity": 0.0, "color": None},  # invisible -> dropped
+    ])
+    assert len(out) == 2
+    assert all(c > 0.9 for c in out[0]["fill"])          # light grey, not charcoal
+    assert out[0]["fill_opacity"] == 1.0
+    assert out[1]["fill"] == (1, 0, 0)
+
+
+def _line_table(text, fill="e9e9e9", ind=0, width=10000):
+    return (
+        f'<w:tbl><w:tblPr><w:tblInd w:w="{ind}" w:type="dxa"/></w:tblPr>'
+        f'<w:tblGrid><w:gridCol w:w="10566"/></w:tblGrid><w:tr><w:trPr>'
+        f'<w:trHeight w:hRule="exact" w:val="280"/></w:trPr><w:tc><w:tcPr>'
+        f'<w:tcW w:type="dxa" w:w="{width}"/><w:shd w:fill="{fill}"/></w:tcPr>'
+        f'<w:p><w:pPr><w:ind w:left="0"/></w:pPr><w:r><w:t>{text}</w:t></w:r></w:p>'
+        f'</w:tc></w:tr></w:tbl>'
+    )
+
+
+_SPACER = ('<w:p><w:pPr><w:spacing w:line="20" w:lineRule="exact" w:before="0" '
+           'w:after="0"/></w:pPr></w:p>')
+
+
+def test_shaded_line_tables_merged_into_one_box():
+    from confas.engine import _merge_shaded_line_tables
+    ns = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+    body = (_line_table("Header", fill="e60000") + _SPACER
+            + _line_table("line one") + _SPACER + _line_table("line two", ind=60, width=9000)
+            + _SPACER + _line_table("line three"))
+    xml = f'<w:document {ns}><w:body>{body}</w:body></w:document>'.encode()
+    out, merged = _merge_shaded_line_tables(xml)
+    text = out.decode()
+    assert merged == 2
+    assert text.count("<w:tbl>") == 2                   # red header + one grey box
+    assert "trHeight" not in text.split("line one")[0].split("e60000")[-1]
+    assert text.index("line one") < text.index("line two") < text.index("line three")
