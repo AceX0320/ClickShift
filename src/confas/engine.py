@@ -769,7 +769,7 @@ def _read_text_auto(path: Path) -> tuple[str, str]:
 def conv_text_generic(src: Path, dst: Path) -> None:
     text, _enc = _read_text_auto(src)
     ext = dst.suffix.lstrip(".").lower()
-    if ext in ("txt", "md", "log", "csv", "tsv", "json", "xml", "srt", "yml", "yaml", "ini"):
+    if ext in (TEXT_EXTS - {"html", "htm"}):
         dst.write_text(text, encoding="utf-8-sig")
     elif ext in ("html", "htm"):
         body = _html_mod.escape(text)
@@ -1055,7 +1055,7 @@ def _routes_for(src_ext: str, dst_ext: str) -> list[Route]:
             add("text->docx->pdf", text_pdf_two_step, 40)
     elif s in TEXT_EXTS and d == "docx":
         if BACKENDS.python_docx:
-            if s in ("html", "htm"):
+            if s in ("html", "htm") and BACKENDS.libreoffice:
                 add("libreoffice-html", conv_html_to_docx, 80)
             add("python-docx-md", conv_text_to_docx, 70)
         add("libreoffice", conv_libreoffice, 50)
@@ -1065,6 +1065,12 @@ def _routes_for(src_ext: str, dst_ext: str) -> list[Route]:
         if d in ("txt", "md", "html", "htm"):
             add("epub-extract", conv_epub_extract, 90)
         add("libreoffice", conv_libreoffice, 30)
+    elif s in TEXT_EXTS and d in TEXT_EXTS:
+        add("text-passthru", conv_text_generic, 100)
+        if office_available and s in OFFICE_DOC_IN and d in ("html", "txt"):
+            add("office-com", conv_office_com, 60)
+        if s in OFFICE_DOC_IN and d in ("html", "txt"):
+            add("libreoffice", conv_libreoffice, 40)
     elif s in ("doc", "xls", "ppt", "odt", "ods", "odp", "rtf") and d in ("docx", "xlsx", "pptx", "pdf"):
         if office_available:
             add("office-com", conv_office_com, 100)
@@ -1079,16 +1085,14 @@ def _routes_for(src_ext: str, dst_ext: str) -> list[Route]:
         add("libreoffice", conv_libreoffice, 70)
         if BACKENDS.python_docx and d == "docx":
             add("python-docx-md", conv_text_to_docx, 65)
+        if s in TEXT_EXTS and d in ("html", "htm"):
+            add("text-passthru", conv_text_generic, 90)
     elif s in ("docx", "xlsx", "pptx") and d in ("pdf", "odt", "ods", "odp", "rtf", "html", "txt", "csv"):
         if office_available and d == "pdf":
             add("office-com", conv_office_com, 100)
         elif word_available and s == "docx" and d in _WORD_ONLY_FMTS:
             add("office-com", conv_office_com, 45)
         add("libreoffice", conv_libreoffice, 70)
-    elif s in TEXT_EXTS and d in TEXT_EXTS:
-        add("text-passthru", conv_text_generic, 100)
-    elif s in ("txt", "md") and d in ("html", "htm"):
-        add("text-passthru", conv_text_generic, 100)
     else:
         # last-resort generic chain
         if s in TEXT_EXTS and d in TEXT_EXTS:
@@ -1106,7 +1110,7 @@ def _routes_for(src_ext: str, dst_ext: str) -> list[Route]:
             continue
         if r.name == "office-com" and not (IS_WINDOWS and BACKENDS.office_app):
             continue
-        if r.name == "libreoffice" and not BACKENDS.libreoffice:
+        if r.name.startswith("libreoffice") and not BACKENDS.libreoffice:
             continue
         if r.name == "pdf2docx" and not BACKENDS.pdf2docx:
             continue

@@ -7,3 +7,5 @@ dist/
 .venv/
 assets/confas.ico.bak
 tests/_tmp_home/
+logs_118368604049/
+logs_*/
