@@ -44,3 +44,27 @@ def test_state_persists(tmp_path):
     sel.record(src, ".docx", "fast", 120, True)
     sel2 = BanditSelector(history_file=tmp_path / "h.jsonl")
     assert sum(sel2.bandit.n.values()) >= 1
+
+
+def test_content_aware_features_distinguish_scanned_vs_text_pdf(tmp_path):
+    text_pdf = tmp_path / "text.pdf"
+    scan_pdf = tmp_path / "scan.pdf"
+    text_pdf.write_bytes(b"%PDF-1.7\n/Type /Page\n/Font /F1\n/Font /F2\n" + b"a" * 500)
+    scan_pdf.write_bytes(b"%PDF-1.7\n/Type /Page\n/Subtype /Image\n/Subtype /Image\n" + b"a" * 500)
+    f_text = _features(text_pdf, ".docx")
+    f_scan = _features(scan_pdf, ".docx")
+    assert len(f_text) == DIM and len(f_scan) == DIM
+    # media_ratio (index 7) is higher for the image-heavy PDF than the font-only PDF
+    assert f_scan[7] > f_text[7]
+
+
+def test_sherman_morrison_matches_exact_inverse(tmp_path):
+    sel = BanditSelector(history_file=tmp_path / "h.jsonl")
+    rng = np.random.default_rng(42)
+    arm = "pdf>docx|pdf2docx"
+    for _ in range(15):
+        x = rng.normal(size=DIM)
+        x[0] = 1.0
+        sel.bandit.update(arm, x, float(rng.uniform(-1.0, 1.0)))
+    exact_inv = np.linalg.inv(sel.bandit.A[arm])
+    assert np.allclose(sel.bandit.A_inv[arm], exact_inv, atol=1e-6)

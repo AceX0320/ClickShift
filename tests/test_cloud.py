@@ -202,3 +202,11 @@ def test_token_saved_owner_only(tmp_path, monkeypatch):
     assert p.read_text() == "ghp_secret123"
     mode = p.stat().st_mode & 0o777
     assert mode == 0o600 or mode == 0o644             # Windows may ignore chmod; content ok
+
+
+def test_merge_preserves_accumulated_reward_scale():
+    """Accumulated reward vectors b with n>1 must not be clipped to [-1, 1]."""
+    st = _mk_state(seed=10, n_updates=20, arm="pdf>docx|pdf2docx")
+    st["bandit"]["pdf>docx|pdf2docx"]["b"][0] = 15.0  # 20 runs with ~0.75 avg reward
+    m = cloud.merge_states([st])
+    assert m["bandit"]["pdf>docx|pdf2docx"]["b"][0] == 15.0

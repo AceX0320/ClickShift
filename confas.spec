@@ -11,11 +11,13 @@ a = Analysis(
     datas=[],
     hiddenimports=[
         "confas.engine", "confas.learning", "confas.monitor", "confas.cli",
-        # Windows-only, resolved lazily at runtime; keep them collectable:
+        "confas.cloud", "confas.debuglog",
+        # Dynamically imported backends and Windows-only modules:
         "win32com.client", "pythoncom", "pywintypes",
         "pystray", "pystray._win32",
-        "PIL", "PIL.Image", "PIL.ImageDraw",
-        "numpy",
+        "PIL", "PIL.Image", "PIL.ImageOps", "PIL.ImageDraw",
+        "numpy", "docx", "docx.shared", "pdf2docx", "pypdf", "fitz",
+        "chardet", "charset_normalizer",
     ],
     hookspath=[],
     runtime_hooks=[],

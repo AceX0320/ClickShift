@@ -80,3 +80,22 @@ def test_unsupported_pair_returns_error(tmp_path, engine):
     f.write_bytes(b"\x00\x01")
     res = engine.convert(f, "qqq")
     assert not res.ok  # must fail loudly rather than produce garbage
+
+
+def test_large_text_not_truncated(tmp_path, engine):
+    """Files > 200 KB must be converted in full (regression test for _read_text_auto)."""
+    src = tmp_path / "big.txt"
+    payload = ("Line0123456789\n" * 20_000) + "TAIL_MARKER_END\n"  # ~300 KB
+    assert len(payload.encode("utf-8")) > 250_000
+    src.write_text(payload, encoding="utf-8")
+    res = engine.convert(src, "html")
+    assert res.ok, res.error
+    out_text = Path(res.target).read_text(encoding="utf-8")
+    assert "TAIL_MARKER_END" in out_text
+
+
+def test_pdf_to_docx_routes_present(engine):
+    """PDF -> DOCX must always have at least one pure-Python or native route."""
+    routes = [r.name for r in _routes_for(".pdf", ".docx")]
+    assert routes, "PDF -> DOCX must have conversion routes"
+    assert any(r in routes for r in ("pdf2docx", "pymupdf-docx", "pypdf-docx", "office-com", "libreoffice"))

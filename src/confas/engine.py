@@ -27,10 +27,15 @@ conversions are near-instant (no interpreter/COM spin-up per file).
 The module is import-safe on Linux/macOS as well (Windows-only backends are
 simply unavailable there) which makes development/testing possible anywhere.
 """
+# pyright: reportMissingImports=false, reportMissingModuleSource=false
 from __future__ import annotations
 
+import html as _html_mod
+import importlib
+import io
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -40,12 +45,42 @@ import threading
 import time
 import traceback
 import uuid
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
+from xml.etree import ElementTree as ET
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    __package__ = "confas"
 
 IS_WINDOWS = sys.platform == "win32"
+
+
+def _opt_import(name: str) -> Any:
+    try:
+        return importlib.import_module(name)
+    except Exception:  # pragma: no cover
+        return None
+
+
+winreg: Any = _opt_import("winreg") if IS_WINDOWS else None
+
+
+def _ensure_stdio() -> None:
+    """In PyInstaller --noconsole mode sys.stdout/stderr are None, breaking pdf2docx/logging."""
+    try:
+        if sys.stdout is None:
+            sys.stdout = open(os.devnull, "w", encoding="utf-8", errors="replace")
+        if sys.stderr is None:
+            sys.stderr = open(os.devnull, "w", encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+
+_ensure_stdio()
 
 
 # --------------------------------------------------------------------------- #
@@ -96,9 +131,19 @@ IMAGE_EXTS = {"png", "jpg", "jpeg", "gif", "bmp", "tiff", "tif", "webp",
               "avif", "heic", "heif", "jxl", "ico", "ppm", "pgm", "pbm", "jp2"}
 TEXT_EXTS = {"txt", "md", "markdown", "csv", "tsv", "json", "xml", "html", "htm",
              "log", "ini", "py", "js", "c", "cpp", "h", "java", "yml", "yaml", "srt"}
+SUPPORTED_INPUT_EXTS = (
+    OFFICE_DOC_IN
+    | OFFICE_SHEET_IN
+    | OFFICE_SLIDE_IN
+    | PDF_CAPABLE_IN
+    | IMAGE_EXTS
+    | TEXT_EXTS
+    | {"pdf", "epub", "xps", "wmf", "emf"}
+)
 
 # "newest generation" mapping used by the right-click menu builder.
 NEWEST_GENERATION = {
+    "pdf": "docx",       # PDF -> editable OOXML Word document by default
     "doc": "docx",       # OOXML (Word 2007+) - never emit legacy .doc
     "xls": "xlsx",       # OOXML (Excel 2007+)
     "ppt": "pptx",       # OOXML (PowerPoint 2007+)
@@ -113,35 +158,41 @@ NEWEST_GENERATION = {
 }
 
 
-def newest_target_for(src_ext: str) -> list[str]:
-    """Suggested 'latest version' targets for a given source extension."""
+def all_targets_for(src_ext: str) -> list[str]:
+    """Return ALL supported conversion target extensions for ``src_ext`` (ordered best-first)."""
     src_ext = src_ext.lower().lstrip(".")
     out: list[str] = []
     g = NEWEST_GENERATION.get(src_ext)
     if g:
         out.append(g)
-    can_produce_pdf = bool(BACKENDS.libreoffice) or (IS_WINDOWS and bool(BACKENDS.office_app))
-    if src_ext in OFFICE_DOC_IN | {"pdf"}:
-        if can_produce_pdf:
-            out.append("pdf")
-        out.append("docx")
-    if src_ext in OFFICE_SHEET_IN:
-        out += ["xlsx", "pdf", "csv"]
+    if src_ext == "pdf":
+        out += ["docx", "txt", "md", "html", "csv", "png", "jpg", "webp", "odt", "rtf"]
+    if src_ext in OFFICE_DOC_IN:
+        out += ["pdf", "docx", "txt", "md", "html", "rtf", "odt"]
+    if src_ext in OFFICE_SHEET_IN or src_ext == "tsv":
+        out += ["xlsx", "pdf", "csv", "ods", "txt", "html"]
     if src_ext in OFFICE_SLIDE_IN:
-        out += ["pptx", "pdf"]
-    if src_ext in IMAGE_EXTS:
-        out += ["webp", "png", "jpg", "avif", "jxl"]
+        out += ["pptx", "pdf", "odp"]
+    if src_ext in IMAGE_EXTS or src_ext in ("wmf", "emf"):
+        out += ["webp", "png", "jpg", "pdf", "avif", "jxl", "tiff", "bmp", "ico", "gif"]
     if src_ext in TEXT_EXTS:
-        out += ["docx", "txt", "md", "html", "pdf"]
+        out += ["docx", "pdf", "txt", "md", "html", "rtf", "odt"]
     if src_ext == "epub":
-        out += ["txt", "docx", "html"]
-    # de-duplicate, keep order, drop self
+        out += ["txt", "docx", "html", "md", "pdf"]
+    if src_ext == "xps":
+        out += ["pdf", "docx", "png", "jpg"]
+    # de-duplicate, keep order, drop self and legacy formats
     seen, res = set(), []
     for e in out:
         if e != src_ext and e not in seen:
             seen.add(e)
             res.append(e)
-    return res[:4]
+    return res
+
+
+def newest_target_for(src_ext: str) -> list[str]:
+    """Suggested 'latest version' targets for a given source extension."""
+    return all_targets_for(src_ext)
 
 
 # --------------------------------------------------------------------------- #
@@ -154,6 +205,8 @@ class Backends:
         self.office_app: dict[str, str] = {}      # word|excel|powerpoint -> ProgId
         self.pillow = False
         self.pdf2docx = False
+        self.pymupdf = False
+        self.pypdf = False
         self.python_docx = False
         self.chardet = False
         self.detect()
@@ -172,42 +225,40 @@ class Backends:
                     break
             if not self.libreoffice:
                 self.libreoffice = shutil.which("soffice")
-            try:  # only meaningful inside a Windows session
-                import winreg  # noqa: WPS433
-                for app, progid in (
-                    ("word", "Word.Application"),
-                    ("excel", "Excel.Application"),
-                    ("powerpoint", "PowerPoint.Application"),
-                ):
-                    for hive in (winreg.HKEY_CLASSES_ROOT,):
-                        try:
-                            winreg.OpenKey(hive, progid)
-                            self.office_app[app] = progid
-                            break
-                        except OSError:
-                            continue
-            except Exception:
-                pass
+            if winreg is not None:  # only meaningful inside a Windows session
+                try:
+                    for app, progid in (
+                        ("word", "Word.Application"),
+                        ("excel", "Excel.Application"),
+                        ("powerpoint", "PowerPoint.Application"),
+                    ):
+                        for hive in (winreg.HKEY_CLASSES_ROOT,):
+                            try:
+                                winreg.OpenKey(hive, progid)
+                                self.office_app[app] = progid
+                                break
+                            except OSError:
+                                continue
+                except Exception:
+                    pass
         else:
             self.libreoffice = shutil.which("soffice") or shutil.which("libreoffice")
+        for attr, mod_name in (
+            ("pillow", "PIL"),
+            ("pymupdf", "fitz"),
+            ("pypdf", "pypdf"),
+            ("python_docx", "docx"),
+            ("chardet", "chardet"),
+        ):
+            try:
+                importlib.import_module(mod_name)
+                setattr(self, attr, True)
+            except Exception:
+                pass
         try:
-            import PIL  # noqa: F401
-            self.pillow = True
-        except Exception:
-            pass
-        try:
-            import pdf2docx  # noqa: F401
+            _patch_pdf2docx_compat()
+            importlib.import_module("pdf2docx")
             self.pdf2docx = True
-        except Exception:
-            pass
-        try:
-            import docx  # noqa: F401
-            self.python_docx = True
-        except Exception:
-            pass
-        try:
-            import chardet  # noqa: F401
-            self.chardet = True
         except Exception:
             pass
 
@@ -217,9 +268,38 @@ class Backends:
             "office_apps": dict(self.office_app),
             "pillow": self.pillow,
             "pdf2docx": self.pdf2docx,
+            "pymupdf": self.pymupdf,
+            "pypdf": self.pypdf,
             "python_docx": self.python_docx,
             "chardet": self.chardet,
         }
+
+
+def _patch_pdf2docx_compat() -> None:
+    """Fix upstream PyMuPDF >= 1.24.3 and NumPy >= 2.0 breaking changes in pdf2docx 0.5.8."""
+    try:
+        np: Any = importlib.import_module("numpy")
+        for alias, target in (
+            ("float_", np.float64),
+            ("int_", np.int64),
+            ("int0", np.intp),
+            ("bool8", np.bool_),
+            ("Inf", np.inf),
+            ("NaN", np.nan),
+        ):
+            if not hasattr(np, alias):
+                setattr(np, alias, target)
+    except Exception:
+        pass
+    try:
+        fitz: Any = importlib.import_module("fitz")
+        # PyMuPDF 1.24.3+ removed Rect.get_area() / IRect.get_area() which pdf2docx calls
+        for cls_name in ("Rect", "IRect"):
+            cls = getattr(fitz, cls_name, None)
+            if cls is not None and not hasattr(cls, "get_area"):
+                setattr(cls, "get_area", lambda self: abs(self))
+    except Exception:
+        pass
 
 
 BACKENDS = Backends()
@@ -271,11 +351,21 @@ def lo_convert(src: Path, dst: Path, extra: Optional[list[str]] = None) -> None:
     if not BACKENDS.libreoffice:
         raise RuntimeError("LibreOffice not found")
     outdir = dst.parent
-    filt = _LO_FILTERS.get(dst.suffix.lstrip("."))
+    dst_ext = dst.suffix.lstrip(".").lower()
+    src_ext = src.suffix.lstrip(".").lower()
+    filt = _LO_FILTERS.get(dst_ext)
+    prof_dir = Path(tempfile.gettempdir()) / f"confas_lo_profile_{os.getpid()}_{threading.get_ident()}"
+    prof_uri = prof_dir.resolve().as_uri()
     args = [
         BACKENDS.libreoffice, "--headless", "--norestore", "--nologo", "--nofirststartwizard",
-        f"-env:UserInstallation=file:///{tempfile.gettempdir()}/confas_lo_profile",
-        "--convert-to", (f"{filt}" if filt else dst.suffix.lstrip(".")),
+        f"-env:UserInstallation={prof_uri}",
+    ]
+    # Crucial for PDF -> DOCX/ODT/RTF/TXT/HTML: force LibreOffice Writer import
+    # instead of Draw (which rejects MS Word 2007 XML export with error 207).
+    if src_ext == "pdf" and dst_ext in ("docx", "doc", "odt", "rtf", "txt", "html", "htm"):
+        args.append("--infilter=writer_pdf_import")
+    args += [
+        "--convert-to", (f"{dst_ext}:{filt}" if filt else dst_ext),
     ]
     if extra:
         args[-1] += ": " + ", ".join(extra)
@@ -308,39 +398,152 @@ _FILEFORMAT = {  # https://learn.microsoft.com/office/vba/api/wdwdformat etc.
 _WORD_ONLY_FMTS = {"html", "rtf", "txt"}
 
 
-def conv_office_com(src: Path, dst: Path) -> None:
-    if not IS_WINDOWS:
-        raise RuntimeError("Office COM requires Windows")
-    import pythoncom  # type: ignore
-    from win32com.client import DispatchEx, constants  # type: ignore
-    pythoncom.CoInitialize()
-    try:
-        ext = dst.suffix.lstrip(".").lower()
-        app_name = None
-        if src.suffix.lstrip(".").lower() in OFFICE_SHEET_IN and ext in ("xlsx", "pdf", "csv", "xls"):
-            app_name = "excel"
-        elif src.suffix.lstrip(".").lower() in OFFICE_SLIDE_IN and ext in ("pptx", "pdf", "ppt"):
-            app_name = "powerpoint"
-        else:
-            app_name = "word"
-        progid = BACKENDS.office_app.get(app_name)
-        if not progid:
-            raise RuntimeError(f"Microsoft {app_name.title()} not installed")
-        app = DispatchEx(progid)
+class _OfficeStaWorker:
+    """Dedicated STA thread keeping one Office COM application warm across files."""
+
+    IDLE_TIMEOUT_S = 45.0
+
+    def __init__(self, app_name: str, progid: str) -> None:
+        self.app_name = app_name
+        self.progid = progid
+        self._q: "queue.Queue" = queue.Queue()
+        self._thread: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
+
+    def _ensure_thread(self) -> None:
+        with self._lock:
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(
+                    target=self._loop, daemon=True, name=f"confas-com-{self.app_name}"
+                )
+                self._thread.start()
+
+    def submit(self, fn: Callable[[Any], None]) -> None:
+        self._ensure_thread()
+        res_q: "queue.Queue[tuple[bool, Any]]" = queue.Queue(maxsize=1)
+        self._q.put((fn, res_q))
+        ok, payload = res_q.get()
+        if not ok:
+            raise payload
+
+    def shutdown(self) -> None:
+        with self._lock:
+            if self._thread and self._thread.is_alive():
+                self._q.put(None)
+
+    def _spawn_app(self) -> Any:
+        win32_client: Any = importlib.import_module("win32com.client")
+        app = win32_client.DispatchEx(self.progid)
         try:
             app.Visible = False
         except Exception:
             pass
         try:
-            app.DisplayAlerts = False     # also suppresses the Word PDF-reflow prompt
+            app.DisplayAlerts = False
         except Exception:
             pass
-        target = Path(dst)
-        if target.exists():
-            target = _unique(target)
-        dst_abs = str(target.resolve())
+        return app
+
+    def _quit_app(self, app: Any) -> None:
+        if app is not None:
+            try:
+                app.Quit()
+            except Exception:
+                pass
+
+    def _loop(self) -> None:
+        pythoncom: Any = importlib.import_module("pythoncom")
+        pythoncom.CoInitialize()
+        app = None
+        try:
+            while True:
+                try:
+                    item = self._q.get(timeout=self.IDLE_TIMEOUT_S)
+                except queue.Empty:
+                    # Idle timeout expired -> release COM server until next batch
+                    self._quit_app(app)
+                    app = None
+                    continue
+                if item is None:
+                    break
+                fn, res_q = item
+                try:
+                    if app is None:
+                        app = self._spawn_app()
+                    try:
+                        fn(app)
+                    except Exception:
+                        # Retry once with a fresh COM process in case RPC died
+                        self._quit_app(app)
+                        app = self._spawn_app()
+                        fn(app)
+                    res_q.put((True, None))
+                except Exception as exc:
+                    self._quit_app(app)
+                    app = None
+                    res_q.put((False, exc))
+        finally:
+            self._quit_app(app)
+            pythoncom.CoUninitialize()
+
+
+class _OfficeComPool:
+    def __init__(self) -> None:
+        self._workers: dict[str, _OfficeStaWorker] = {}
+        self._lock = threading.Lock()
+
+    def run(self, app_name: str, progid: str, fn: Callable[[Any], None]) -> None:
+        with self._lock:
+            w = self._workers.get(app_name)
+            if w is None:
+                w = _OfficeStaWorker(app_name, progid)
+                self._workers[app_name] = w
+        w.submit(fn)
+
+    def shutdown(self) -> None:
+        with self._lock:
+            workers = list(self._workers.values())
+            self._workers.clear()
+        for w in workers:
+            w.shutdown()
+
+
+_OFFICE_POOL = _OfficeComPool()
+
+
+def conv_office_com(src: Path, dst: Path) -> None:
+    if not IS_WINDOWS:
+        raise RuntimeError("Office COM requires Windows")
+    ext = dst.suffix.lstrip(".").lower()
+    if src.suffix.lstrip(".").lower() in OFFICE_SHEET_IN and ext in ("xlsx", "pdf", "csv", "xls"):
+        app_name = "excel"
+    elif src.suffix.lstrip(".").lower() in OFFICE_SLIDE_IN and ext in ("pptx", "pdf", "ppt"):
+        app_name = "powerpoint"
+    else:
+        app_name = "word"
+    progid = BACKENDS.office_app.get(app_name)
+    if not progid:
+        raise RuntimeError(f"Microsoft {app_name.title()} not installed")
+    target = Path(dst)
+    if target.exists():
+        target = _unique(target)
+    dst_abs = str(target.resolve())
+    src_abs = str(src.resolve())
+
+    def _do_convert(app: Any) -> None:
+        try:
+            app.DisplayAlerts = 0  # wdAlertsNone
+        except Exception:
+            pass
         if app_name == "word":
-            doc = app.Documents.Open(str(src.resolve()), ReadOnly=True)
+            doc = app.Documents.Open(
+                src_abs,
+                ConfirmConversions=False,
+                ReadOnly=True,
+                AddToRecentFiles=False,
+                Visible=False,
+                NoEncodingDialog=True,
+            )
             try:
                 fmt = _FILEFORMAT.get(ext)
                 if ext == "pdf":
@@ -352,7 +555,7 @@ def conv_office_com(src: Path, dst: Path) -> None:
             finally:
                 doc.Close(SaveChanges=False)
         elif app_name == "excel":
-            wb = app.Workbooks.Open(str(src.resolve()), ReadOnly=True)
+            wb = app.Workbooks.Open(src_abs, ReadOnly=True)
             try:
                 if ext == "pdf":
                     wb.ExportAsFixedFormat(-1, dst_abs)  # xlTypePDF
@@ -361,7 +564,7 @@ def conv_office_com(src: Path, dst: Path) -> None:
             finally:
                 wb.Close(SaveChanges=False)
         else:  # powerpoint
-            pres = app.Presentations.Open(str(src.resolve()), WithWindow=False)
+            pres = app.Presentations.Open(src_abs, WithWindow=False)
             try:
                 if ext == "pdf":
                     pres.SaveAs(dst_abs, 32)  # ppSaveAsPDF
@@ -369,12 +572,8 @@ def conv_office_com(src: Path, dst: Path) -> None:
                     pres.SaveAs(dst_abs, _FILEFORMAT.get(ext, 24))
             finally:
                 pres.Close()
-    finally:
-        try:
-            app.Quit()
-        except Exception:
-            pass
-        pythoncom.CoUninitialize()
+
+    _OFFICE_POOL.run(app_name, progid, _do_convert)
     out_file = Path(dst_abs)
     if not out_file.exists():
         raise RuntimeError("Office COM produced no output")
@@ -383,15 +582,132 @@ def conv_office_com(src: Path, dst: Path) -> None:
         out_file.replace(wanted)
 
 
-# ---- pdf2docx (layout-preserving PDF -> DOCX) ------------------------------ #
+# ---- pdf2docx + PyMuPDF/pypdf fallbacks (PDF -> DOCX) ---------------------- #
 
 def conv_pdf2docx(src: Path, dst: Path) -> None:
-    from pdf2docx import Converter  # type: ignore
-    cv = Converter(str(src))
+    _ensure_stdio()
+    _patch_pdf2docx_compat()
+    pdf2docx_mod: Any = importlib.import_module("pdf2docx")
+    cv = pdf2docx_mod.Converter(str(src))
     try:
         cv.convert(str(dst), start=0, end=None)
     finally:
         cv.close()
+    if not dst.exists() or dst.stat().st_size == 0:
+        raise RuntimeError("pdf2docx produced no output file")
+    # Check if pdf2docx produced a blank document (e.g. scanned/complex PDF)
+    if BACKENDS.python_docx:
+        try:
+            docx: Any = importlib.import_module("docx")
+            d = docx.Document(str(dst))
+            has_text = any(p.text.strip() for p in d.paragraphs)
+            has_tables = bool(d.tables)
+            has_shapes = bool(d.inline_shapes)
+            if not (has_text or has_tables or has_shapes):
+                dst.unlink(missing_ok=True)
+                raise RuntimeError("pdf2docx produced an empty DOCX (likely scanned PDF)")
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+
+
+def conv_pdf_to_docx_pymupdf(src: Path, dst: Path) -> None:
+    """High-reliability PDF -> DOCX via PyMuPDF (fitz) + python-docx.
+
+    Preserves headings, bold/italic text runs, and embedded images; if a page
+    is scanned (image-only with no text), renders the page at 200 DPI into the
+    Word document so scanned PDFs convert cleanly.
+    """
+    fitz: Any = importlib.import_module("fitz")
+    docx: Any = importlib.import_module("docx")
+    docx_shared: Any = importlib.import_module("docx.shared")
+    Inches = docx_shared.Inches
+    Pt = docx_shared.Pt
+
+    pdf = fitz.open(str(src))
+    if len(pdf) == 0:
+        pdf.close()
+        raise RuntimeError("PDF has 0 pages")
+    doc = docx.Document()
+    style = doc.styles["Normal"]
+    style.font.name = "Calibri"
+    style.font.size = Pt(11)
+
+    try:
+        for page_idx, page in enumerate(pdf):
+            if page_idx > 0:
+                doc.add_page_break()
+            pdict = page.get_text("dict")
+            blocks = pdict.get("blocks", []) if isinstance(pdict, dict) else []
+            wrote_any_text = False
+            for b in blocks:
+                if b.get("type") == 0:  # text block
+                    for line in b.get("lines", []):
+                        spans = line.get("spans", [])
+                        if not spans:
+                            continue
+                        line_text = "".join(s.get("text", "") for s in spans).strip()
+                        if not line_text:
+                            continue
+                        wrote_any_text = True
+                        max_size = max((float(s.get("size", 11.0)) for s in spans), default=11.0)
+                        if max_size >= 18.0:
+                            doc.add_heading(line_text, level=1)
+                        elif max_size >= 14.5:
+                            doc.add_heading(line_text, level=2)
+                        else:
+                            p = doc.add_paragraph()
+                            for s in spans:
+                                txt = s.get("text", "")
+                                if not txt:
+                                    continue
+                                r = p.add_run(txt)
+                                flags = int(s.get("flags", 0))
+                                font_name = (s.get("font") or "").lower()
+                                if (flags & 16) or "bold" in font_name:
+                                    r.bold = True
+                                if (flags & 2) or "italic" in font_name or "oblique" in font_name:
+                                    r.italic = True
+            # If the page had no extractable text (e.g. scanned page), embed rendered page image
+            if not wrote_any_text:
+                pix = page.get_pixmap(dpi=200)
+                img_bytes = pix.tobytes("png")
+                doc.add_picture(io.BytesIO(img_bytes), width=Inches(6.2))
+    finally:
+        pdf.close()
+    doc.save(str(dst))
+
+
+def conv_pdf_to_docx_pypdf(src: Path, dst: Path) -> None:
+    """Pure-Python fallback PDF -> DOCX via pypdf + python-docx."""
+    pypdf_mod: Any = importlib.import_module("pypdf")
+    docx: Any = importlib.import_module("docx")
+    docx_shared: Any = importlib.import_module("docx.shared")
+    PdfReader = pypdf_mod.PdfReader
+    Pt = docx_shared.Pt
+
+    reader = PdfReader(str(src), strict=True)
+    if len(reader.pages) == 0:
+        raise RuntimeError("PDF has 0 pages")
+    doc = docx.Document()
+    style = doc.styles["Normal"]
+    style.font.name = "Calibri"
+    style.font.size = Pt(11)
+    wrote_any = False
+    for idx, page in enumerate(reader.pages):
+        if idx > 0:
+            doc.add_page_break()
+        txt = (page.extract_text() or "").strip()
+        if txt:
+            wrote_any = True
+            for para in re.split(r"\n\s*\n", txt):
+                clean = para.strip()
+                if clean:
+                    doc.add_paragraph(clean)
+    if not wrote_any:
+        raise RuntimeError("pypdf extracted no text from PDF")
+    doc.save(str(dst))
 
 
 # ---- Pillow image pipeline (C-speed) --------------------------------------- #
@@ -401,12 +717,13 @@ _IMG_QUALITY = {"jpg": 95, "jpeg": 95, "webp": 95, "avif": 60, "heic": 60,
 
 
 def conv_pillow(src: Path, dst: Path) -> None:
-    from PIL import Image, ImageOps  # type: ignore
+    Image: Any = importlib.import_module("PIL.Image")
+    ImageOps: Any = importlib.import_module("PIL.ImageOps")
     ext = dst.suffix.lstrip(".").lower()
     if ext == "jpg":
         ext = "jpeg"
-    with Image.open(src) as im:
-        im = ImageOps.exif_transpose(im)
+    with Image.open(src) as im_orig:
+        im = ImageOps.exif_transpose(im_orig) or im_orig
         if ext in ("jpeg", "bmp", "ico") and im.mode in ("RGBA", "LA", "P"):
             bg = Image.new("RGB", im.size, (255, 255, 255))
             rgba = im.convert("RGBA")
@@ -414,7 +731,7 @@ def conv_pillow(src: Path, dst: Path) -> None:
             im = bg
         elif ext in ("jpeg", "bmp") and im.mode not in ("RGB", "L"):
             im = im.convert("RGB")
-        save_kw: dict = {}
+        save_kw: dict[str, Any] = {}
         q = _IMG_QUALITY.get(ext)
         if q is not None and ext in ("jpeg", "webp", "tiff"):
             save_kw["quality"] = q
@@ -424,23 +741,27 @@ def conv_pillow(src: Path, dst: Path) -> None:
             save_kw["optimize"] = True
         if ext == "jpeg":
             save_kw["subsampling"] = 0     # 4:4:4 = maximum fidelity
-            save_kw["exif"] = im.info.get("exif", b"") or None
-            if save_kw["exif"] is None:
-                save_kw.pop("exif")
+            exif_bytes = im.info.get("exif", b"")
+            if exif_bytes:
+                save_kw["exif"] = exif_bytes
         im.save(dst, **save_kw)
 
 
 # ---- Text-family conversions ----------------------------------------------- #
 
 def _read_text_auto(path: Path) -> tuple[str, str]:
-    raw = path.read_bytes()[:200_000] or path.read_bytes()
+    raw = path.read_bytes()
+    if not raw:
+        return "", "utf-8"
     enc = "utf-8"
+    sample = raw[:65_536]
     if BACKENDS.chardet:
-        guess = __import__("chardet").detect(raw)
+        chardet: Any = importlib.import_module("chardet")
+        guess = chardet.detect(sample)
         if guess.get("encoding"):
             enc = guess["encoding"]
     try:
-        return raw.decode(enc, errors="replace") if len(raw) else "", enc
+        return raw.decode(enc, errors="replace"), enc
     except LookupError:
         return raw.decode("utf-8", errors="replace"), "utf-8"
 
@@ -451,10 +772,10 @@ def conv_text_generic(src: Path, dst: Path) -> None:
     if ext in ("txt", "md", "log", "csv", "tsv", "json", "xml", "srt", "yml", "yaml", "ini"):
         dst.write_text(text, encoding="utf-8-sig")
     elif ext in ("html", "htm"):
-        body = __import__("html").escape(text)
+        body = _html_mod.escape(text)
         dst.write_text(
             "<!DOCTYPE html><html><head><meta charset='utf-8'><title>"
-            f"{__import__('html').escape(src.stem)}</title></head><body><pre>{body}</pre></body></html>",
+            f"{_html_mod.escape(src.stem)}</title></head><body><pre>{body}</pre></body></html>",
             encoding="utf-8")
     else:
         raise RuntimeError(f"unsupported text target .{ext}")
@@ -464,9 +785,9 @@ _MD_HEURISTIC = re.compile(r"^(#{1,6}\s|[*-]\s|\d+.\s|>\s|`|\*\*)", re.M)
 
 
 def conv_text_to_docx(src: Path, dst: Path) -> None:
-    import docx  # type: ignore
-    from docx.enum.text import WD_ALIGN_PARAGRAPH  # type: ignore
-    from docx.shared import Pt  # type: ignore
+    docx: Any = importlib.import_module("docx")
+    docx_shared: Any = importlib.import_module("docx.shared")
+    Pt = docx_shared.Pt
     text, _ = _read_text_auto(src)
     lines = text.splitlines()
     d = docx.Document()
@@ -528,26 +849,31 @@ def conv_html_to_docx(src: Path, dst: Path) -> None:
 
 
 def conv_epub_extract(src: Path, dst: Path) -> None:
-    import zipfile
-    from xml.etree import ElementTree as ET
     texts: list[str] = []
     with zipfile.ZipFile(src) as z:
         names = [n for n in z.namelist() if n.lower().endswith((".xhtml", ".html", ".htm"))]
         # respect spine order when possible
         try:
             root = ET.fromstring(z.read("META-INF/container.xml"))
-            opf_path = root.findall(".//{urn:oasis:names:tc:opendocument:xmlns:container}rootfile")[0].get("full-path")
-            opf_dir = str(Path(opf_path).parent)
-            opf = ET.fromstring(z.read(opf_path))
-            ns = {"p": "http://www.idpf.org/2007/opf", "c": "http://www.idpf.org/2007/opf"}
-            manifest = {it.get("id"): it.get("href")
-                        for it in opf.findall(".//p:manifest/p:item", ns)}
-            ordered = []
-            for it in opf.findall(".//p:spine/p:itemref", ns):
-                href = manifest.get(it.get("idref"))
-                if href:
-                    ordered.append((opf_dir + "/" + href).replace("\\", "/").lstrip("./"))
-            names = [n for n in ordered if n in z.namelist()] or names
+            rootfiles = root.findall(".//{urn:oasis:names:tc:opendocument:xmlns:container}rootfile")
+            opf_path = rootfiles[0].get("full-path") if rootfiles else None
+            if opf_path:
+                opf_dir = str(Path(opf_path).parent)
+                opf = ET.fromstring(z.read(opf_path))
+                ns = {"p": "http://www.idpf.org/2007/opf", "c": "http://www.idpf.org/2007/opf"}
+                manifest: dict[str, str] = {}
+                for it in opf.findall(".//p:manifest/p:item", ns):
+                    item_id = it.get("id")
+                    item_href = it.get("href")
+                    if item_id and item_href:
+                        manifest[item_id] = item_href
+                ordered: list[str] = []
+                for it in opf.findall(".//p:spine/p:itemref", ns):
+                    idref = it.get("idref")
+                    href = manifest.get(idref) if idref else None
+                    if href:
+                        ordered.append((opf_dir + "/" + href).replace("\\", "/").lstrip("./"))
+                names = [n for n in ordered if n in z.namelist()] or names
         except Exception:
             pass
         for n in sorted(names):
@@ -571,7 +897,7 @@ def conv_epub_extract(src: Path, dst: Path) -> None:
         conv_text_to_docx(tmp, dst)
         tmp.unlink(missing_ok=True)
     elif ext in ("html", "htm"):
-        body = __import__("html").escape(joined)
+        body = _html_mod.escape(joined)
         dst.write_text(f"<!DOCTYPE html><html><head><meta charset='utf-8'></head>"
                        f"<body><pre>{body}</pre></body></html>", encoding="utf-8")
     else:
@@ -579,7 +905,7 @@ def conv_epub_extract(src: Path, dst: Path) -> None:
 
 
 def conv_docx_to_text(src: Path, dst: Path) -> None:
-    import docx  # type: ignore
+    docx: Any = importlib.import_module("docx")
     d = docx.Document(str(src))
     lines = [p.text for p in d.paragraphs]
     for t in d.tables:
@@ -590,7 +916,7 @@ def conv_docx_to_text(src: Path, dst: Path) -> None:
 
 def conv_image_to_pdf(src: Path, dst: Path) -> None:
     if BACKENDS.pillow:
-        from PIL import Image  # type: ignore
+        Image: Any = importlib.import_module("PIL.Image")
         with Image.open(src) as im:
             if im.mode != "RGB":
                 im = im.convert("RGB")
@@ -600,15 +926,40 @@ def conv_image_to_pdf(src: Path, dst: Path) -> None:
 
 
 def conv_pdf_to_text(src: Path, dst: Path) -> None:
+    ext = dst.suffix.lstrip(".").lower()
+    if BACKENDS.pymupdf:
+        fitz: Any = importlib.import_module("fitz")
+        doc = fitz.open(str(src))
+        try:
+            if ext in ("html", "htm"):
+                parts = [page.get_text("html") for page in doc]
+                dst.write_text(
+                    "<!DOCTYPE html><html><head><meta charset='utf-8'></head><body>\n"
+                    + "\n<hr/>\n".join(parts) + "\n</body></html>",
+                    encoding="utf-8",
+                )
+                return
+            text = "\n\n".join((page.get_text("text") or "").strip() for page in doc)
+            dst.write_text(text, encoding="utf-8-sig")
+            return
+        finally:
+            doc.close()
     try:
-        from pypdf import PdfReader  # type: ignore
+        pypdf_mod: Any = importlib.import_module("pypdf")
+        PdfReader = pypdf_mod.PdfReader
     except ImportError:
-        # fall back to LibreOffice -> txt
         lo_convert(src, dst)
         return
     reader = PdfReader(str(src))
     text = "\n".join((page.extract_text() or "") for page in reader.pages)
-    dst.write_text(text, encoding="utf-8-sig")
+    if ext in ("html", "htm"):
+        body = _html_mod.escape(text)
+        dst.write_text(
+            f"<!DOCTYPE html><html><head><meta charset='utf-8'></head><body><pre>{body}</pre></body></html>",
+            encoding="utf-8",
+        )
+    else:
+        dst.write_text(text, encoding="utf-8-sig")
 
 
 # --------------------------------------------------------------------------- #
@@ -641,19 +992,29 @@ def _routes_for(src_ext: str, dst_ext: str) -> list[Route]:
         add("libreoffice", conv_libreoffice, 20)
     elif s == "pdf" and d == "docx":
         if BACKENDS.pdf2docx:
-            add("pdf2docx", conv_pdf2docx, 90)
+            add("pdf2docx", conv_pdf2docx, 95)
         if word_available:
             # Word 2013+ PDF reflow: excellent for text-centric PDFs
-            add("office-com", conv_office_com, 80)
-        add("libreoffice", conv_libreoffice, 60)
-    elif s == "pdf" and d in ("txt", "md", "csv"):
+            add("office-com", conv_office_com, 85)
+        if BACKENDS.pymupdf and BACKENDS.python_docx:
+            add("pymupdf-docx", conv_pdf_to_docx_pymupdf, 75)
+        add("libreoffice", conv_libreoffice, 65)
+        if BACKENDS.pypdf and BACKENDS.python_docx:
+            add("pypdf-docx", conv_pdf_to_docx_pypdf, 50)
+    elif s == "pdf" and d in ("txt", "md", "csv", "html", "htm"):
         add("pypdf", conv_pdf_to_text, 90)
+        if word_available and d in _WORD_ONLY_FMTS:
+            add("office-com", conv_office_com, 60)
         add("libreoffice", conv_libreoffice, 40)
+    elif s == "pdf" and d in ("odt", "rtf"):
+        if word_available and d == "rtf":
+            add("office-com", conv_office_com, 85)
+        add("libreoffice", conv_libreoffice, 75)
     elif s == "pdf" and d in ("jpg", "jpeg", "png", "webp"):
-        if BACKENDS.pillow:
-            def pdf_img(src: Path, dst: Path, sub=0) -> None:
+        if BACKENDS.pillow and BACKENDS.pymupdf:
+            def pdf_img(src: Path, dst: Path, sub: int = 0) -> None:
                 # render page(s) via pdftoppm-like path using PyMuPDF if present
-                import fitz  # type: ignore
+                fitz: Any = importlib.import_module("fitz")
                 doc = fitz.open(src)
                 pg = doc[sub]
                 pix = pg.get_pixmap(dpi=200)
@@ -662,11 +1023,7 @@ def _routes_for(src_ext: str, dst_ext: str) -> list[Route]:
                     conv_pillow(dst.with_suffix(".png"), dst)
                     dst.with_suffix(".png").unlink(missing_ok=True)
                 doc.close()
-            try:
-                import fitz  # noqa: F401
-                add("pymupdf", pdf_img, 90)
-            except ImportError:
-                pass
+            add("pymupdf", pdf_img, 90)
         add("libreoffice", conv_libreoffice, 30)
     elif s in IMAGE_EXTS and d == "pdf":
         if BACKENDS.pillow:
@@ -767,7 +1124,8 @@ class ConversionEngine:
 
     def __init__(self, enable_ml: bool = True, history_file: Optional[Path] = None) -> None:
         self.enable_ml = enable_ml and os.environ.get("CONFAS_DISABLE_ML") != "1"
-        self._selector = None
+        self._selector: Any = None
+        self.cloud: Any = None
         if self.enable_ml:
             try:
                 from .learning import BanditSelector
@@ -784,8 +1142,6 @@ class ConversionEngine:
                     cloud.start()          # no-op unless cloud_sync is on
                 except Exception:
                     self.cloud = None
-            else:
-                self.cloud = None
         self._pool = ThreadPoolExecutor(max_workers=max(2, (os.cpu_count() or 4)))
         self._lock = threading.Lock()
 
@@ -843,7 +1199,7 @@ class ConversionEngine:
                 attempts.append({"backend": r.name, "ok": True, "ms": att_ms,
                                  "error": "", "traceback": ""})
                 if self._selector:
-                    self._selector.record(src, dst_ext, r.name, ms, True)
+                    self._selector.record(src, dst_ext, r.name, att_ms, True)
                 res = ConversionResult(str(src), str(base), r.name, ms, True,
                                        bytes_in=src.stat().st_size,
                                        bytes_out=base.stat().st_size if base.exists() else 0)
@@ -853,7 +1209,6 @@ class ConversionEngine:
                 debuglog.finalize(sess, res)
                 return res
             except Exception as exc:  # try next backend
-                ms_so_far = (time.perf_counter() - t0) * 1000
                 att_ms = (time.perf_counter() - ta) * 1000
                 if self._selector:
                     self._selector.record(src, dst_ext, r.name, att_ms, False)
@@ -886,6 +1241,12 @@ class ConversionEngine:
 
     def shutdown(self) -> None:
         self._pool.shutdown(wait=False)
+        _OFFICE_POOL.shutdown()
+        if self.cloud is not None:
+            try:
+                self.cloud.stop()
+            except Exception:
+                pass
 
 
 ENGINE_SINGLETON: Optional[ConversionEngine] = None

@@ -40,3 +40,36 @@ def test_nonwindows_no_registry_calls():
     if not monitor.IS_WINDOWS:
         assert monitor.register_startup() is False
         assert monitor.install_context_menu() == 0
+
+
+def test_all_choices_available_in_menus():
+    """Every file family must expose all supported conversion targets, not just 2-3."""
+    pdf_targets = monitor.menu_targets("pdf")
+    for expected in ("docx", "txt", "md", "html", "csv", "png", "jpg", "webp"):
+        assert expected in pdf_targets
+    docx_targets = monitor.menu_targets("docx")
+    for expected in ("pdf", "txt", "md", "html", "rtf", "odt"):
+        assert expected in docx_targets
+    png_targets = monitor.menu_targets("png")
+    for expected in ("webp", "jpg", "pdf", "avif", "jxl", "tiff", "bmp", "ico", "gif"):
+        assert expected in png_targets
+
+
+def test_daemon_ipc_delegation(tmp_path, monkeypatch):
+    monkeypatch.setenv("CONFAS_HOME", str(tmp_path))
+    src = tmp_path / "ipc_note.txt"
+    src.write_text("Hello via warm daemon IPC\n", encoding="utf-8")
+    srv = monitor.DaemonIPCServer({"ml_enabled": False})
+    srv.start_and_publish()
+    try:
+        # Pretend the IPC file belongs to a different live PID so client connects
+        meta = __import__("json").loads(monitor.ipc_file().read_text(encoding="utf-8"))
+        meta["pid"] = 0
+        monitor.ipc_file().write_text(__import__("json").dumps(meta), encoding="utf-8")
+        seen = []
+        res = monitor.try_daemon_convert([(str(src), "html")], enable_ml=False, progress=seen.append)
+        assert res is not None and len(res) == 1
+        assert res[0].ok and len(seen) == 1
+        assert (tmp_path / "ipc_note.html").exists()
+    finally:
+        srv.stop()

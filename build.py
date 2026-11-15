@@ -17,7 +17,7 @@ SPEC = ROOT / "confas.spec"
 
 def check_imports() -> None:
     sys.path.insert(0, str(SRC))
-    import confas.engine, confas.learning, confas.monitor, confas.cli  # noqa: F401
+    import confas.engine, confas.learning, confas.monitor, confas.cli, confas.cloud, confas.debuglog  # noqa: F401
     print("imports OK")
 
 
@@ -35,12 +35,30 @@ def build() -> int:
         # why BACKENDS.pdf2docx showed False on users' machines): bundle them.
         "--collect-all", "fitz",             # PyMuPDF (pdf rendering/reflow)
         "--collect-all", "cv2",              # OpenCV (pdf2docx layout analysis)
+        "--collect-all", "docx",             # python-docx templates + shared
+        "--hidden-import", "numpy",
+        "--hidden-import", "PIL",
+        "--hidden-import", "PIL.Image",
+        "--hidden-import", "PIL.ImageOps",
+        "--hidden-import", "PIL.ImageDraw",
+        "--hidden-import", "docx",
+        "--hidden-import", "docx.shared",
+        "--hidden-import", "pdf2docx",
+        "--hidden-import", "pypdf",
+        "--hidden-import", "fitz",
+        "--hidden-import", "chardet",
+        "--hidden-import", "charset_normalizer",
         "--hidden-import", "win32com.client",
         "--hidden-import", "pythoncom",
         "--hidden-import", "pywintypes",
+        "--hidden-import", "pystray",
+        "--hidden-import", "pystray._win32",
         "--hidden-import", "confas.engine",
         "--hidden-import", "confas.learning",
         "--hidden-import", "confas.monitor",
+        "--hidden-import", "confas.cli",
+        "--hidden-import", "confas.cloud",
+        "--hidden-import", "confas.debuglog",
     ]
     icon = ROOT / "assets" / "confas.ico"
     if icon.exists():

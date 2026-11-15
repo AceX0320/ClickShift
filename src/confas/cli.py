@@ -16,6 +16,11 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Optional
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    __package__ = "confas"
 
 from . import __version__ as version
 from .engine import get_engine, newest_target_for, BACKENDS, _norm_ext
@@ -56,6 +61,73 @@ def _popup(title: str, text: str) -> None:
     print(f"{title}: {text}")
 
 
+def _pick_target_popup(src: Path) -> Optional[str]:
+    """Show a native Win32 popup menu at the mouse cursor with ALL conversion choices."""
+    targets = monitor.menu_targets(src.suffix)
+    if not targets:
+        targets = newest_target_for(src.suffix) or ["pdf"]
+    best = targets[0]
+    if not monitor.IS_WINDOWS or os.environ.get("CONFAS_NO_POPUP") == "1":
+        return best
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+
+        MF_STRING = 0x0000
+        MF_SEPARATOR = 0x0800
+        TPM_RETURNCMD = 0x0100
+        TPM_NONOTIFY = 0x0080
+        TPM_RIGHTBUTTON = 0x0002
+        WS_POPUP = 0x80000000
+        WS_EX_TOOLWINDOW = 0x00000080
+        WS_EX_TOPMOST = 0x00000008
+
+        hmenu = user32.CreatePopupMenu()
+        if not hmenu:
+            return best
+
+        # Header / Auto choice + all individual targets
+        user32.AppendMenuW(hmenu, MF_STRING, 1, f"Auto -> {best.upper()} (Recommended)")
+        user32.AppendMenuW(hmenu, MF_SEPARATOR, 0, None)
+        for idx, t in enumerate(targets, start=2):
+            user32.AppendMenuW(hmenu, MF_STRING, idx, f"Convert to {t.upper()}  (.{t})")
+
+        pt = wintypes.POINT()
+        user32.GetCursorPos(ctypes.byref(pt))
+
+        hinst = kernel32.GetModuleHandleW(None)
+        hwnd = user32.CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+            "Static",
+            "ConFasMenuHost",
+            WS_POPUP,
+            pt.x, pt.y, 1, 1,
+            None, None, hinst, None,
+        )
+        user32.ShowWindow(hwnd, 1)
+        user32.SetForegroundWindow(hwnd)
+        cmd_id = user32.TrackPopupMenu(
+            hmenu,
+            TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+            pt.x, pt.y, 0, hwnd, None,
+        )
+        user32.DestroyMenu(hmenu)
+        user32.DestroyWindow(hwnd)
+        if cmd_id <= 0:
+            return None  # user dismissed the menu
+        if cmd_id == 1:
+            return best
+        chosen_idx = cmd_id - 2
+        if 0 <= chosen_idx < len(targets):
+            return targets[chosen_idx]
+        return best
+    except Exception:
+        return best
+
+
 # --------------------------------------------------------------------------- #
 #  commands
 # --------------------------------------------------------------------------- #
@@ -86,14 +158,18 @@ def cmd_convert(args) -> int:
     if not files:
         print("No input files found.", file=sys.stderr)
         return 2
+    chosen_target = args.target
+    if getattr(args, "choose", False) and not chosen_target:
+        chosen_target = _pick_target_popup(files[0])
+        if chosen_target is None:
+            return 0  # user cancelled popup menu
     jobs: list[tuple[str, str]] = []
     for f in files:
-        t = args.target
+        t = chosen_target
         if not t:
             sugg = newest_target_for(f.suffix)
             t = sugg[0] if sugg else "pdf"
-        jobs.append((str(f), t))
-    engine = get_engine(enable_ml=not args.no_ml)
+        jobs.append((str(f.resolve()), t))
     # (progress printed per file as conversions finish)
     results = []
 
@@ -112,7 +188,11 @@ def cmd_convert(args) -> int:
             print(f"      debug report: {rep}")
 
     t0 = time.perf_counter()
-    engine.convert_many(jobs, progress=on_done)
+    ipc_res = monitor.try_daemon_convert(jobs, enable_ml=not args.no_ml, progress=on_done)
+    if ipc_res is None:
+        results.clear()
+        engine = get_engine(enable_ml=not args.no_ml)
+        engine.convert_many(jobs, progress=on_done)
     total_ms = (time.perf_counter() - t0) * 1000
     ok_n = sum(1 for r in results if r.ok)
     fail_n = len(results) - ok_n
@@ -255,6 +335,11 @@ def cmd_config(args) -> int:
             cfg["ml_enabled"] = v.lower() in ("1", "on", "true", "yes")
         elif k in ("watch", "watch_enabled"):
             cfg["watch_enabled"] = v.lower() in ("1", "on", "true", "yes")
+        elif k in ("win11_both_menus", "both_menus", "win11_menu"):
+            on = v.lower() in ("1", "on", "true", "yes")
+            cfg["win11_both_menus"] = on
+            monitor._set_win11_both_menus(on)
+            monitor.refresh_explorer()
         elif k in ("debug", "debug_reports"):
             vv = v.strip().lower()
             if vv not in ("always", "onerror", "off"):
@@ -316,6 +401,8 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("files", nargs="+", help="source file(s)")
     c.add_argument("-t", "--target", default=None,
                    help="target extension (default: latest generation for that type)")
+    c.add_argument("--choose", action="store_true",
+                   help="show native popup menu at cursor with all target choices")
     c.add_argument("--no-ml", action="store_true", help="disable adaptive backend learning")
     c.add_argument("--popup", action="store_true", help="show result popup even when not frozen")
     c.set_defaults(fn=cmd_convert)

@@ -48,26 +48,39 @@ Security model (defence in depth)
    pull/push is swallowed and logged; conversions keep working offline.
 """
 
+# pyright: reportMissingImports=false, reportMissingModuleSource=false
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import logging
 import os
+import sys
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    __package__ = "confas"
 
 log = logging.getLogger("confas.cloud")
 
-try:
-    import numpy as np
-except Exception:  # pragma: no cover
-    np = None  # type: ignore
+
+def _opt_import(name: str) -> Any:
+    try:
+        return importlib.import_module(name)
+    except Exception:  # pragma: no cover
+        return None
+
+
+np: Any = _opt_import("numpy")
 
 DEFAULT_GIST_ID = "REPLACE_WITH_YOUR_GIST_ID"
 API_ROOT = "https://api.github.com"
@@ -96,9 +109,9 @@ def _data_dir() -> Path:
     return Path(os.environ.get("CONFAS_HOME", str(Path.home() / ".confas")))
 
 
-def load_cloud_config() -> dict:
+def load_cloud_config() -> dict[str, Any]:
     """Merge DEFAULT_CONFIG's cloud keys with the user's config.json."""
-    cfg = {}
+    cfg: dict[str, Any] = {}
     try:
         from .monitor import DEFAULT_CONFIG, load_config
         full = load_config()
@@ -137,8 +150,8 @@ def save_token(t: str) -> Path:
 #  transport (urllib - no extra dependency inside the frozen EXE)
 # --------------------------------------------------------------------------- #
 
-def _request(url: str, method: str = "GET", body: Optional[dict] = None,
-             headers: Optional[dict] = None, timeout: int = 15) -> Optional[dict]:
+def _request(url: str, method: str = "GET", body: Optional[dict[str, Any]] = None,
+             headers: Optional[dict[str, str]] = None, timeout: int = 15) -> Optional[dict[str, Any]]:
     if not _check_url(url):
         log.warning("blocked non-https request to %r", url[:100])
         return None
@@ -167,30 +180,32 @@ def _request(url: str, method: str = "GET", body: Optional[dict] = None,
 #  merge logic (pure-python + numpy, safe on client AND in CI)
 # --------------------------------------------------------------------------- #
 
-def _clean_reward(v) -> float:
-    """Clamp a remote reward vector into the sane [-1, 1] bandit range."""
+def _clean_reward(v: Any, n: int = 1) -> Any:
+    """Clamp a remote accumulated reward vector b into the sane [-2.25*n, 2.25*n] range."""
     try:
         arr = np.array(v, dtype=float)
     except Exception:
         return None
     if arr.size == 0 or not np.all(np.isfinite(arr)):
         return None
-    return np.clip(arr, -1.0, 1.0)
+    bound = 2.25 * max(int(n), 1)
+    return np.clip(arr, -bound, bound)
 
 
-def merge_states(states: list[dict]) -> dict:
+def merge_states(states: list[Any]) -> dict[str, Any]:
     """Merge contributor states into one pooled state.
 
-    * ``bandit`` arms: A matrices averaged across contributors that have >=1
-      sample (each contributor's A starts at ridge*I, so averaging keeps the
-      proper prior scale), b vectors summed (rewards accumulate), n summed.
+    * ``bandit`` arms: A matrices and b vectors averaged across contributors
+      that have >=1 sample (each contributor's A starts at ridge*I, so
+      averaging preserves both the ridge prior scale and theta = A^-1 b),
+      while n is summed.
     * ``median_ms``: minimum observed latency wins (best-case speed knowledge).
     * ``clock``: max + 1 (Lamport).
     Security: every remote number is validated/bounded here; nonsense (NaN,
     negative counts, absurd latencies, >24h timings, oversized payloads) is
     dropped arm-by-arm instead of poisoning the pool.
     """
-    bandit: dict[str, dict] = {}
+    bandit: dict[str, dict[str, Any]] = {}
     medians: dict[str, float] = {}
     clock = 0
     for st in states:
@@ -207,17 +222,21 @@ def merge_states(states: list[dict]) -> dict:
             if not isinstance(arm, str) or len(arm) > 128 or not isinstance(s, dict):
                 continue
             try:
-                A = np.array(s["A"], dtype=float)
-                b = _clean_reward(s["b"])
                 n = int(s.get("n", 0))
+                if not (0 <= n <= 1_000_000):
+                    continue
+                A = np.array(s["A"], dtype=float)
+                b = _clean_reward(s["b"], n=max(n, 1))
             except Exception:
                 continue
-            if b is None or not np.all(np.isfinite(A)) or not (0 <= n <= 1_000_000):
+            if b is None or not np.all(np.isfinite(A)):
                 continue
-            d = bandit.setdefault(arm, {"A_sum": None, "nA": 0, "b_sum": None, "n": 0})
-            d["n"] += n
+            d: dict[str, Any] = bandit.setdefault(
+                arm, {"A_sum": None, "nA": 0, "b_sum": None, "n": 0}
+            )
+            d["n"] = int(d["n"]) + n
             if n > 0:                       # only real learners vote on the prior
-                d["nA"] += 1
+                d["nA"] = int(d["nA"]) + 1
                 d["A_sum"] = A if d["A_sum"] is None else d["A_sum"] + A
                 d["b_sum"] = b if d["b_sum"] is None else d["b_sum"] + b
         pairs = st.get("median_ms") or {}
@@ -225,30 +244,30 @@ def merge_states(states: list[dict]) -> dict:
             continue
         for pair, ms in list(pairs.items())[:2048]:
             try:
-                ms = float(ms)
+                ms_val = float(ms)
             except (TypeError, ValueError):
                 continue
-            if not (0.0 < ms <= MAX_LATENCY_MS) or not isinstance(pair, str):
+            if not (0.0 < ms_val <= MAX_LATENCY_MS) or not isinstance(pair, str):
                 continue
-            if pair not in medians or ms < medians[pair]:
-                medians[pair] = ms
-    out_bandit = {}
+            if pair not in medians or ms_val < medians[pair]:
+                medians[pair] = ms_val
+    out_bandit: dict[str, Any] = {}
     for arm, d in bandit.items():
-        if d["A_sum"] is None:
+        if d["A_sum"] is None or d["b_sum"] is None:
             continue
+        denom = max(int(d["nA"]), 1)
         out_bandit[arm] = {
-            "A": (d["A_sum"] / max(d["nA"], 1)).tolist(),
-            "b": d["b_sum"].tolist(),
-            "n": min(d["n"], 1_000_000),
+            "A": (d["A_sum"] / denom).tolist(),
+            "b": (d["b_sum"] / denom).tolist(),
+            "n": min(int(d["n"]), 1_000_000),
         }
     return {"version": 1, "clock": clock + 1, "updated": time.time(),
             "bandit": out_bandit, "median_ms": medians}
 
 
-def _contributor_id(cfg: dict) -> str:
+def _contributor_id(cfg: dict[str, Any]) -> str:
     cid = cfg.get("cloud_client_id")
     if not cid:
-        import uuid
         cid = uuid.uuid4().hex[:16]
         cfg["cloud_client_id"] = cid
         try:
@@ -258,7 +277,7 @@ def _contributor_id(cfg: dict) -> str:
             save_config(full)
         except Exception:
             pass
-    return cid
+    return str(cid)
 
 
 # --------------------------------------------------------------------------- #
@@ -268,17 +287,18 @@ def _contributor_id(cfg: dict) -> str:
 class CloudSync:
     """Push/pull the bandit state to/from the shared learning pool."""
 
-    def __init__(self, selector, cfg: Optional[dict] = None) -> None:
+    def __init__(self, selector: Any, cfg: Optional[dict[str, Any]] = None) -> None:
         self.selector = selector                    # BanditSelector
         cfg = cfg if cfg is not None else load_cloud_config()
-        self.cfg = cfg
-        self.mode = (cfg.get("cloud_mode") or "url").lower()
-        self.url = (cfg.get("cloud_url") or "").strip()
-        self.gist_id = (cfg.get("cloud_gist_id") or DEFAULT_GIST_ID).strip()
+        self.cfg: dict[str, Any] = cfg
+        self.mode = str(cfg.get("cloud_mode") or "url").lower()
+        self.url = str(cfg.get("cloud_url") or "").strip()
+        self.gist_id = str(cfg.get("cloud_gist_id") or DEFAULT_GIST_ID).strip()
         self.token = token()
         self.interval = float(cfg.get("cloud_interval_s", 900))
         self.pull_on_start = bool(cfg.get("cloud_pull_on_start", True))
         self._timer: Optional[threading.Timer] = None
+        self._next_at: float = 0.0
         self._lock = threading.Lock()
 
     # -- enabled? ----------------------------------------------------------- #
@@ -292,7 +312,7 @@ class CloudSync:
         return _check_url(self.url)
 
     # -- payload ------------------------------------------------------------ #
-    def build_payload(self) -> dict:
+    def build_payload(self) -> dict[str, Any]:
         return {"version": 1,
                 "clock": int(self.cfg.get("cloud_clock", 0)) + 1,
                 "bandit": self.selector.bandit.export(),
@@ -318,14 +338,14 @@ class CloudSync:
                 self.selector.bandit.import_state(state["bandit"])
                 for pair, ms in list((state.get("median_ms") or {}).items())[:2048]:
                     try:
-                        ms = float(ms)
+                        ms_val = float(ms)
                     except (TypeError, ValueError):
                         continue
-                    if not (0.0 < ms <= MAX_LATENCY_MS):
+                    if not (0.0 < ms_val <= MAX_LATENCY_MS):
                         continue
                     cur = self.selector.median_ms.get(pair)
-                    if cur is None or ms < cur:
-                        self.selector.median_ms[pair] = ms
+                    if cur is None or ms_val < cur:
+                        self.selector.median_ms[pair] = ms_val
                 self.selector._save_state()
                 self._set_meta("cloud_last_pull", time.time())
                 self._set_meta("cloud_clock", int(state.get("clock", 0)))
@@ -337,22 +357,24 @@ class CloudSync:
                 log.debug("cloud pull failed: %s", exc)
                 return False
 
-    def _fetch_pooled(self) -> Optional[dict]:
+    def _fetch_pooled(self) -> Optional[dict[str, Any]]:
         if self.mode == "gist":
             data = _request(f"{API_ROOT}/gists/{self.gist_id}",
                             headers=self._gh_headers())
             if not data:
                 return None
             files = data.get("files") or {}
+            if not isinstance(files, dict):
+                return None
             entry = files.get("merged.json") or files.get("state.json")
-            if not entry:
+            if not isinstance(entry, dict):
                 return None
             raw = entry.get("content")
             if raw is None:                      # too big -> must fetch raw_url
-                raw_resp = _request(entry.get("raw_url", ""))
+                raw_resp = _request(str(entry.get("raw_url") or ""))
                 return raw_resp                  # best effort
             try:
-                return json.loads(raw)
+                return json.loads(str(raw))
             except Exception:
                 return None
         return _request(f"{self.url.rstrip('/')}/state")
@@ -374,31 +396,35 @@ class CloudSync:
                 self._set_meta("cloud_clock", payload["clock"])
             return ok
 
-    def _gh_headers(self) -> dict:
+    def _gh_headers(self) -> dict[str, str]:
         h = {"Authorization": f"Bearer {self.token}"}
         if self.token:
             h["Accept"] = "application/vnd.github+json"
         return h
 
-    def _push_gist(self, payload: dict) -> bool:
+    def _push_gist(self, payload: dict[str, Any]) -> bool:
         if not self.token:
             return False
         data = _request(f"{API_ROOT}/gists/{self.gist_id}", headers=self._gh_headers())
         if not data:
             return False
         files = data.get("files") or {}
+        if not isinstance(files, dict):
+            return False
         mine = f"contrib-{_contributor_id(self.cfg)}.json"
-        keep = {}
+        keep: dict[str, dict[str, str]] = {}
         for k, v in files.items():
+            if not isinstance(v, dict):
+                continue
             content = v.get("content")
-            if (k.endswith(".json") and isinstance(content, str)
+            if (isinstance(k, str) and k.endswith(".json") and isinstance(content, str)
                     and len(content) <= MAX_CONTRIB_BYTES):
                 keep[k] = {"content": content}
         # strip our own stale copy, merge everything, re-add merged + contribution
         keep.pop(mine, None)
         keep.pop("merged.json", None)
-        contribs = []
-        for name, f in keep.items():
+        contribs: list[Any] = []
+        for _name, f in keep.items():
             try:
                 contribs.append(json.loads(f["content"]))
             except Exception:
@@ -411,7 +437,7 @@ class CloudSync:
         return resp is not None
 
     # -- meta --------------------------------------------------------------- #
-    def _set_meta(self, key: str, value) -> None:
+    def _set_meta(self, key: str, value: Any) -> None:
         try:
             from .monitor import load_config, save_config
             cfg = load_config()
@@ -435,16 +461,17 @@ class CloudSync:
         ``cloud_debounce_s`` (default 60 s), so a burst of conversions results
         in exactly one upload."""
         debounce = float(self.cfg.get("cloud_debounce_s", 60))
-        delay = max(delay if delay is not None else self.interval, debounce)
+        actual_delay = max(delay if delay is not None else self.interval, debounce)
         now = time.time()
-        if self._timer is not None and getattr(self, "_next_at", 0) - debounce < now:
+        if self._timer is not None and self._next_at - debounce < now:
             return                      # one already pending soon enough
-        if self._timer:
+        if self._timer is not None:
             self._timer.cancel()
-        self._next_at = now + delay
-        self._timer = threading.Timer(delay, self._tick)
-        self._timer.daemon = True
-        self._timer.start()
+        self._next_at = now + actual_delay
+        timer = threading.Timer(actual_delay, self._tick)
+        timer.daemon = True
+        timer.start()
+        self._timer = timer
 
     def _schedule_now(self) -> None:
         """Called by the selector after every recorded conversion."""
@@ -458,11 +485,11 @@ class CloudSync:
             self._schedule(self.interval)
 
     def stop(self) -> None:
-        if self._timer:
+        if self._timer is not None:
             self._timer.cancel()
             self._timer = None
 
-    def status(self) -> dict:
+    def status(self) -> dict[str, Any]:
         return {"enabled": self.enabled(), "mode": self.mode,
                 "endpoint": self.url or (f"gist:{self.gist_id}" if self.enabled() else ""),
                 "token_set": bool(self.token),
@@ -478,7 +505,7 @@ class CloudSync:
 # --------------------------------------------------------------------------- #
 
 def merge_gist_worker(gist_id: Optional[str] = None, token_: Optional[str] = None,
-                      dry_run: bool = False) -> dict:
+                      dry_run: bool = False) -> dict[str, Any]:
     """Recompute merged.json from all contrib-*.json files in the gist.
 
     Used by the scheduled GitHub Action so contributors only ever PATCH their
@@ -497,12 +524,16 @@ def merge_gist_worker(gist_id: Optional[str] = None, token_: Optional[str] = Non
         return {"version": 1, "clock": 0, "updated": time.time(),
                 "bandit": {}, "median_ms": {}}
     files = data.get("files") or {}
-    contribs, keep = [], {}
-    for k, v in files.items():
-        content = v.get("content")
-        if (k.startswith("contrib-") and isinstance(content, str)
-                and len(content) <= MAX_CONTRIB_BYTES):
-            keep[k] = {"content": content}
+    contribs: list[Any] = []
+    keep: dict[str, dict[str, str]] = {}
+    if isinstance(files, dict):
+        for k, v in files.items():
+            if not isinstance(v, dict):
+                continue
+            content = v.get("content")
+            if (isinstance(k, str) and k.startswith("contrib-") and isinstance(content, str)
+                    and len(content) <= MAX_CONTRIB_BYTES):
+                keep[k] = {"content": content}
     for f in keep.values():
         try:
             contribs.append(json.loads(f["content"]))
