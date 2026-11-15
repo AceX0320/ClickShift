@@ -156,6 +156,10 @@ DEFAULT_CONFIG = {
     "cloud_interval_s": 900,        # background push/pull cadence
     "cloud_debounce_s": 60,         # min seconds between uploads
     "cloud_pull_on_start": True,
+    # --- GitHub auto-updater --------------------------------------------- #
+    "auto_update_check": True,
+    "update_check_interval_s": 21600,
+    "skipped_update_version": "",
 }
 
 
@@ -639,7 +643,10 @@ def _purge_duplicate_class_verbs() -> None:
         pass
 
 
-def install_context_menu(extensions: Optional[list[str]] = None) -> int:
+def install_context_menu(
+    extensions: Optional[list[str]] = None,
+    progress_cb: Optional[Any] = None,
+) -> int:
     """Create the single expandable 'Convert with ConFas >' menu on both the
     Windows 11 primary context menu (via ConFasShell.dll IExplorerCommand) and
     the secondary classic menu (via cascading SubCommands), removing any
@@ -648,7 +655,17 @@ def install_context_menu(extensions: Optional[list[str]] = None) -> int:
     """
     if not IS_WINDOWS:
         return 0
+
+    def _report(status: str, pct: float) -> None:
+        if progress_cb is not None:
+            try:
+                progress_cb(status, pct)
+            except Exception:
+                pass
+
+    _report("Saving executable path for Explorer...", 22)
     _save_exe_path_registry()
+    _report("Cleaning up duplicate shell entries...", 30)
     _purge_duplicate_class_verbs()
     # Windows 11: the packaged IExplorerCommand extension shows ONE expandable
     # 'Convert with ConFas >' in the main menu AND automatically in
@@ -656,10 +673,15 @@ def install_context_menu(extensions: Optional[list[str]] = None) -> int:
     # classic menu show it twice, so the registry cascade is only a fallback
     # (Windows 10, or when the package could not be registered).
     _set_win11_both_menus(False)
+    _report("Registering Windows 11 shell extension...", 42)
     shell_ext_ok = _is_win11() and _install_win11_shell_extension()
     exts = extensions or MENU_EXTENSIONS
+    total_exts = max(1, len(exts))
     n = 0
-    for ext in exts:
+    for idx, ext in enumerate(exts):
+        if idx % 6 == 0 or idx == total_exts - 1:
+            pct = 55.0 + (idx / total_exts) * 30.0
+            _report(f"Configuring right-click actions (.{ext})...", pct)
         locations = _verb_locations(ext)
         primary_loc = rf"Software\Classes\SystemFileAssociations\.{ext}"
         targets = menu_targets(ext)
@@ -1016,6 +1038,30 @@ def try_daemon_convert(jobs: list[tuple[str, str]], enable_ml: bool = True,
 #  System tray daemon
 # --------------------------------------------------------------------------- #
 
+def _make_tray_icon_image():
+    """Load assets/confas.ico (or confas.png) for the system tray, with fallback."""
+    Image: Any = importlib.import_module("PIL.Image")
+    ImageDraw: Any = importlib.import_module("PIL.ImageDraw")
+    assets = _assets_dir()
+    for name in ("confas.ico", "confas.png"):
+        p = assets / name
+        if p.exists():
+            try:
+                img = Image.open(p)
+                img.load()
+                return img.convert("RGBA").resize((64, 64), Image.LANCZOS)
+            except Exception:
+                pass
+    # Fallback matching the navy / split-doc / gold-bolt icon design
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle([3, 3, 61, 61], radius=14, fill=(13, 30, 62, 255))
+    d.rounded_rectangle([15, 11, 49, 53], radius=4, fill=(56, 189, 248, 255))
+    d.rectangle([15, 11, 32, 53], fill=(248, 250, 252, 255))
+    d.polygon([(35, 17), (24, 35), (32, 35), (29, 49), (40, 30), (33, 30)], fill=(250, 204, 21, 255))
+    return img
+
+
 def run_daemon(headless: bool = False) -> int:
     """Main entry for `ConFas.exe run` - stays alive forever."""
     cfg = load_config()
@@ -1049,20 +1095,67 @@ def run_daemon(headless: bool = False) -> int:
         return 0
 
     # ---- pystray tray icon ------------------------------------------------ #
+    update_stop = threading.Event()
+    update_lock = threading.Lock()
     try:
         pystray: Any = importlib.import_module("pystray")
-        Image: Any = importlib.import_module("PIL.Image")
-        ImageDraw: Any = importlib.import_module("PIL.ImageDraw")
-
-        def _make_icon_img():
-            img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-            d = ImageDraw.Draw(img)
-            d.rounded_rectangle([4, 4, 60, 60], radius=14, fill=(37, 99, 235, 255))
-            d.polygon([(20, 26), (44, 26), (32, 44)], fill=(255, 255, 255, 255))
-            d.line([(20, 26), (20, 18), (44, 18), (44, 26)], fill=(255, 255, 255, 255), width=4)
-            return img
+        from . import __version__ as _ver
+        from . import updater as _updater
 
         paused = {"v": False}
+        icon_holder: dict[str, Any] = {"icon": None}
+
+        def _stop_for_update() -> None:
+            update_stop.set()
+            if watch:
+                watch.stop_event.set()
+            if ipc:
+                ipc.stop()
+            ic = icon_holder.get("icon")
+            if ic is not None:
+                try:
+                    ic.stop()
+                except Exception:
+                    pass
+
+        def _check_and_prompt_update(manual: bool = False) -> None:
+            if not update_lock.acquire(blocking=False):
+                return
+            try:
+                info = _updater.check_for_update(current_version=_ver)
+                if info is None:
+                    if manual and icon_holder.get("icon") is not None:
+                        try:
+                            icon_holder["icon"].notify(f"ConFas v{_ver} is up to date.")
+                        except Exception:
+                            pass
+                    return
+                latest_cfg = load_config()
+                if (not manual) and latest_cfg.get("skipped_update_version") == info.tag_name:
+                    return
+                result = _updater.run_interactive_update(
+                    info,
+                    current_version=_ver,
+                    on_before_restart=_stop_for_update,
+                )
+                if result == "skip":
+                    latest_cfg["skipped_update_version"] = info.tag_name
+                    save_config(latest_cfg)
+            except Exception as exc:
+                _log(f"update check failed: {exc}")
+            finally:
+                update_lock.release()
+
+        def _auto_update_loop() -> None:
+            if update_stop.wait(5.0):
+                return
+            while not update_stop.is_set():
+                cur_cfg = load_config()
+                if cur_cfg.get("auto_update_check", True):
+                    _check_and_prompt_update(manual=False)
+                interval = max(300, int(cur_cfg.get("update_check_interval_s", 21600)))
+                if update_stop.wait(interval):
+                    return
 
         def toggle_pause(icon, item):
             paused["v"] = not paused["v"]
@@ -1079,24 +1172,38 @@ def run_daemon(headless: bool = False) -> int:
         def open_drop(icon, item):
             subprocess.Popen(["explorer", str(Path(cfg["watch_folder"]))])
 
+        def check_updates_menu(icon, item):
+            threading.Thread(
+                target=lambda: _check_and_prompt_update(manual=True),
+                daemon=True,
+            ).start()
+
         def quit_app(icon, item):
+            update_stop.set()
+            if watch:
+                watch.stop_event.set()
             if ipc:
                 ipc.stop()
             icon.stop()
 
         menu = pystray.Menu(
-            pystray.MenuItem(lambda i: f"ConFas - {'paused' if paused['v'] else 'watching ' + cfg['watch_folder']}",
+            pystray.MenuItem(lambda i: f"ConFas v{_ver} - {'paused' if paused['v'] else 'watching ' + cfg['watch_folder']}",
                              None, enabled=False),
             pystray.MenuItem("Pause/Resume watching", toggle_pause),
             pystray.MenuItem("Open drop folder", open_drop),
+            pystray.MenuItem("Check for updates...", check_updates_menu),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit ConFas", quit_app),
         )
-        icon = pystray.Icon(APP_NAME, _make_icon_img(), "ConFas - document converter", menu)
+        icon = pystray.Icon(APP_NAME, _make_tray_icon_image(), f"ConFas v{_ver} - document converter", menu)
+        icon_holder["icon"] = icon
+        if os.environ.get("CONFAS_NO_POPUP") != "1":
+            threading.Thread(target=_auto_update_loop, daemon=True).start()
         _log("tray daemon started")
         icon.run()
         return 0
     except Exception as exc:
+        update_stop.set()
         _log(f"tray unavailable ({exc}); falling back to headless loop")
         try:
             while True:

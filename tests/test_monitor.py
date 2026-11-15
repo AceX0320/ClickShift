@@ -101,3 +101,18 @@ def test_win11_shell_ext_skips_duplicate_classic_cascade(monkeypatch):
     assert monitor.install_context_menu(extensions=["pdf"]) == 1
     assert written == [r"Software\Classes\SystemFileAssociations\.pdf"]
 
+
+def test_tray_icon_loads_new_asset_and_cli_install_quiet(monkeypatch):
+    img = monitor._make_tray_icon_image()
+    assert img.mode == "RGBA"
+    assert img.size == (64, 64)
+
+    monkeypatch.setenv("CONFAS_NO_POPUP", "1")
+    monkeypatch.setattr(monitor, "install_context_menu", lambda **_kw: 3)
+    monkeypatch.setattr(monitor, "register_startup", lambda: True)
+    monkeypatch.setattr(monitor, "refresh_explorer", lambda: None)
+
+    from confas import cli
+    rc = cli.main(["install", "--quiet"])
+    assert rc == 0
+

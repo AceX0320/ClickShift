@@ -17,7 +17,7 @@ SPEC = ROOT / "confas.spec"
 
 def check_imports() -> None:
     sys.path.insert(0, str(SRC))
-    import confas.engine, confas.learning, confas.monitor, confas.cli, confas.cloud, confas.debuglog  # noqa: F401
+    import confas.engine, confas.learning, confas.monitor, confas.cli, confas.cloud, confas.debuglog, confas.updater  # noqa: F401
     print("imports OK")
 
 
@@ -59,6 +59,9 @@ def build() -> int:
         "--hidden-import", "confas.cli",
         "--hidden-import", "confas.cloud",
         "--hidden-import", "confas.debuglog",
+        "--hidden-import", "confas.updater",
+        "--hidden-import", "tkinter",
+        "--hidden-import", "tkinter.ttk",
     ]
     assets_dir = ROOT / "assets"
     if assets_dir.exists():

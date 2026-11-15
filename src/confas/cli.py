@@ -210,22 +210,51 @@ def cmd_run(args) -> int:
 
 
 def cmd_install(args) -> int:
+    from .updater import InstallProgressPopup
+
     print("ConFas setup")
-    monitor.DATA_DIR.mkdir(parents=True, exist_ok=True)
-    monitor.save_config(monitor.load_config())
-    Path(monitor.DEFAULT_CONFIG["watch_folder"]).mkdir(exist_ok=True)
-    if monitor.IS_WINDOWS:
-        n = monitor.install_context_menu()
-        print(f"  right-click menu entries installed : {n} extensions")
-        if monitor.register_startup():
-            print("  added to Startup apps (Task Manager > Startup apps)")
+    quiet = bool(getattr(args, "quiet", False))
+    show_popup = (
+        monitor.IS_WINDOWS
+        and not quiet
+        and os.environ.get("CONFAS_NO_POPUP") != "1"
+    )
+    popup = InstallProgressPopup(
+        title="ConFas Setup",
+        heading=f"Installing ConFas v{version}...",
+        enabled=show_popup,
+    ).start()
+    try:
+        popup.update("Preparing ConFas configuration...", progress=10, detail="Creating data and watch folders")
+        monitor.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        monitor.save_config(monitor.load_config())
+        Path(monitor.DEFAULT_CONFIG["watch_folder"]).mkdir(exist_ok=True)
+
+        if monitor.IS_WINDOWS:
+            n = monitor.install_context_menu(
+                progress_cb=lambda msg, pct: popup.update(
+                    msg, progress=pct, detail="Updating Windows Explorer integration"
+                )
+            )
+            print(f"  right-click menu entries installed : {n} extensions")
+
+            popup.update("Adding ConFas to Windows Startup apps...", progress=90, detail="Writing Startup entry")
+            if monitor.register_startup():
+                print("  added to Startup apps (Task Manager > Startup apps)")
+            else:
+                print("  WARNING: could not write the Run key")
+
+            popup.update("Refreshing Windows Explorer...", progress=96, detail="Finalizing installation")
+            monitor.refresh_explorer()
+            print("\nDone. Sign out/in once so Explorer refreshes its menus.")
+            popup.complete("ConFas installed! Running in system tray.", delay_s=0.7)
         else:
-            print("  WARNING: could not write the Run key")
-        monitor.refresh_explorer()
-        print("\nDone. Sign out/in once so Explorer refreshes its menus.")
-    else:
-        print("  non-Windows: only watch-folder daemon available (`confas run`)")
-    return 0
+            print("  non-Windows: only watch-folder daemon available (`confas run`)")
+            popup.complete("ConFas configured.", delay_s=0.3)
+        return 0
+    except Exception as exc:
+        popup.error(f"Setup failed: {exc}", delay_s=2.0)
+        raise
 
 
 def cmd_uninstall(args) -> int:
@@ -368,6 +397,8 @@ def cmd_config(args) -> int:
                   f"PAT with ONLY the 'gist' scope.")
         elif k in ("cloud_interval", "cloud_interval_s"):
             cfg["cloud_interval_s"] = max(60, int(float(v)))
+        elif k in ("auto_update", "auto_update_check"):
+            cfg["auto_update_check"] = v.lower() in ("1", "on", "true", "yes")
         else:
             print(f"unknown key '{k}'", file=sys.stderr)
             continue
@@ -384,6 +415,22 @@ def cmd_targets(args) -> int:
     ext = args.ext
     print(", ".join(newest_target_for(ext)))
     return 0
+
+
+def cmd_update(args) -> int:
+    from .updater import check_for_update, run_interactive_update
+
+    info = check_for_update(current_version=version)
+    if info is None:
+        print(f"ConFas v{version} is up to date.")
+        return 0
+    print(f"Update available: {info.tag_name} (installed: v{version})")
+    print(f"Release page: {info.html_url}")
+    if getattr(args, "check", False):
+        return 0
+    res = run_interactive_update(info, current_version=version)
+    print(f"Update status: {res}")
+    return 0 if res != "error" else 1
 
 
 # --------------------------------------------------------------------------- #
@@ -410,9 +457,13 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--headless", action="store_true", help="no tray icon")
     r.set_defaults(fn=cmd_run)
     i = sub.add_parser("install", help="add to Startup apps + install right-click menu")
+    i.add_argument("--quiet", action="store_true", help="suppress setup progress popup")
     i.set_defaults(fn=cmd_install)
     u = sub.add_parser("uninstall", help="remove startup entry + context menu")
     u.set_defaults(fn=cmd_uninstall)
+    up = sub.add_parser("update", help="check GitHub for a newer ConFas release")
+    up.add_argument("--check", action="store_true", help="only check and print status")
+    up.set_defaults(fn=cmd_update)
     s = sub.add_parser("status", help="show detected backends & registration state")
     s.set_defaults(fn=cmd_status)
     st = sub.add_parser("stats", help="show learned conversion performance")
@@ -430,7 +481,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     # Explorer may pass bare file paths without a subcommand (defensive)
-    if argv and argv[0] not in {"convert", "run", "install", "uninstall", "status",
+    if argv and argv[0] not in {"convert", "run", "install", "uninstall", "update", "status",
                                 "stats", "config", "targets", "-h", "--help"}:
         if all(Path(a).exists() or a.startswith("%") for a in argv):
             argv = ["convert"] + argv

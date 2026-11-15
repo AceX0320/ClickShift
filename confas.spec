@@ -11,17 +11,18 @@ a = Analysis(
     datas=[(str(ROOT / "assets"), "assets")] if (ROOT / "assets").exists() else [],
     hiddenimports=[
         "confas.engine", "confas.learning", "confas.monitor", "confas.cli",
-        "confas.cloud", "confas.debuglog",
+        "confas.cloud", "confas.debuglog", "confas.updater",
         # Dynamically imported backends and Windows-only modules:
         "win32com.client", "pythoncom", "pywintypes",
         "pystray", "pystray._win32",
+        "tkinter", "tkinter.ttk",
         "PIL", "PIL.Image", "PIL.ImageOps", "PIL.ImageDraw",
         "numpy", "docx", "docx.shared", "pdf2docx", "pypdf", "fitz",
         "chardet", "charset_normalizer",
     ],
     hookspath=[],
     runtime_hooks=[],
-    excludes=["tkinter", "matplotlib", "PyQt5", "PySide6"],
+    excludes=["matplotlib", "PyQt5", "PySide6"],
     noarchive=False,
 )
 

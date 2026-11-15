@@ -9,5 +9,5 @@ cli         : command line / right-click entry point
 __main__    : `python -m confas ...`
 """
 
-__version__ = "1.0.10"
+__version__ = "1.0.11"
 APP_NAME = "ConFas"
