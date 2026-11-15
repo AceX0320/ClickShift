@@ -169,7 +169,11 @@ def test_run_interactive_update_handles_frozen_apply(tmp_path, monkeypatch):
     monkeypatch.setattr(updater, "prompt_update_dialog", lambda *a, **k: "update")
     monkeypatch.setattr(updater, "download_update", lambda u, d, progress_cb=None: d.write_bytes(b"MZ"))
     applied = []
-    monkeypatch.setattr(updater, "apply_windows_update", lambda s, t, pid_to_wait=None: applied.append((s, t)))
+    monkeypatch.setattr(
+        updater,
+        "apply_windows_update",
+        lambda s, t, pid_to_wait=None, new_exe_path=None: applied.append((s, t, new_exe_path)),
+    )
     stopped = []
 
     monkeypatch.setattr(updater.sys, "platform", "win32")
@@ -183,5 +187,23 @@ def test_run_interactive_update_handles_frozen_apply(tmp_path, monkeypatch):
         target_exe=target,
     )
     assert res == "updated"
-    assert len(applied) == 1 and applied[0][1] == target
+    assert len(applied) == 1
+    assert applied[0][1] == target
+    assert applied[0][2] == tmp_path / "ConFas-v1.0.99.exe"
     assert stopped == [True]
+
+
+def test_parse_release_payload_matches_versioned_exe():
+    payload = {
+        "tag_name": "v1.0.13",
+        "assets": [
+            {
+                "name": "ConFas-v1.0.13.exe",
+                "size": 151_000_000,
+                "browser_download_url": "https://github.com/AceX0320/ConFas/releases/download/v1.0.13/ConFas-v1.0.13.exe",
+            }
+        ],
+    }
+    info = updater.parse_release_payload(payload)
+    assert info is not None
+    assert info.download_url.endswith("/ConFas-v1.0.13.exe")

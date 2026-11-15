@@ -2,7 +2,7 @@
 
 **One EXE. Right-click any document → converted. Learns to get faster.**
 
-> **📥 Direct EXE Download (Latest — v1.0.12):** [**Download `ConFas.exe`**](https://github.com/AceX0320/ConFas/releases/latest/download/ConFas.exe) · [**v1.0.12 Direct Link**](https://github.com/AceX0320/ConFas/releases/download/v1.0.12/ConFas.exe)  
+> **📥 Direct EXE Download (Latest — v1.0.13):** [**Download `ConFas-v1.0.13.exe`**](https://github.com/AceX0320/ConFas/releases/download/v1.0.13/ConFas-v1.0.13.exe) · [**Latest Release Page**](https://github.com/AceX0320/ConFas/releases/latest)  
 > *(Or grab the latest CI artifact from [GitHub Actions](https://github.com/AceX0320/ConFas/actions/workflows/build.yml) / browse [Releases](https://github.com/AceX0320/ConFas/releases))*
 
 ConFas is a 100 % local, offline document conversion tool:
@@ -123,18 +123,18 @@ The direct permanent download link for the latest `ConFas.exe` release is:
 https://github.com/AceX0320/ConFas/releases/latest/download/ConFas.exe
 ```
 
-* **Direct Download (Always Latest):** [https://github.com/AceX0320/ConFas/releases/latest/download/ConFas.exe](https://github.com/AceX0320/ConFas/releases/latest/download/ConFas.exe)
-* **Direct Download (v1.0.12 Pinned):** [https://github.com/AceX0320/ConFas/releases/download/v1.0.12/ConFas.exe](https://github.com/AceX0320/ConFas/releases/download/v1.0.12/ConFas.exe)
+* **Direct Download (Latest Release Page):** [https://github.com/AceX0320/ConFas/releases/latest](https://github.com/AceX0320/ConFas/releases/latest)
+* **Direct Download (v1.0.13 Pinned):** [https://github.com/AceX0320/ConFas/releases/download/v1.0.13/ConFas-v1.0.13.exe](https://github.com/AceX0320/ConFas/releases/download/v1.0.13/ConFas-v1.0.13.exe)
 * **All Releases:** [https://github.com/AceX0320/ConFas/releases](https://github.com/AceX0320/ConFas/releases)
 * **CI Build Artifacts (`ConFas-windows-exe`):** [https://github.com/AceX0320/ConFas/actions/workflows/build.yml](https://github.com/AceX0320/ConFas/actions/workflows/build.yml)
-* `/releases/latest/download/ConFas.exe` **always resolves to the newest published version** — one permanent link that never goes stale.
+* `/releases/latest` **always points to the newest published versioned EXE** (`ConFas-v<version>.exe`).
 
 Publishing happens automatically on every push to `main` (via `.github/workflows/build.yml`) as well as on version tags (via `.github/workflows/release.yml`):
 
-1. Push to `main` (or tag and push a version) → CI runs the full 40-test suite, builds `ConFas.exe` on a Windows runner, uploads the `ConFas-windows-exe` artifact, and publishes `ConFas.exe` to the latest GitHub Release:
+1. Push to `main` (or tag and push a version) → CI runs the full 40-test suite, builds `ConFas-v<version>.exe` on a Windows runner, uploads the `ConFas-windows-exe` artifact, and publishes `ConFas-v<version>.exe` to the latest GitHub Release:
    ```bat
-   git tag v1.0.12
-   git push origin v1.0.12
+   git tag v1.0.13
+   git push origin v1.0.13
    ```
 2. Share the permanent link above. Anyone who downloads and double-clicks the
    EXE gets the self-install (both Windows right-click menus + Task Manager Startup entry).

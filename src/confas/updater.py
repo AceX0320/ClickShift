@@ -172,7 +172,7 @@ def parse_release_payload(data: object) -> Optional[ReleaseInfo]:
                 continue
             name = str(asset.get("name") or "")
             url = str(asset.get("browser_download_url") or "")
-            if name.lower() == "confas.exe" and is_allowed_download_url(url):
+            if name.lower().startswith("confas") and name.lower().endswith(".exe") and is_allowed_download_url(url):
                 download_url = url
                 asset_size = int(asset.get("size") or 0)
                 break
@@ -320,10 +320,12 @@ def apply_windows_update(
     downloaded_exe: Path,
     target_exe: Path,
     pid_to_wait: Optional[int] = None,
+    new_exe_path: Optional[Path] = None,
 ) -> Path:
-    """Spawn a detached Windows helper script that replaces target_exe and relaunches it."""
+    """Spawn a detached Windows helper script that installs final_exe and relaunches it."""
     downloaded_exe = Path(downloaded_exe).resolve()
     target_exe = Path(target_exe).resolve()
+    final_exe = Path(new_exe_path).resolve() if new_exe_path is not None else target_exe
     if not downloaded_exe.exists():
         raise FileNotFoundError(f"Missing downloaded update: {downloaded_exe}")
 
@@ -332,10 +334,16 @@ def apply_windows_update(
     script = tmp_dir / f"confas_apply_update_{pid}.cmd"
 
     # Wait up to ~20s for the running ConFas process to exit cleanly, then force-stop
-    # any lingering ConFas lock, swap in the new EXE with retries, relaunch setup/tray,
-    # and self-delete.
+    # any lingering lock, place the versioned EXE (removing the old EXE if renamed),
+    # relaunch setup/tray, and self-delete.
     src_str = str(downloaded_exe)
-    dst_str = str(target_exe)
+    dst_str = str(final_exe)
+    old_str = str(target_exe)
+    cleanup_old = (
+        f"del /F /Q \"{old_str}\" >nul 2>nul\r\n"
+        if final_exe != target_exe
+        else ""
+    )
     bat = (
         "@echo off\r\n"
         "setlocal enableextensions\r\n"
@@ -356,6 +364,7 @@ def apply_windows_update(
         ")\r\n"
         "exit /b 1\r\n"
         ":launch_new\r\n"
+        f"{cleanup_old}"
         "start \"\" \"%DST%\"\r\n"
         "(goto) 2>nul & del /F /Q \"%~f0\"\r\n"
     )
@@ -591,9 +600,9 @@ class InstallProgressPopup:
 
 
 def prompt_update_dialog(info: ReleaseInfo, current_version: str = __version__) -> str:
-    """Show a native update prompt asking the user to update, defer, or skip.
+    """Show a minimal update prompt with current/available version and an Update button.
 
-    Returns 'update', 'later', or 'skip'.
+    Returns 'update' or 'later'.
     """
     if os.environ.get("CONFAS_NO_POPUP") == "1":
         return "later"
@@ -606,8 +615,8 @@ def prompt_update_dialog(info: ReleaseInfo, current_version: str = __version__) 
                 import ctypes
                 res = ctypes.windll.user32.MessageBoxW(
                     0,
-                    f"ConFas {info.tag_name} is available (you have v{current_version}).\n\nUpdate now?",
-                    "ConFas Update Available",
+                    f"Current version: v{current_version}\nAvailable version: {info.tag_name}",
+                    "ConFas Update",
                     0x04 | 0x40,
                 )
                 return "update" if res == 6 else "later"
@@ -617,7 +626,7 @@ def prompt_update_dialog(info: ReleaseInfo, current_version: str = __version__) 
 
     choice = {"value": "later"}
     root = tk.Tk()
-    root.title("ConFas Update Available")
+    root.title("ConFas Update")
     root.resizable(False, False)
     root.configure(bg="#0F172A")
     try:
@@ -627,12 +636,51 @@ def prompt_update_dialog(info: ReleaseInfo, current_version: str = __version__) 
     except Exception:
         pass
 
-    notes = (info.release_notes or "").strip()
-    if len(notes) > 360:
-        notes = notes[:357].rstrip() + "..."
-    size_mb = f" ({info.asset_size / (1024 * 1024):.1f} MB)" if info.asset_size else ""
+    wrap = tk.Frame(root, bg="#0F172A", padx=24, pady=20)
+    wrap.pack(fill="both", expand=True)
 
-    width, height = 450, 265 if notes else 195
+    tk.Label(
+        wrap,
+        text=f"Installed: v{current_version}",
+        bg="#0F172A",
+        fg="#CBD5E1",
+        font=("Segoe UI", 10),
+        anchor="w",
+    ).pack(fill="x")
+
+    tk.Label(
+        wrap,
+        text=f"Available: {info.tag_name}",
+        bg="#0F172A",
+        fg="#38BDF8",
+        font=("Segoe UI", 11, "bold"),
+        anchor="w",
+    ).pack(fill="x", pady=(6, 16))
+
+    def choose(val: str) -> None:
+        choice["value"] = val
+        root.destroy()
+
+    update_btn = tk.Button(
+        wrap,
+        text="Update",
+        command=lambda: choose("update"),
+        bg="#0284C7",
+        fg="#FFFFFF",
+        activebackground="#0369A1",
+        activeforeground="#FFFFFF",
+        relief="flat",
+        padx=20,
+        pady=7,
+        font=("Segoe UI", 10, "bold"),
+        cursor="hand2",
+    )
+    update_btn.pack(fill="x")
+    update_btn.focus_set()
+
+    root.update_idletasks()
+    width = max(300, root.winfo_reqwidth())
+    height = root.winfo_reqheight()
     sx = root.winfo_screenwidth()
     sy = root.winfo_screenheight()
     root.geometry(f"{width}x{height}+{(sx - width) // 2}+{(sy - height) // 2}")
@@ -640,96 +688,6 @@ def prompt_update_dialog(info: ReleaseInfo, current_version: str = __version__) 
         root.attributes("-topmost", True)
     except Exception:
         pass
-
-    wrap = tk.Frame(root, bg="#0F172A", padx=22, pady=18)
-    wrap.pack(fill="both", expand=True)
-
-    tk.Label(
-        wrap,
-        text=f"ConFas {info.tag_name} is available",
-        bg="#0F172A",
-        fg="#F8FAFC",
-        font=("Segoe UI", 12, "bold"),
-        anchor="w",
-    ).pack(fill="x")
-
-    tk.Label(
-        wrap,
-        text=f"Installed: v{current_version}   ->   Latest: {info.tag_name}{size_mb}",
-        bg="#0F172A",
-        fg="#38BDF8",
-        font=("Segoe UI", 9),
-        anchor="w",
-    ).pack(fill="x", pady=(6, 10))
-
-    if notes:
-        box = tk.Label(
-            wrap,
-            text=notes,
-            bg="#1E293B",
-            fg="#CBD5E1",
-            font=("Segoe UI", 8),
-            anchor="nw",
-            justify="left",
-            wraplength=390,
-            padx=10,
-            pady=8,
-        )
-        box.pack(fill="both", expand=True, pady=(0, 12))
-
-    btn_row = tk.Frame(wrap, bg="#0F172A")
-    btn_row.pack(fill="x", side="bottom")
-
-    def choose(val: str) -> None:
-        choice["value"] = val
-        root.destroy()
-
-    update_btn = tk.Button(
-        btn_row,
-        text="Update Now",
-        command=lambda: choose("update"),
-        bg="#0284C7",
-        fg="#FFFFFF",
-        activebackground="#0369A1",
-        activeforeground="#FFFFFF",
-        relief="flat",
-        padx=14,
-        pady=6,
-        font=("Segoe UI", 9, "bold"),
-        cursor="hand2",
-    )
-    update_btn.pack(side="right")
-    update_btn.focus_set()
-
-    tk.Button(
-        btn_row,
-        text="Later",
-        command=lambda: choose("later"),
-        bg="#334155",
-        fg="#E2E8F0",
-        activebackground="#475569",
-        activeforeground="#FFFFFF",
-        relief="flat",
-        padx=12,
-        pady=6,
-        font=("Segoe UI", 9),
-        cursor="hand2",
-    ).pack(side="right", padx=(0, 8))
-
-    tk.Button(
-        btn_row,
-        text="Skip version",
-        command=lambda: choose("skip"),
-        bg="#0F172A",
-        fg="#94A3B8",
-        activebackground="#1E293B",
-        activeforeground="#CBD5E1",
-        relief="flat",
-        padx=8,
-        pady=6,
-        font=("Segoe UI", 8),
-        cursor="hand2",
-    ).pack(side="left")
 
     root.protocol("WM_DELETE_WINDOW", lambda: choose("later"))
     root.mainloop()
@@ -757,6 +715,7 @@ def run_interactive_update(
         return "opened_browser"
 
     dest_exe = Path(target_exe or sys.executable).resolve()
+    versioned_exe = dest_exe.parent / f"{APP_NAME}-{info.tag_name}.exe"
     staging_exe = Path(tempfile.gettempdir()) / f"ConFas-update-{info.tag_name}.exe"
 
     popup = InstallProgressPopup(
@@ -786,7 +745,12 @@ def run_interactive_update(
 
         download_update(info.download_url, staging_exe, progress_cb=on_progress)
         popup.update("Installing update and restarting...", progress=98.0, detail="Replacing executable")
-        apply_windows_update(staging_exe, dest_exe, pid_to_wait=os.getpid())
+        apply_windows_update(
+            staging_exe,
+            dest_exe,
+            pid_to_wait=os.getpid(),
+            new_exe_path=versioned_exe,
+        )
         popup.complete(f"Restarting into {info.tag_name}...", delay_s=0.4)
         if on_before_restart is not None:
             on_before_restart()

@@ -42,28 +42,28 @@ jobs:
           }
       - name: Build Win11 IExplorerCommand Shell Extension & MSIX
         run: powershell -ExecutionPolicy Bypass -File scripts/build_shell_ext.ps1
-      - name: Build ConFas.exe
+      - name: Build versioned ConFas EXE
         run: python build.py
       - uses: actions/upload-artifact@v4
         with:
           name: ConFas-windows-exe
-          path: dist/ConFas.exe
+          path: dist/ConFas-v*.exe
       - name: Publish latest GitHub Release (on main push)
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.12
-          name: ConFas v1.0.12 (Latest Build)
+          tag_name: v1.0.13
+          name: ConFas v1.0.13 (Latest Build)
           make_latest: "true"
-          files: dist/ConFas.exe
+          files: dist/ConFas-v*.exe
           body: |
-            ## ConFas Windows EXE (v1.0.12)
+            ## ConFas Windows EXE (v1.0.13)
 
-            **Direct download (always the newest release):**
-            https://github.com/${{ github.repository }}/releases/latest/download/ConFas.exe
+            **Direct download:**
+            https://github.com/${{ github.repository }}/releases/download/v1.0.13/ConFas-v1.0.13.exe
 
-            **Direct download (pinned to v1.0.12):**
-            https://github.com/${{ github.repository }}/releases/download/v1.0.12/ConFas.exe
+            **Latest release page:**
+            https://github.com/${{ github.repository }}/releases/latest
 
             Built automatically from commit `${{ github.sha }}`.
 

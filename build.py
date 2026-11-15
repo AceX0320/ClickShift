@@ -21,11 +21,19 @@ def check_imports() -> None:
     print("imports OK")
 
 
+def _app_version() -> str:
+    sys.path.insert(0, str(SRC))
+    from confas import __version__
+    return __version__
+
+
 def build() -> int:
+    ver = _app_version()
+    exe_name = f"ConFas-v{ver}"
     args = [
         sys.executable, "-m", "PyInstaller",
         "--noconfirm", "--clean",
-        "--name", "ConFas",
+        "--name", exe_name,
         "--onefile",
         "--noconsole",                      # GUI subsystem: no black console window
         "--specpath", str(ROOT),

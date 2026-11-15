@@ -1,8 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
 # PyInstaller spec for ConFas.exe  (build with:  pyinstaller confas.spec)
+import re
 from pathlib import Path
 
 ROOT = Path(SPECPATH)
+_init_text = (ROOT / "src" / "confas" / "__init__.py").read_text(encoding="utf-8")
+_ver_match = re.search(r'__version__\s*=\s*"([^"]+)"', _init_text)
+EXE_NAME = f"ConFas-v{_ver_match.group(1)}" if _ver_match else "ConFas"
 
 a = Analysis(
     [str(ROOT / "entry_point.py")],
@@ -34,7 +38,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name="ConFas",
+    name=EXE_NAME,
     debug=False,
     strip=False,
     upx=False,

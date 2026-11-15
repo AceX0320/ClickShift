@@ -22,14 +22,17 @@ if ($LASTEXITCODE -ne 0) { Pop-Location; Write-Host "Build failed." -ForegroundC
 # 4. Place the EXE in %LOCALAPPDATA%\ConFas and run first-time setup
 $dest = Join-Path $env:LOCALAPPDATA "ConFas"
 New-Item -ItemType Directory -Force -Path $dest | Out-Null
-Copy-Item ".\dist\ConFas.exe" $dest -Force
-Start-Process -FilePath (Join-Path $dest "ConFas.exe") -ArgumentList "install" -Wait
-Start-Process -FilePath (Join-Path $dest "ConFas.exe")   # launches tray daemon now
+$builtExe = Get-ChildItem ".\dist\ConFas*.exe" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+if (-not $builtExe) { Pop-Location; Write-Host "No ConFas EXE found in dist\." -ForegroundColor Red; exit 1 }
+$installedExe = Join-Path $dest $builtExe.Name
+Copy-Item $builtExe.FullName $installedExe -Force
+Start-Process -FilePath $installedExe -ArgumentList "install" -Wait
+Start-Process -FilePath $installedExe   # launches tray daemon now
 
 Pop-Location
 Write-Host ""
 Write-Host "Done!" -ForegroundColor Green
-Write-Host "  * ConFas.exe installed to $dest"
+Write-Host "  * $($builtExe.Name) installed to $dest"
 Write-Host "  * Registered in Startup apps (check Task Manager > Startup apps)"
 Write-Host "  * Right-click any document in Explorer -> 'Convert with ConFas'"
 Write-Host "  * Drop files into ~\ConFasDrop for automatic conversion"

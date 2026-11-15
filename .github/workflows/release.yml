@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to publish (e.g. v1.0.12)"
+        description: "Release tag to publish (e.g. v1.0.13)"
         required: true
-        default: "v1.0.12"
+        default: "v1.0.13"
 
 permissions:
   contents: write
@@ -47,7 +47,7 @@ jobs:
           }
       - name: Build Win11 IExplorerCommand Shell Extension & MSIX
         run: powershell -ExecutionPolicy Bypass -File scripts/build_shell_ext.ps1
-      - name: Build ConFas.exe
+      - name: Build versioned ConFas EXE
         run: python build.py
       - name: Record build commit + timestamp (for freshness checks)
         shell: pwsh
@@ -62,12 +62,12 @@ jobs:
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: |
-            dist/ConFas.exe
+            dist/ConFas-v*.exe
             build-info.txt
           body: |
             ## ConFas Windows EXE
 
-            Direct download (always the newest release):
-            https://github.com/${{ github.repository }}/releases/latest/download/ConFas.exe
+            Latest release page:
+            https://github.com/${{ github.repository }}/releases/latest
 
             Built from commit `${{ github.sha }}`.
