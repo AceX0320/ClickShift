@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to publish (e.g. v1.0.4)"
+        description: "Release tag to publish (e.g. v1.0.5)"
         required: true
-        default: "v1.0.4"
+        default: "v1.0.5"
 
 permissions:
   contents: write
@@ -41,6 +41,8 @@ jobs:
           pip install pywin32 pystray
       - name: Generate icon (if missing)
         run: python scripts/make_icon.py
+      - name: Build Win11 IExplorerCommand Shell Extension & MSIX
+        run: powershell -ExecutionPolicy Bypass -File scripts/build_shell_ext.ps1
       - name: Build ConFas.exe
         run: python build.py
       - name: Record build commit + timestamp (for freshness checks)

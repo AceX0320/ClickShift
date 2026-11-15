@@ -32,4 +32,5 @@ if __name__ == "__main__":
     out.mkdir(exist_ok=True)
     base = make(256)
     base.save(out / "confas.ico", sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
-    print("wrote", out / "confas.ico")
+    make(150).save(out / "confas.png", format="PNG")
+    print("wrote", out / "confas.ico", "and", out / "confas.png")

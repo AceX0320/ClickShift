@@ -483,18 +483,131 @@ def _set_win11_both_menus(enable: bool) -> None:
         _log(f"win11 menu bridge update failed: {exc}")
 
 
-def install_context_menu(extensions: Optional[list[str]] = None) -> int:
-    """Create ConFas right-click entries (cascading menu + per-target verbs + Open with).
+def _assets_dir() -> Path:
+    """Locate bundled assets directory (works both frozen in _MEIPASS and from source)."""
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        cand = Path(meipass) / "assets"
+        if cand.exists():
+            return cand
+    return Path(__file__).resolve().parents[2] / "assets"
 
-    Every verb is written to all locations Explorer consults (effective
-    ProgID, HKCR ProgID, OpenWithProgids, SystemFileAssociations, raw .ext,
-    and universal '*'), and the EXE is registered under "Open with" (with a
-    native popup menu of all formats) + Win11 primary menu bridge so both
-    Windows right-click menus provide every conversion choice.
+
+def _save_exe_path_registry() -> None:
+    """Store the current ConFas executable path in HKCU\\Software\\ConFas for ConFasShell.dll."""
+    if not IS_WINDOWS or winreg is None:
+        return
+    try:
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\ConFas") as k:
+            winreg.SetValueEx(k, "ExePath", 0, winreg.REG_SZ, exe_path())
+    except Exception as exc:
+        _log(f"save ExePath registry failed: {exc}")
+
+
+def _install_win11_shell_extension() -> bool:
+    """Install the packaged IExplorerCommand shell extension (ConFasShell.dll) so
+    the expandable 'Convert with ConFas >' submenu appears in the Windows 11 main menu.
+    """
+    if not IS_WINDOWS:
+        return False
+    try:
+        import shutil
+        src_assets = _assets_dir()
+        dll_src = src_assets / "ConFasShell.dll"
+        manifest_src = src_assets / "AppxManifest.xml"
+        if not dll_src.exists() or not manifest_src.exists():
+            _log(f"Win11 shell extension assets not found in {src_assets}")
+            return False
+
+        local_app = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
+        shell_dir = local_app / "ConFas" / "win11_shell"
+        shell_dir.mkdir(parents=True, exist_ok=True)
+
+        for fname in ("ConFasShell.dll", "ConFasStub.exe", "AppxManifest.xml",
+                      "confas.png", "confas.ico", "ConFasShell.msix", "ConFasShell.cer"):
+            s = src_assets / fname
+            if s.exists():
+                try:
+                    shutil.copy2(s, shell_dir / fname)
+                except Exception:
+                    pass
+
+        msix_path = shell_dir / "ConFasShell.msix"
+        cer_path = shell_dir / "ConFasShell.cer"
+        manifest_path = shell_dir / "AppxManifest.xml"
+
+        # 1. Try direct registration without elevation first (succeeds if Developer Mode or cert already trusted)
+        direct_cmd = (
+            f'Add-AppxPackage -Path "{msix_path}" -ForceApplicationShutdown -ErrorAction Stop'
+            if msix_path.exists()
+            else f'Add-AppxPackage -Register "{manifest_path}" -ForceApplicationShutdown -ErrorAction Stop'
+        )
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", direct_cmd],
+            capture_output=True, text=True, timeout=25,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if r.returncode == 0:
+            _log("Win11 IExplorerCommand shell extension registered directly")
+            return True
+
+        # 2. One-time elevated trust + registration (enables sideloading/dev-unlock + trusts cert + registers)
+        elev_parts = [
+            'New-Item -Path "HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\AppModelUnlock" -Force | Out-Null',
+            'Set-ItemProperty -Path "HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\AppModelUnlock" -Name "AllowDevelopmentWithoutDevLicense" -Value 1 -Type DWord -Force',
+            'Set-ItemProperty -Path "HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\AppModelUnlock" -Name "AllowAllTrustedApps" -Value 1 -Type DWord -Force',
+        ]
+        if cer_path.exists():
+            elev_parts.append(
+                f'Import-Certificate -FilePath "{cer_path}" -CertStoreLocation "Cert:\\LocalMachine\\TrustedPeople" | Out-Null'
+            )
+            elev_parts.append(
+                f'Import-Certificate -FilePath "{cer_path}" -CertStoreLocation "Cert:\\LocalMachine\\Root" | Out-Null'
+            )
+        elev_Scripts = "; ".join(elev_parts)
+        outer_cmd = (
+            f'Start-Process powershell -Verb RunAs -WindowStyle Hidden -Wait '
+            f'-ArgumentList \'-NoProfile -WindowStyle Hidden -Command "{elev_Scripts}"\'; '
+            f'{direct_cmd}'
+        )
+        r2 = subprocess.run(
+            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", outer_cmd],
+            capture_output=True, text=True, timeout=45,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if r2.returncode == 0:
+            _log("Win11 IExplorerCommand shell extension registered after one-time trust setup")
+            return True
+        _log(f"Win11 shell extension registration stderr: {r2.stderr.strip() or r.stderr.strip()}")
+    except Exception as exc:
+        _log(f"Win11 shell extension install error: {exc}")
+    return False
+
+
+def _remove_win11_shell_extension() -> None:
+    if not IS_WINDOWS:
+        return
+    try:
+        cmd = 'Get-AppxPackage -Name "ConFas.ShellExtension" | Remove-AppxPackage -ErrorAction SilentlyContinue'
+        subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", cmd],
+            capture_output=True, text=True, timeout=20,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception:
+        pass
+
+
+def install_context_menu(extensions: Optional[list[str]] = None) -> int:
+    """Create the single expandable 'Convert with ConFas >' menu on both the
+    Windows 11 primary context menu (via ConFasShell.dll IExplorerCommand) and
+    the secondary classic menu (via cascading SubCommands), removing any
+    duplicate flat verb entries.
     Returns number of extensions handled.
     """
     if not IS_WINDOWS:
         return 0
+    _save_exe_path_registry()
     exts = extensions or MENU_EXTENSIONS
     n = 0
     for ext in exts:
@@ -503,35 +616,31 @@ def install_context_menu(extensions: Optional[list[str]] = None) -> int:
         default_t = targets[0] if targets else None
         ok = False
         for loc in locations:
+            # Remove any legacy flat top-level verbs so ConFas only appears once (as the expandable menu)
+            for verb, _label, _cmd in _verbs_for(ext):
+                _delete_verb(loc, verb)
             try:
                 _write_cascading_menu(loc, targets, default_t)
                 ok = True
             except Exception as exc:
                 _log(f"cascading menu .{ext} failed at {loc}: {exc}")
-            for verb, label, cmd in _verbs_for(ext):
-                try:
-                    _write_verb(loc, verb, label, cmd)
-                    ok = True
-                except Exception as exc:
-                    _log(f"context menu .{ext} {verb} failed at {loc}: {exc}")
         try:
             _register_openwith(ext)
         except Exception as exc:
             _log(f"open-with registration for .{ext} failed: {exc}")
         if ok:
             n += 1
-    # Also install universal fallback on HKCU\Software\Classes\* so any file shows ConFas
-    try:
-        _write_cascading_menu(r"Software\Classes\*", UNIVERSAL_TARGETS, None)
-        _write_verb(r"Software\Classes\*", VERB_CHOOSE,
-                    "Convert with ConFas (Choose format...)", _verb_cmd(None, choose=True))
-    except Exception as exc:
-        _log(f"universal * menu failed: {exc}")
-    cfg = load_config()
-    if cfg.get("win11_both_menus", True):
-        _set_win11_both_menus(True)
+    # Clean up universal '*' verbs so they don't duplicate or override per-extension target lists
+    if winreg is not None:
+        _delete_verb(r"Software\Classes\*", VERB_MENU)
+        _delete_verb(r"Software\Classes\*", VERB_CHOOSE)
+        _delete_verb(r"Software\Classes\*", VERB_AUTO)
+
+    # Keep the modern Windows 11 primary menu active and register our native Win11 expandable shell extension
+    _set_win11_both_menus(False)
+    _install_win11_shell_extension()
     _log(f"context menu installed for {n}/{len(exts)} extensions "
-         f"(cascading menu + all target verbs + open-with + win11 bridge)")
+         f"(single expandable menu in both Win11 main menu and classic menu)")
     return n
 
 
@@ -553,7 +662,9 @@ def remove_context_menu(extensions: Optional[list[str]] = None) -> int:
     _delete_verb(r"Software\Classes\*", VERB_AUTO)
     _delete_key_tree(winreg.HKEY_CURRENT_USER,
                      rf"Software\Classes\Applications\{OPENWITH_APP}")
+    _delete_key_tree(winreg.HKEY_CURRENT_USER, r"Software\ConFas")
     _set_win11_both_menus(False)
+    _remove_win11_shell_extension()
     _log(f"context menu removed ({n} verb keys deleted)")
     return n
 

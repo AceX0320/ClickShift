@@ -36,6 +36,8 @@ jobs:
           pip install pywin32 pystray
       - name: Generate icon (if missing)
         run: python scripts/make_icon.py
+      - name: Build Win11 IExplorerCommand Shell Extension & MSIX
+        run: powershell -ExecutionPolicy Bypass -File scripts/build_shell_ext.ps1
       - name: Build ConFas.exe
         run: python build.py
       - uses: actions/upload-artifact@v4
@@ -46,18 +48,18 @@ jobs:
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.4
-          name: ConFas v1.0.4 (Latest Build)
+          tag_name: v1.0.5
+          name: ConFas v1.0.5 (Latest Build)
           make_latest: "true"
           files: dist/ConFas.exe
           body: |
-            ## ConFas Windows EXE (v1.0.4)
+            ## ConFas Windows EXE (v1.0.5)
 
             **Direct download (always the newest release):**
             https://github.com/${{ github.repository }}/releases/latest/download/ConFas.exe
 
-            **Direct download (pinned to v1.0.4):**
-            https://github.com/${{ github.repository }}/releases/download/v1.0.4/ConFas.exe
+            **Direct download (pinned to v1.0.5):**
+            https://github.com/${{ github.repository }}/releases/download/v1.0.5/ConFas.exe
 
             Built automatically from commit `${{ github.sha }}`.
 

@@ -60,7 +60,10 @@ def build() -> int:
         "--hidden-import", "confas.cloud",
         "--hidden-import", "confas.debuglog",
     ]
-    icon = ROOT / "assets" / "confas.ico"
+    assets_dir = ROOT / "assets"
+    if assets_dir.exists():
+        args += ["--add-data", f"{assets_dir}{os.pathsep}assets"]
+    icon = assets_dir / "confas.ico"
     if icon.exists():
         args += ["--icon", str(icon)]
     args.append(str(ROOT / "entry_point.py"))

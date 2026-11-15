@@ -8,7 +8,7 @@ a = Analysis(
     [str(ROOT / "entry_point.py")],
     pathex=[str(ROOT / "src")],
     binaries=[],
-    datas=[],
+    datas=[(str(ROOT / "assets"), "assets")] if (ROOT / "assets").exists() else [],
     hiddenimports=[
         "confas.engine", "confas.learning", "confas.monitor", "confas.cli",
         "confas.cloud", "confas.debuglog",
