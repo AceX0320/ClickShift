@@ -101,12 +101,9 @@ def test_download_update_verifies_pe_header_and_writes(tmp_path, monkeypatch):
 
     class _FakeResp(io.BytesIO):
         headers = {"Content-Length": str(len(payload))}
+
         def geturl(self):
             return url
-        def __enter__(self):
-            return self
-        def __exit__(self, *args):
-            self.close()
 
     class _FakeOpener:
         def open(self, req, timeout=60.0):
