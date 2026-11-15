@@ -167,13 +167,13 @@ def all_targets_for(src_ext: str) -> list[str]:
     if g:
         out.append(g)
     if src_ext == "pdf":
-        out += ["docx", "txt", "md", "html", "csv", "png", "jpg", "webp", "odt", "rtf"]
+        out += ["docx", "pptx", "txt", "md", "html", "csv", "png", "jpg", "webp", "odt", "rtf"]
     if src_ext in OFFICE_DOC_IN:
-        out += ["pdf", "docx", "txt", "md", "html", "rtf", "odt"]
+        out += ["pdf", "docx", "pptx", "txt", "md", "html", "rtf", "odt"]
     if src_ext in OFFICE_SHEET_IN or src_ext == "tsv":
         out += ["xlsx", "pdf", "csv", "ods", "txt", "html"]
     if src_ext in OFFICE_SLIDE_IN:
-        out += ["pptx", "pdf", "odp"]
+        out += ["pptx", "pdf", "docx", "odp"]
     if src_ext in IMAGE_EXTS or src_ext in ("wmf", "emf"):
         out += ["webp", "png", "jpg", "pdf", "avif", "jxl", "tiff", "bmp", "ico", "gif"]
     if src_ext in TEXT_EXTS:
@@ -209,6 +209,7 @@ class Backends:
         self.pymupdf = False
         self.pypdf = False
         self.python_docx = False
+        self.python_pptx = False
         self.chardet = False
         self.detect()
 
@@ -249,6 +250,7 @@ class Backends:
             ("pymupdf", "fitz"),
             ("pypdf", "pypdf"),
             ("python_docx", "docx"),
+            ("python_pptx", "pptx"),
             ("chardet", "chardet"),
         ):
             try:
@@ -272,6 +274,7 @@ class Backends:
             "pymupdf": self.pymupdf,
             "pypdf": self.pypdf,
             "python_docx": self.python_docx,
+            "python_pptx": self.python_pptx,
             "chardet": self.chardet,
         }
 
@@ -569,6 +572,8 @@ def lo_convert(src: Path, dst: Path, extra: Optional[list[str]] = None) -> None:
     # instead of Draw (which rejects MS Word 2007 XML export with error 207).
     if src_ext == "pdf" and dst_ext in ("docx", "doc", "odt", "rtf", "txt", "html", "htm"):
         args.append("--infilter=writer_pdf_import")
+    elif src_ext == "pdf" and dst_ext in ("pptx", "ppt", "odp"):
+        args.append("--infilter=impress_pdf_import")
     args += [
         "--convert-to", (f"{dst_ext}:{filt}" if filt else dst_ext),
     ]
@@ -1561,6 +1566,804 @@ def conv_pdf_to_md_structured(src: Path, dst: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
+#  Presentations (PDF / DOCX <-> PPTX)
+# --------------------------------------------------------------------------- #
+
+_PPTX_EMU_PER_PT = 12700.0
+_PPTX_EMU_PER_IN = 914400.0
+_PPTX_MAX_PT = 4032.0  # PowerPoint OOXML max slide side = 56 in
+_PPTX_MIN_PT = 72.0    # 1 in minimum
+
+
+def _clamp_slide_pts(w_pt: float, h_pt: float) -> tuple[float, float]:
+    """Clamp slide dimensions (in points) within PowerPoint's supported bounds."""
+    if w_pt <= 0 or h_pt <= 0:
+        return (960.0, 540.0)
+    top = max(w_pt, h_pt)
+    if top > _PPTX_MAX_PT:
+        scale = _PPTX_MAX_PT / top
+        w_pt *= scale
+        h_pt *= scale
+    return (max(_PPTX_MIN_PT, w_pt), max(_PPTX_MIN_PT, h_pt))
+
+
+def _rgb_int_to_tuple(color_int: int) -> tuple[int, int, int]:
+    """Unpack PyMuPDF packed 0xRRGGBB integer into (r, g, b) bytes."""
+    return ((color_int >> 16) & 0xFF, (color_int >> 8) & 0xFF, color_int & 0xFF)
+
+
+def _normalize_image_stream(blob: bytes) -> Optional[io.BytesIO]:
+    """Ensure image bytes are in a universally accepted raster format (PNG/JPEG)."""
+    if not blob:
+        return None
+    if BACKENDS.pillow:
+        try:
+            Image: Any = importlib.import_module("PIL.Image")
+            with Image.open(io.BytesIO(blob)) as im:
+                fmt = (im.format or "").upper()
+                if fmt in ("PNG", "JPEG") and im.mode in ("RGB", "RGBA", "L"):
+                    return io.BytesIO(blob)
+                out = io.BytesIO()
+                if im.mode not in ("RGB", "RGBA", "L"):
+                    im = im.convert("RGBA" if "A" in im.getbands() else "RGB")
+                im.save(out, format="PNG")
+                out.seek(0)
+                return out
+        except Exception:
+            return None
+    return io.BytesIO(blob)
+
+
+def _flatten_pptx_shapes(shapes: Any) -> list[tuple[int, int, Any]]:
+    """Collect leaf shapes recursively, sorted top-to-bottom then left-to-right."""
+    items: list[tuple[int, int, Any]] = []
+    for sh in shapes:
+        sub_shapes = getattr(sh, "shapes", None)
+        if sub_shapes is not None:
+            items.extend(_flatten_pptx_shapes(sub_shapes))
+        else:
+            top = int(getattr(sh, "top", 0) or 0)
+            left = int(getattr(sh, "left", 0) or 0)
+            items.append((top, left, sh))
+    items.sort(key=lambda t: (t[0], t[1]))
+    return items
+
+
+def conv_pdf_to_pptx(src: Path, dst: Path) -> None:
+    """Convert PDF pages to PowerPoint slides (.pptx) via PyMuPDF + python-pptx.
+
+    Text pages emit positioned editable textboxes and extracted images; scanned
+    or textless pages fall back to a 200 DPI page image so nothing is dropped.
+    """
+    fitz: Any = importlib.import_module("fitz")
+    pptx_mod: Any = importlib.import_module("pptx")
+    pptx_util: Any = importlib.import_module("pptx.util")
+    pptx_color: Any = importlib.import_module("pptx.dml.color")
+    Pt = pptx_util.Pt
+    RGBColor = pptx_color.RGBColor
+
+    pdf = fitz.open(str(src))
+    try:
+        if getattr(pdf, "needs_pass", False):
+            raise RuntimeError("PDF is password protected")
+        if len(pdf) == 0:
+            raise RuntimeError("PDF has 0 pages")
+
+        sw, sh = _clamp_slide_pts(float(pdf[0].rect.width), float(pdf[0].rect.height))
+        prs = pptx_mod.Presentation()
+        prs.slide_width = Pt(sw)
+        prs.slide_height = Pt(sh)
+        blank_layout = prs.slide_layouts[min(6, len(prs.slide_layouts) - 1)]
+
+        for page in pdf:
+            slide = prs.slides.add_slide(blank_layout)
+            pw = max(1.0, float(page.rect.width))
+            ph = max(1.0, float(page.rect.height))
+            scale = min(sw / pw, sh / ph)
+            ox = (sw - pw * scale) / 2.0
+            oy = (sh - ph * scale) / 2.0
+
+            pdict = page.get_text("dict")
+            blocks = pdict.get("blocks", []) if isinstance(pdict, dict) else []
+            text_blocks = [b for b in blocks if b.get("type") == 0]
+            has_text = any(
+                "".join(s.get("text", "") for s in ln.get("spans", [])).strip()
+                for b in text_blocks
+                for ln in b.get("lines", [])
+            )
+
+            if not has_text:
+                pix = page.get_pixmap(dpi=200)
+                stream = io.BytesIO(pix.tobytes("png"))
+                slide.shapes.add_picture(
+                    stream, Pt(ox), Pt(oy), Pt(pw * scale), Pt(ph * scale)
+                )
+                continue
+
+            # Place extracted raster images first so text sits cleanly on top
+            seen_img_rects: set[tuple[int, int, int, int]] = set()
+            for img_info in page.get_images(full=True):
+                xref = img_info[0]
+                try:
+                    extracted = pdf.extract_image(xref)
+                except Exception:
+                    continue
+                if not extracted or not extracted.get("image"):
+                    continue
+                img_stream = _normalize_image_stream(extracted["image"])
+                if img_stream is None:
+                    continue
+                try:
+                    rects = page.get_image_rects(xref)
+                except Exception:
+                    rects = []
+                for rect in rects:
+                    rw = float(rect.width)
+                    rh = float(rect.height)
+                    if rw < 4.0 or rh < 4.0:
+                        continue
+                    key = (round(rect.x0), round(rect.y0), round(rw), round(rh))
+                    if key in seen_img_rects:
+                        continue
+                    seen_img_rects.add(key)
+                    img_stream.seek(0)
+                    try:
+                        slide.shapes.add_picture(
+                            img_stream,
+                            Pt(ox + rect.x0 * scale),
+                            Pt(oy + rect.y0 * scale),
+                            Pt(rw * scale),
+                            Pt(rh * scale),
+                        )
+                    except Exception:
+                        pass
+
+            for b in text_blocks:
+                lines = b.get("lines", [])
+                non_empty_lines = [
+                    ln for ln in lines
+                    if "".join(s.get("text", "") for s in ln.get("spans", [])).strip()
+                ]
+                if not non_empty_lines:
+                    continue
+                bx0, by0, bx1, by1 = b.get("bbox", (0.0, 0.0, pw, ph))
+                bw = max(24.0, (bx1 - bx0) * scale + 6.0)
+                bh = max(14.0, (by1 - by0) * scale + 4.0)
+                tb = slide.shapes.add_textbox(
+                    Pt(max(0.0, ox + bx0 * scale)),
+                    Pt(max(0.0, oy + by0 * scale)),
+                    Pt(min(bw, sw)),
+                    Pt(min(bh, sh)),
+                )
+                tf = tb.text_frame
+                tf.word_wrap = True
+                tf.margin_left = Pt(1)
+                tf.margin_right = Pt(1)
+                tf.margin_top = Pt(1)
+                tf.margin_bottom = Pt(1)
+
+                for l_idx, ln in enumerate(non_empty_lines):
+                    p = tf.paragraphs[0] if l_idx == 0 else tf.add_paragraph()
+                    p.space_before = Pt(0)
+                    p.space_after = Pt(1)
+                    for sp in ln.get("spans", []):
+                        txt = sp.get("text", "")
+                        if not txt:
+                            continue
+                        run = p.add_run()
+                        run.text = txt
+                        fsize = max(6.0, min(96.0, float(sp.get("size", 11.0)) * scale * 0.96))
+                        run.font.size = Pt(fsize)
+                        flags = int(sp.get("flags", 0) or 0)
+                        if flags & 16:
+                            run.font.bold = True
+                        if flags & 2:
+                            run.font.italic = True
+                        color_val = sp.get("color")
+                        if isinstance(color_val, int):
+                            r, g, bl = _rgb_int_to_tuple(color_val)
+                            run.font.color.rgb = RGBColor(r, g, bl)
+
+        prs.save(str(dst))
+    finally:
+        pdf.close()
+
+
+def _copy_docx_runs_to_pptx_para(src_p: Any, dst_p: Any, Pt: Any, RGBColor: Any, base_pt: float) -> None:
+    """Copy run text and basic inline formatting from a python-docx paragraph to pptx."""
+    if not getattr(src_p, "runs", None):
+        r = dst_p.add_run()
+        r.text = src_p.text
+        r.font.size = Pt(base_pt)
+        return
+    for srun in src_p.runs:
+        if not srun.text:
+            continue
+        trun = dst_p.add_run()
+        trun.text = srun.text
+        if srun.bold is not None:
+            trun.font.bold = bool(srun.bold)
+        if srun.italic is not None:
+            trun.font.italic = bool(srun.italic)
+        if srun.underline is not None:
+            trun.font.underline = bool(srun.underline)
+        if srun.font.size is not None:
+            trun.font.size = Pt(max(8.0, min(48.0, float(srun.font.size.pt))))
+        else:
+            trun.font.size = Pt(base_pt)
+        rgb = getattr(getattr(srun.font, "color", None), "rgb", None)
+        if rgb is not None and len(str(rgb)) == 6:
+            try:
+                val = int(str(rgb), 16)
+                trun.font.color.rgb = RGBColor(*_rgb_int_to_tuple(val))
+            except Exception:
+                pass
+    if not dst_p.runs and src_p.text.strip():
+        r = dst_p.add_run()
+        r.text = src_p.text
+        r.font.size = Pt(base_pt)
+
+
+def conv_docx_to_pptx(src: Path, dst: Path) -> None:
+    """Convert Word (.docx) to widescreen PowerPoint (.pptx), splitting on headings/page breaks."""
+    docx_mod: Any = importlib.import_module("docx")
+    docx_para_mod: Any = importlib.import_module("docx.text.paragraph")
+    docx_tbl_mod: Any = importlib.import_module("docx.table")
+    pptx_mod: Any = importlib.import_module("pptx")
+    pptx_util: Any = importlib.import_module("pptx.util")
+    pptx_color: Any = importlib.import_module("pptx.dml.color")
+    pptx_align: Any = importlib.import_module("pptx.enum.text")
+    Inches = pptx_util.Inches
+    Pt = pptx_util.Pt
+    RGBColor = pptx_color.RGBColor
+    PP_ALIGN = pptx_align.PP_ALIGN
+
+    doc = docx_mod.Document(str(src))
+    prs = pptx_mod.Presentation()
+    prs.slide_width = Inches(13.333)
+    prs.slide_height = Inches(7.5)
+    blank_layout = prs.slide_layouts[min(6, len(prs.slide_layouts) - 1)]
+
+    MARGIN_X = 0.7
+    BODY_W = 11.93
+    BODY_TOP_TITLED = 1.45
+    BODY_TOP_PLAIN = 0.65
+    BODY_BOTTOM = 6.95
+
+    current_slide: Any = None
+    current_title = ""
+    current_tf: Any = None
+    y_cursor = BODY_TOP_PLAIN
+    slide_has_content = False
+
+    def _new_slide(title_text: str = "") -> Any:
+        nonlocal current_slide, current_title, current_tf, y_cursor, slide_has_content
+        slide = prs.slides.add_slide(blank_layout)
+        current_slide = slide
+        current_title = title_text.strip()
+        current_tf = None
+        slide_has_content = False
+        if current_title:
+            tb = slide.shapes.add_textbox(Inches(MARGIN_X), Inches(0.45), Inches(BODY_W), Inches(0.85))
+            tf = tb.text_frame
+            tf.word_wrap = True
+            p = tf.paragraphs[0]
+            r = p.add_run()
+            r.text = current_title
+            r.font.size = Pt(28)
+            r.font.bold = True
+            r.font.color.rgb = RGBColor(0x1E, 0x29, 0x3B)
+            y_cursor = BODY_TOP_TITLED
+        else:
+            y_cursor = BODY_TOP_PLAIN
+        return slide
+
+    def _ensure_body_tf() -> Any:
+        nonlocal current_tf
+        slide = current_slide if current_slide is not None else _new_slide()
+        if current_tf is None:
+            tb = slide.shapes.add_textbox(
+                Inches(MARGIN_X),
+                Inches(y_cursor),
+                Inches(BODY_W),
+                Inches(max(0.8, BODY_BOTTOM - y_cursor)),
+            )
+            current_tf = tb.text_frame
+            current_tf.word_wrap = True
+        return current_tf
+
+    def _extract_para_images(p: Any) -> list[bytes]:
+        blobs: list[bytes] = []
+        rids: list[str] = []
+        for attr in (".//a:blip/@r:embed", ".//v:imagedata/@r:id"):
+            try:
+                rids.extend(p._element.xpath(attr))
+            except Exception:
+                pass
+        for rid in rids:
+            part = doc.part.related_parts.get(str(rid))
+            blob = getattr(part, "blob", None)
+            if isinstance(blob, (bytes, bytearray)) and blob:
+                blobs.append(bytes(blob))
+        return blobs
+
+    children = list(doc.element.body)
+    idx = 0
+    while idx < len(children):
+        child = children[idx]
+        idx += 1
+        tag = child.tag.rsplit("}", 1)[-1]
+
+        if tag == "p":
+            para = docx_para_mod.Paragraph(child, doc)
+            text = para.text.strip()
+            style_name = (getattr(para.style, "name", "") or "").lower()
+            has_break = bool(getattr(para.paragraph_format, "page_break_before", False))
+            if not has_break:
+                try:
+                    has_break = bool(child.xpath(".//w:br[@w:type='page']"))
+                except Exception:
+                    has_break = False
+
+            if has_break and current_slide is not None and (slide_has_content or current_title):
+                _new_slide()
+
+            img_blobs = _extract_para_images(para)
+
+            if style_name == "title" and text:
+                title_slide = prs.slides.add_slide(blank_layout)
+                tb = title_slide.shapes.add_textbox(Inches(1.0), Inches(2.4), Inches(11.333), Inches(1.4))
+                tf = tb.text_frame
+                tf.word_wrap = True
+                p0 = tf.paragraphs[0]
+                p0.alignment = PP_ALIGN.CENTER
+                r0 = p0.add_run()
+                r0.text = text
+                r0.font.size = Pt(38)
+                r0.font.bold = True
+                r0.font.color.rgb = RGBColor(0x0F, 0x17, 0x2A)
+                if idx < len(children) and children[idx].tag.rsplit("}", 1)[-1] == "p":
+                    nxt = docx_para_mod.Paragraph(children[idx], doc)
+                    if (getattr(nxt.style, "name", "") or "").lower() == "subtitle" and nxt.text.strip():
+                        p1 = tf.add_paragraph()
+                        p1.alignment = PP_ALIGN.CENTER
+                        p1.space_before = Pt(10)
+                        r1 = p1.add_run()
+                        r1.text = nxt.text.strip()
+                        r1.font.size = Pt(20)
+                        r1.font.color.rgb = RGBColor(0x47, 0x55, 0x69)
+                        idx += 1
+                current_slide = None
+                current_tf = None
+                slide_has_content = False
+                continue
+
+            if style_name in ("heading 1", "heading 2") and text:
+                if current_slide is None or slide_has_content or current_title:
+                    _new_slide(text)
+                else:
+                    _new_slide(text)
+                continue
+
+            if not text and not img_blobs:
+                continue
+
+            if text:
+                is_subhead = style_name.startswith("heading ")
+                is_list = style_name.startswith("list") or bool(getattr(getattr(para._p, "pPr", None), "numPr", None) is not None)
+                line_est = max(1, (len(text) // 85) + 1 + text.count("\n"))
+                step_in = line_est * 0.34 + (0.16 if is_subhead else 0.10)
+                if current_slide is None:
+                    _new_slide()
+                elif y_cursor + step_in > BODY_BOTTOM and slide_has_content:
+                    cont = f"{current_title} (cont.)" if current_title and not current_title.endswith("(cont.)") else current_title
+                    _new_slide(cont)
+
+                tf = _ensure_body_tf()
+                p_out = tf.paragraphs[0] if not slide_has_content else tf.add_paragraph()
+                p_out.space_before = Pt(6 if is_subhead else 3)
+                p_out.space_after = Pt(4)
+                if is_list:
+                    _copy_bullet_prefix = True
+                else:
+                    _copy_bullet_prefix = False
+                if _copy_bullet_prefix and not text.startswith(("•", "-", "*")):
+                    br = p_out.add_run()
+                    br.text = "• "
+                    br.font.size = Pt(16)
+                _copy_docx_runs_to_pptx_para(para, p_out, Pt, RGBColor, 18.0 if is_subhead else 16.0)
+                if is_subhead:
+                    for rr in p_out.runs:
+                        rr.font.bold = True
+                y_cursor += step_in
+                slide_has_content = True
+
+            for blob in img_blobs:
+                stream = _normalize_image_stream(blob)
+                if stream is None:
+                    continue
+                if current_slide is None or (y_cursor > BODY_BOTTOM - 2.0 and slide_has_content):
+                    cont = f"{current_title} (cont.)" if current_title and not current_title.endswith("(cont.)") else current_title
+                    slide_target = _new_slide(cont)
+                else:
+                    slide_target = current_slide
+                avail_h = max(1.6, BODY_BOTTOM - y_cursor)
+                pic_h = min(3.4, avail_h)
+                try:
+                    pic = slide_target.shapes.add_picture(stream, Inches(MARGIN_X), Inches(y_cursor), height=Inches(pic_h))
+                    if pic.width > Inches(BODY_W):
+                        ratio = float(Inches(BODY_W)) / float(pic.width)
+                        pic.width = Inches(BODY_W)
+                        pic.height = int(float(pic.height) * ratio)
+                    y_cursor += (float(pic.height) / _PPTX_EMU_PER_IN) + 0.2
+                    current_tf = None
+                    slide_has_content = True
+                except Exception:
+                    pass
+
+        elif tag == "tbl":
+            tbl = docx_tbl_mod.Table(child, doc)
+            nrows = len(tbl.rows)
+            ncols = len(tbl.columns) if nrows else 0
+            if nrows == 0 or ncols == 0:
+                continue
+            est_h = min(5.4, max(0.8, nrows * 0.44))
+            if current_slide is None or (y_cursor + est_h > BODY_BOTTOM and slide_has_content):
+                cont = f"{current_title} (cont.)" if current_title and not current_title.endswith("(cont.)") else current_title
+                slide_target = _new_slide(cont)
+            else:
+                slide_target = current_slide
+            tbl_shape = slide_target.shapes.add_table(
+                nrows, ncols, Inches(MARGIN_X), Inches(y_cursor), Inches(BODY_W), Inches(est_h)
+            )
+            ptbl = tbl_shape.table
+            for r_idx, row in enumerate(tbl.rows):
+                for c_idx in range(min(ncols, len(row.cells))):
+                    cell = ptbl.cell(r_idx, c_idx)
+                    cell.text = row.cells[c_idx].text.strip()
+                    for p in cell.text_frame.paragraphs:
+                        for rr in p.runs:
+                            rr.font.size = Pt(12)
+                            if r_idx == 0:
+                                rr.font.bold = True
+            y_cursor += est_h + 0.22
+            current_tf = None
+            slide_has_content = True
+
+    if len(prs.slides) == 0:
+        _new_slide(src.stem)
+    prs.save(str(dst))
+
+
+def conv_pptx_to_docx(src: Path, dst: Path) -> None:
+    """Convert PowerPoint (.pptx) slides to a structured Word document (.docx)."""
+    pptx_mod: Any = importlib.import_module("pptx")
+    pptx_shapes_enum: Any = importlib.import_module("pptx.enum.shapes")
+    pptx_color_enum: Any = importlib.import_module("pptx.enum.dml")
+    docx_mod: Any = importlib.import_module("docx")
+    docx_shared: Any = importlib.import_module("docx.shared")
+    Inches = docx_shared.Inches
+    Pt = docx_shared.Pt
+    DocxRGB = docx_shared.RGBColor
+    MSO_SHAPE_TYPE = pptx_shapes_enum.MSO_SHAPE_TYPE
+    MSO_COLOR_TYPE = pptx_color_enum.MSO_COLOR_TYPE
+
+    prs = pptx_mod.Presentation(str(src))
+    doc = docx_mod.Document()
+    doc.styles["Normal"].font.name = "Calibri"
+    doc.styles["Normal"].font.size = Pt(11)
+
+    if len(prs.slides) == 0:
+        doc.add_heading(src.stem, level=1)
+        doc.save(str(dst))
+        return
+
+    for s_idx, slide in enumerate(prs.slides):
+        if s_idx > 0:
+            doc.add_page_break()
+        title_shape = None
+        try:
+            title_shape = slide.shapes.title
+        except Exception:
+            title_shape = None
+
+        title_text = ""
+        if title_shape is not None and getattr(title_shape, "has_text_frame", False):
+            title_text = title_shape.text_frame.text.strip()
+        if title_text:
+            doc.add_heading(title_text, level=1)
+        else:
+            doc.add_heading(f"Slide {s_idx + 1}", level=2)
+
+        for _top, _left, sh in _flatten_pptx_shapes(slide.shapes):
+            if title_shape is not None and sh == title_shape:
+                continue
+
+            if getattr(sh, "has_table", False):
+                stbl = sh.table
+                nrows = len(stbl.rows)
+                ncols = len(stbl.columns) if nrows else 0
+                if nrows > 0 and ncols > 0:
+                    dtbl = doc.add_table(rows=nrows, cols=ncols)
+                    try:
+                        dtbl.style = "Table Grid"
+                    except Exception:
+                        pass
+                    for r_idx, row in enumerate(stbl.rows):
+                        for c_idx in range(min(ncols, len(row.cells))):
+                            txt = row.cells[c_idx].text.strip()
+                            dcell = dtbl.cell(r_idx, c_idx)
+                            dcell.text = ""
+                            dp = dcell.paragraphs[0]
+                            dr = dp.add_run(txt)
+                            if r_idx == 0:
+                                dr.bold = True
+                    doc.add_paragraph("")
+                continue
+
+            if getattr(sh, "shape_type", None) == MSO_SHAPE_TYPE.PICTURE or hasattr(sh, "image"):
+                try:
+                    blob = sh.image.blob
+                except Exception:
+                    blob = None
+                if blob:
+                    stream = _normalize_image_stream(blob)
+                    if stream is not None:
+                        w_in = (float(sh.width or 0) / _PPTX_EMU_PER_IN) if getattr(sh, "width", None) else 4.5
+                        w_in = max(0.8, min(6.2, w_in))
+                        try:
+                            doc.add_picture(stream, width=Inches(w_in))
+                        except Exception:
+                            pass
+                continue
+
+            if getattr(sh, "has_text_frame", False):
+                for p in sh.text_frame.paragraphs:
+                    ptext = p.text.strip()
+                    if not ptext:
+                        continue
+                    lvl = int(getattr(p, "level", 0) or 0)
+                    style = "List Bullet" if lvl > 0 else None
+                    try:
+                        dp = doc.add_paragraph(style=style) if style else doc.add_paragraph()
+                    except Exception:
+                        dp = doc.add_paragraph()
+                    if lvl > 1:
+                        dp.paragraph_format.left_indent = Inches(0.25 * lvl)
+                    if p.runs:
+                        for pr in p.runs:
+                            if not pr.text:
+                                continue
+                            dr = dp.add_run(pr.text)
+                            if pr.font.bold is not None:
+                                dr.bold = bool(pr.font.bold)
+                            if pr.font.italic is not None:
+                                dr.italic = bool(pr.font.italic)
+                            if pr.font.underline is not None:
+                                dr.underline = bool(pr.font.underline)
+                            if pr.font.size is not None:
+                                dr.font.size = Pt(max(8.0, min(28.0, float(pr.font.size.pt))))
+                            try:
+                                clr = pr.font.color
+                                if clr is not None and clr.type == MSO_COLOR_TYPE.RGB and clr.rgb is not None:
+                                    val = int(str(clr.rgb), 16)
+                                    dr.font.color.rgb = DocxRGB(*_rgb_int_to_tuple(val))
+                            except Exception:
+                                pass
+                    else:
+                        dp.add_run(ptext)
+
+        try:
+            if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
+                notes = slide.notes_slide.notes_text_frame.text.strip()
+                if notes:
+                    np = doc.add_paragraph()
+                    nr = np.add_run(f"Notes: {notes}")
+                    nr.italic = True
+                    nr.font.size = Pt(9.5)
+                    nr.font.color.rgb = DocxRGB(0x64, 0x74, 0x8B)
+        except Exception:
+            pass
+
+    doc.save(str(dst))
+
+
+def _pptx_fill_rgb01(fill: Any) -> Optional[tuple[float, float, float]]:
+    """Extract normalized (0..1) RGB fill color from a python-pptx FillFormat if solid."""
+    try:
+        pptx_dml: Any = importlib.import_module("pptx.enum.dml")
+        if fill.type != pptx_dml.MSO_FILL.SOLID:
+            return None
+        fc = fill.fore_color
+        if fc.type == pptx_dml.MSO_COLOR_TYPE.RGB and fc.rgb is not None:
+            r, g, b = _rgb_int_to_tuple(int(str(fc.rgb), 16))
+            return (r / 255.0, g / 255.0, b / 255.0)
+    except Exception:
+        pass
+    return None
+
+
+def conv_pptx_to_pdf(src: Path, dst: Path) -> None:
+    """Pure-Python PPTX -> PDF renderer via python-pptx + PyMuPDF (no Office/LO required)."""
+    pptx_mod: Any = importlib.import_module("pptx")
+    pptx_shapes_enum: Any = importlib.import_module("pptx.enum.shapes")
+    pptx_dml: Any = importlib.import_module("pptx.enum.dml")
+    pptx_align: Any = importlib.import_module("pptx.enum.text")
+    fitz: Any = importlib.import_module("fitz")
+
+    prs = pptx_mod.Presentation(str(src))
+    sw = float(prs.slide_width or 914400 * 10) / _PPTX_EMU_PER_PT
+    sh = float(prs.slide_height or int(914400 * 5.625)) / _PPTX_EMU_PER_PT
+    pdf = fitz.open()
+
+    align_map = {
+        pptx_align.PP_ALIGN.CENTER: fitz.TEXT_ALIGN_CENTER,
+        pptx_align.PP_ALIGN.RIGHT: fitz.TEXT_ALIGN_RIGHT,
+        pptx_align.PP_ALIGN.JUSTIFY: fitz.TEXT_ALIGN_JUSTIFY,
+    }
+
+    try:
+        if len(prs.slides) == 0:
+            pdf.new_page(width=sw, height=sh)
+        for slide in prs.slides:
+            page = pdf.new_page(width=sw, height=sh)
+            bg_rgb = _pptx_fill_rgb01(slide.background.fill)
+            if bg_rgb is not None:
+                page.draw_rect(page.rect, color=None, fill=bg_rgb)
+
+            # Collect in z-order (slide.shapes iteration order preserves draw stack)
+            stack: list[Any] = []
+            def _collect_z(container: Any) -> None:
+                for item in container:
+                    sub = getattr(item, "shapes", None)
+                    if sub is not None:
+                        _collect_z(sub)
+                    else:
+                        stack.append(item)
+            _collect_z(slide.shapes)
+
+            for shape in stack:
+                x0 = float(getattr(shape, "left", 0) or 0) / _PPTX_EMU_PER_PT
+                y0 = float(getattr(shape, "top", 0) or 0) / _PPTX_EMU_PER_PT
+                w = float(getattr(shape, "width", 0) or 0) / _PPTX_EMU_PER_PT
+                h = float(getattr(shape, "height", 0) or 0) / _PPTX_EMU_PER_PT
+                if w <= 0.5 or h <= 0.5:
+                    continue
+                rect = fitz.Rect(x0, y0, x0 + w, y0 + h)
+
+                if getattr(shape, "shape_type", None) == pptx_shapes_enum.MSO_SHAPE_TYPE.PICTURE or hasattr(shape, "image"):
+                    try:
+                        stream = _normalize_image_stream(shape.image.blob)
+                        if stream is not None:
+                            page.insert_image(rect, stream=stream.getvalue())
+                    except Exception:
+                        pass
+                    continue
+
+                if getattr(shape, "has_table", False):
+                    tbl = shape.table
+                    col_ws = [float(c.width) / _PPTX_EMU_PER_PT for c in tbl.columns]
+                    row_hs = [float(r.height) / _PPTX_EMU_PER_PT for r in tbl.rows]
+                    cy = y0
+                    for r_idx, row in enumerate(tbl.rows):
+                        rh = row_hs[r_idx] if r_idx < len(row_hs) and row_hs[r_idx] > 0 else (h / max(1, len(tbl.rows)))
+                        cx = x0
+                        for c_idx in range(len(tbl.columns)):
+                            cw = col_ws[c_idx] if c_idx < len(col_ws) and col_ws[c_idx] > 0 else (w / max(1, len(tbl.columns)))
+                            crect = fitz.Rect(cx, cy, cx + cw, cy + rh)
+                            cfill = _pptx_fill_rgb01(row.cells[c_idx].fill) or ((0.94, 0.96, 0.98) if r_idx == 0 else None)
+                            page.draw_rect(crect, color=(0.72, 0.76, 0.82), width=0.6, fill=cfill)
+                            ctext = row.cells[c_idx].text.strip()
+                            if ctext:
+                                inner = fitz.Rect(cx + 3, cy + 2, cx + cw - 3, cy + rh - 2)
+                                if inner.width > 2 and inner.height > 2:
+                                    page.insert_textbox(
+                                        inner,
+                                        ctext,
+                                        fontsize=10,
+                                        fontname="hebo" if r_idx == 0 else "helv",
+                                        color=(0.08, 0.09, 0.12),
+                                    )
+                            cx += cw
+                        cy += rh
+                    continue
+
+                fill_rgb = _pptx_fill_rgb01(getattr(shape, "fill", None))
+                if fill_rgb is not None:
+                    page.draw_rect(rect, color=None, fill=fill_rgb)
+
+                if getattr(shape, "has_text_frame", False):
+                    lines_out: list[tuple[str, float, str, tuple[float, float, float], int]] = []
+                    for p in shape.text_frame.paragraphs:
+                        ptxt = p.text
+                        if not ptxt.strip():
+                            continue
+                        p_align = align_map.get(getattr(p, "alignment", None), fitz.TEXT_ALIGN_LEFT)
+                        fsize = 16.0
+                        bold = False
+                        italic = False
+                        col_rgb = (0.08, 0.09, 0.12)
+                        for rn in p.runs:
+                            if rn.font.size is not None:
+                                fsize = float(rn.font.size.pt)
+                            if rn.font.bold:
+                                bold = True
+                            if rn.font.italic:
+                                italic = True
+                            try:
+                                if (
+                                    rn.font.color is not None
+                                    and rn.font.color.type == pptx_dml.MSO_COLOR_TYPE.RGB
+                                    and rn.font.color.rgb is not None
+                                ):
+                                    rr, gg, bb = _rgb_int_to_tuple(int(str(rn.font.color.rgb), 16))
+                                    col_rgb = (rr / 255.0, gg / 255.0, bb / 255.0)
+                            except Exception:
+                                pass
+                            break
+                        fname = "hebi" if (bold and italic) else ("hebo" if bold else ("heit" if italic else "helv"))
+                        lines_out.append((ptxt, max(7.0, min(60.0, fsize)), fname, col_rgb, p_align))
+
+                    if lines_out:
+                        cur_y = y0 + 2.0
+                        bottom = y0 + h - 2.0
+                        for ptxt, fs, fname, col_rgb, p_align in lines_out:
+                            if cur_y >= bottom - 4.0:
+                                break
+                            box = fitz.Rect(x0 + 3.0, cur_y, x0 + w - 3.0, bottom)
+                            if box.width <= 4 or box.height <= 4:
+                                break
+                            # Fit text inside remaining box height; shrink slightly if needed
+                            used_fs = fs
+                            rc = -1.0
+                            while used_fs >= 7.0:
+                                rc = page.insert_textbox(
+                                    box, ptxt, fontsize=used_fs, fontname=fname, color=col_rgb, align=p_align
+                                )
+                                if rc >= 0:
+                                    break
+                                used_fs -= 2.0
+                            est_lines = max(1, int((len(ptxt) * used_fs * 0.52) // max(20.0, box.width)) + ptxt.count("\n") + 1)
+                            cur_y += est_lines * used_fs * 1.28 + 3.0
+
+        pdf.save(str(dst), deflate=True, garbage=3)
+    finally:
+        pdf.close()
+
+
+def conv_via_docx_to_pptx(src: Path, dst: Path) -> None:
+    """Convert non-DOCX documents (txt/md/html/doc/odt/rtf) -> temp .docx -> .pptx."""
+    s = src.suffix.lstrip(".").lower()
+    with tempfile.TemporaryDirectory(prefix="confas_pptx_") as td:
+        tmp_docx = Path(td) / f"{src.stem}.docx"
+        if s in TEXT_EXTS:
+            if s in ("html", "htm") and BACKENDS.libreoffice:
+                conv_html_to_docx(src, tmp_docx)
+            else:
+                conv_text_to_docx(src, tmp_docx)
+        elif IS_WINDOWS and "word" in BACKENDS.office_app:
+            conv_office_com(src, tmp_docx)
+        else:
+            lo_convert(src, tmp_docx)
+        if not tmp_docx.exists():
+            raise RuntimeError(f"Failed intermediate conversion {s} -> docx")
+        conv_docx_to_pptx(tmp_docx, dst)
+
+
+def conv_via_pptx_to_docx(src: Path, dst: Path) -> None:
+    """Convert legacy/open slide formats (.ppt/.odp) -> temp .pptx -> .docx."""
+    with tempfile.TemporaryDirectory(prefix="confas_docx_") as td:
+        tmp_pptx = Path(td) / f"{src.stem}.pptx"
+        if IS_WINDOWS and "powerpoint" in BACKENDS.office_app:
+            conv_office_com(src, tmp_pptx)
+        else:
+            lo_convert(src, tmp_pptx)
+        if not tmp_pptx.exists():
+            raise RuntimeError(f"Failed intermediate conversion {src.suffix} -> pptx")
+        conv_pptx_to_docx(tmp_pptx, dst)
+
+
+# --------------------------------------------------------------------------- #
 #  Routing table
 # --------------------------------------------------------------------------- #
 
@@ -1582,6 +2385,7 @@ def _routes_for(src_ext: str, dst_ext: str) -> list[Route]:
 
     office_available = IS_WINDOWS and bool(BACKENDS.office_app)
     word_available = office_available and "word" in BACKENDS.office_app
+    ppt_available = office_available and "powerpoint" in BACKENDS.office_app
 
     # same family shortcuts ---------------------------------------------------
     if s in IMAGE_EXTS and d in IMAGE_EXTS:
@@ -1599,6 +2403,10 @@ def _routes_for(src_ext: str, dst_ext: str) -> list[Route]:
         add("libreoffice", conv_libreoffice, 65)
         if BACKENDS.pypdf and BACKENDS.python_docx:
             add("pypdf-docx", conv_pdf_to_docx_pypdf, 50)
+    elif s == "pdf" and d == "pptx":
+        if BACKENDS.pymupdf and BACKENDS.python_pptx:
+            add("pymupdf-python-pptx", conv_pdf_to_pptx, 95)
+        add("libreoffice", conv_libreoffice, 40)
     elif s == "pdf" and d in ("md", "markdown"):
         if BACKENDS.pymupdf:
             add("pymupdf-md", conv_pdf_to_md_structured, 99)
@@ -1635,6 +2443,24 @@ def _routes_for(src_ext: str, dst_ext: str) -> list[Route]:
     elif s in IMAGE_EXTS and d == "pdf":
         if BACKENDS.pillow:
             add("pillow-pdf", conv_image_to_pdf, 100)
+        add("libreoffice", conv_libreoffice, 30)
+    elif s == "docx" and d == "pptx":
+        if BACKENDS.python_docx and BACKENDS.python_pptx:
+            add("python-docx-python-pptx", conv_docx_to_pptx, 95)
+        add("libreoffice", conv_libreoffice, 30)
+    elif s in (OFFICE_DOC_IN | {"md", "markdown", "rst"}) - {"docx"} and d == "pptx":
+        if s in TEXT_EXTS and BACKENDS.python_docx and BACKENDS.python_pptx:
+            add("text-python-docx-python-pptx", conv_via_docx_to_pptx, 85)
+        elif BACKENDS.python_docx and BACKENDS.python_pptx and (word_available or BACKENDS.libreoffice):
+            add("via-python-docx-python-pptx", conv_via_docx_to_pptx, 85)
+        add("libreoffice", conv_libreoffice, 30)
+    elif s == "pptx" and d == "docx":
+        if BACKENDS.python_pptx and BACKENDS.python_docx:
+            add("python-pptx-python-docx", conv_pptx_to_docx, 95)
+        add("libreoffice", conv_libreoffice, 30)
+    elif s in ("ppt", "odp") and d == "docx":
+        if BACKENDS.python_pptx and BACKENDS.python_docx and (ppt_available or BACKENDS.libreoffice):
+            add("via-python-pptx-python-docx", conv_via_pptx_to_docx, 85)
         add("libreoffice", conv_libreoffice, 30)
     elif s in ("docx",) and d in TEXT_EXTS - {"docx"}:
         if s == "docx" and d in ("txt", "md", "log"):
@@ -1682,7 +2508,13 @@ def _routes_for(src_ext: str, dst_ext: str) -> list[Route]:
         if office_available:
             add("office-com", conv_office_com, 100)
         add("libreoffice", conv_libreoffice, 70)
-    elif s in OFFICE_DOC_IN | OFFICE_SHEET_IN | OFFICE_SLIDE_IN and d == "pdf":
+    elif s in OFFICE_SLIDE_IN and d == "pdf":
+        if ppt_available:
+            add("office-com", conv_office_com, 100)
+        add("libreoffice", conv_libreoffice, 70)
+        if s == "pptx" and BACKENDS.python_pptx and BACKENDS.pymupdf:
+            add("python-pptx-pymupdf-pdf", conv_pptx_to_pdf, 50)
+    elif s in OFFICE_DOC_IN | OFFICE_SHEET_IN and d == "pdf":
         if office_available:
             add("office-com", conv_office_com, 100)
         add("libreoffice", conv_libreoffice, 70)
@@ -1713,7 +2545,11 @@ def _routes_for(src_ext: str, dst_ext: str) -> list[Route]:
     for r in routes:
         if r.name.startswith("pillow") and not BACKENDS.pillow:
             continue
-        if r.name.startswith("python-docx") and not BACKENDS.python_docx:
+        if ("python-docx" in r.name) and not BACKENDS.python_docx:
+            continue
+        if ("python-pptx" in r.name) and not BACKENDS.python_pptx:
+            continue
+        if ("pymupdf" in r.name) and not BACKENDS.pymupdf:
             continue
         if r.name == "office-com" and not (IS_WINDOWS and BACKENDS.office_app):
             continue

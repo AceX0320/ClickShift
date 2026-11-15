@@ -209,3 +209,163 @@ def test_pdf_to_md_structured(tmp_path, engine):
     assert "\n1\n" not in md
 
 
+def test_pptx_targets_and_routes():
+    from confas.monitor import menu_targets
+
+    for getter in (newest_target_for, menu_targets):
+        assert "pptx" in getter("pdf")
+        assert "pptx" in getter("docx")
+        assert "pdf" in getter("pptx")
+        assert "docx" in getter("pptx")
+
+    assert "pymupdf-python-pptx" in [r.name for r in _routes_for(".pdf", ".pptx")]
+    assert "python-docx-python-pptx" in [r.name for r in _routes_for(".docx", ".pptx")]
+    assert "python-pptx-python-docx" in [r.name for r in _routes_for(".pptx", ".docx")]
+    assert "python-pptx-pymupdf-pdf" in [r.name for r in _routes_for(".pptx", ".pdf")]
+
+
+def test_pdf_to_pptx_text_and_scanned(tmp_path, engine):
+    import io
+    import fitz
+    import pptx
+    from PIL import Image
+
+    img_buf = io.BytesIO()
+    Image.new("RGB", (120, 80), (30, 120, 220)).save(img_buf, format="PNG")
+    img_bytes = img_buf.getvalue()
+
+    src = tmp_path / "deck_src.pdf"
+    doc = fitz.open()
+    p1 = doc.new_page(width=720, height=540)
+    p1.insert_text((72, 90), "Quarterly Review", fontsize=24, fontname="hebo")
+    p1.insert_text((72, 140), "Revenue grew cleanly.", fontsize=14, fontname="helv")
+    p1.insert_image(fitz.Rect(72, 200, 252, 320), stream=img_bytes)
+
+    # Scanned/image-only second page (no text spans)
+    p2 = doc.new_page(width=720, height=540)
+    p2.insert_image(fitz.Rect(40, 40, 680, 500), stream=img_bytes)
+    doc.save(src)
+    doc.close()
+
+    res = engine.convert(src, "pptx")
+    assert res.ok, res.error
+    out = Path(res.target)
+    assert out.suffix.lower() == ".pptx" and out.exists()
+
+    prs = pptx.Presentation(str(out))
+    assert len(prs.slides) == 2
+    s1_text = "\n".join(sh.text_frame.text for sh in prs.slides[0].shapes if sh.has_text_frame)
+    assert "Quarterly Review" in s1_text
+    assert "Revenue grew cleanly." in s1_text
+    assert any(hasattr(sh, "image") for sh in prs.slides[0].shapes)
+    assert any(hasattr(sh, "image") for sh in prs.slides[1].shapes)
+
+
+def test_docx_to_pptx_structured(tmp_path, engine):
+    import io
+    import docx
+    import pptx
+    from PIL import Image
+
+    img_buf = io.BytesIO()
+    Image.new("RGB", (100, 60), (200, 50, 50)).save(img_buf, format="PNG")
+    img_buf.seek(0)
+
+    d = docx.Document()
+    d.add_paragraph("Annual Report", style="Title")
+    d.add_paragraph("2026 Overview", style="Subtitle")
+    d.add_heading("Key Metrics", level=1)
+    d.add_paragraph("First bullet point", style="List Bullet")
+    tbl = d.add_table(rows=2, cols=2)
+    tbl.cell(0, 0).text = "Region"
+    tbl.cell(0, 1).text = "Score"
+    tbl.cell(1, 0).text = "EMEA"
+    tbl.cell(1, 1).text = "98%"
+    d.add_picture(img_buf, width=docx.shared.Inches(2.0))
+    src = tmp_path / "report.docx"
+    d.save(src)
+
+    res = engine.convert(src, "pptx")
+    assert res.ok, res.error
+    prs = pptx.Presentation(str(res.target))
+    assert len(prs.slides) >= 2
+    all_text = "\n".join(
+        sh.text_frame.text for sl in prs.slides for sh in sl.shapes if sh.has_text_frame
+    )
+    assert "Annual Report" in all_text
+    assert "2026 Overview" in all_text
+    assert "Key Metrics" in all_text
+    assert "First bullet point" in all_text
+    assert any(sh.has_table for sl in prs.slides for sh in sl.shapes)
+    assert any(hasattr(sh, "image") for sl in prs.slides for sh in sl.shapes)
+
+
+def test_pptx_to_docx_and_pdf_roundtrip(tmp_path, engine):
+    import io
+    import docx
+    import fitz
+    import pptx
+    from pptx.util import Inches
+    from PIL import Image
+    from confas.engine import conv_pptx_to_pdf
+
+    img_buf = io.BytesIO()
+    Image.new("RGB", (90, 90), (20, 160, 90)).save(img_buf, format="PNG")
+    img_buf.seek(0)
+
+    prs = pptx.Presentation()
+    prs.slide_width = Inches(13.333)
+    prs.slide_height = Inches(7.5)
+
+    s1 = prs.slides.add_slide(prs.slide_layouts[0])
+    s1.shapes.title.text = "Slide One Title"
+    s1.placeholders[1].text = "Opening summary point"
+    s1.notes_slide.notes_text_frame.text = "Remember to pause here."
+
+    s2 = prs.slides.add_slide(prs.slide_layouts[5])
+    s2.shapes.title.text = "Data Breakdown"
+    tshape = s2.shapes.add_table(2, 2, Inches(1.0), Inches(1.8), Inches(5.0), Inches(1.4))
+    tshape.table.cell(0, 0).text = "Item"
+    tshape.table.cell(0, 1).text = "Value"
+    tshape.table.cell(1, 0).text = "Speed"
+    tshape.table.cell(1, 1).text = "Fast"
+    s2.shapes.add_picture(img_buf, Inches(7.0), Inches(1.8), width=Inches(2.0))
+
+    src = tmp_path / "slides.pptx"
+    prs.save(src)
+
+    # 1. PPTX -> DOCX via engine
+    res_docx = engine.convert(src, "docx")
+    assert res_docx.ok, res_docx.error
+    d = docx.Document(str(res_docx.target))
+    doc_text = "\n".join(p.text for p in d.paragraphs)
+    assert "Slide One Title" in doc_text
+    assert "Opening summary point" in doc_text
+    assert "Remember to pause here." in doc_text
+    assert "Data Breakdown" in doc_text
+    assert len(d.tables) == 1
+    assert d.tables[0].cell(1, 1).text == "Fast"
+    assert len(d.inline_shapes) == 1
+
+    # 2. Pure-Python PPTX -> PDF fallback (direct check regardless of local PowerPoint)
+    pure_pdf = tmp_path / "pure.pdf"
+    conv_pptx_to_pdf(src, pure_pdf)
+    assert pure_pdf.exists() and pure_pdf.stat().st_size > 0
+    pdf_doc = fitz.open(str(pure_pdf))
+    try:
+        assert len(pdf_doc) == 2
+        p1_txt = pdf_doc[0].get_text("text")
+        p2_txt = pdf_doc[1].get_text("text")
+        assert "Slide One Title" in p1_txt
+        assert "Data Breakdown" in p2_txt
+        assert "Fast" in p2_txt
+    finally:
+        pdf_doc.close()
+
+    # 3. PPTX -> PDF via engine router
+    res_pdf = engine.convert(src, "pdf")
+    assert res_pdf.ok, res_pdf.error
+    assert Path(res_pdf.target).stat().st_size > 0
+
+
+

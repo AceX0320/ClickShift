@@ -44,6 +44,7 @@ def build() -> int:
         "--collect-all", "fitz",             # PyMuPDF (pdf rendering/reflow)
         "--collect-all", "cv2",              # OpenCV (pdf2docx layout analysis)
         "--collect-all", "docx",             # python-docx templates + shared
+        "--collect-all", "pptx",             # python-pptx default.pptx template
         "--hidden-import", "numpy",
         "--hidden-import", "PIL",
         "--hidden-import", "PIL.Image",
@@ -51,6 +52,9 @@ def build() -> int:
         "--hidden-import", "PIL.ImageDraw",
         "--hidden-import", "docx",
         "--hidden-import", "docx.shared",
+        "--hidden-import", "pptx",
+        "--hidden-import", "pptx.util",
+        "--hidden-import", "pptx.dml.color",
         "--hidden-import", "pdf2docx",
         "--hidden-import", "pypdf",
         "--hidden-import", "fitz",

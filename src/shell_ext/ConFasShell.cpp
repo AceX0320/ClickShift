@@ -29,21 +29,21 @@ static const CLSID CLSID_ConFasExplorerCommand = {
 struct ExtRule {
     const wchar_t* ext;
     const wchar_t* defaultTarget;
-    const wchar_t* targets[12];
+    const wchar_t* targets[16];
 };
 
 static const ExtRule kRules[] = {
-    {L"pdf",  L"docx", {L"docx", L"txt", L"md", L"html", L"csv", L"png", L"jpg", L"webp", L"odt", L"rtf", nullptr}},
-    {L"docx", L"pdf",  {L"pdf", L"txt", L"md", L"html", L"rtf", L"odt", nullptr}},
-    {L"doc",  L"docx", {L"pdf", L"docx", L"txt", L"md", L"html", L"rtf", L"odt", nullptr}},
-    {L"odt",  L"docx", {L"docx", L"pdf", L"txt", L"md", L"html", L"rtf", nullptr}},
-    {L"rtf",  L"docx", {L"docx", L"pdf", L"txt", L"md", L"html", L"odt", nullptr}},
+    {L"pdf",  L"docx", {L"docx", L"pptx", L"txt", L"md", L"html", L"csv", L"png", L"jpg", L"webp", L"odt", L"rtf", nullptr}},
+    {L"docx", L"pdf",  {L"pdf", L"pptx", L"txt", L"md", L"html", L"rtf", L"odt", nullptr}},
+    {L"doc",  L"docx", {L"pdf", L"docx", L"pptx", L"txt", L"md", L"html", L"rtf", L"odt", nullptr}},
+    {L"odt",  L"docx", {L"docx", L"pdf", L"pptx", L"txt", L"md", L"html", L"rtf", nullptr}},
+    {L"rtf",  L"docx", {L"docx", L"pdf", L"pptx", L"txt", L"md", L"html", L"odt", nullptr}},
     {L"xlsx", L"pdf",  {L"pdf", L"csv", L"ods", L"txt", L"html", nullptr}},
     {L"xls",  L"xlsx", {L"xlsx", L"pdf", L"csv", L"ods", L"txt", L"html", nullptr}},
     {L"ods",  L"xlsx", {L"xlsx", L"pdf", L"csv", L"txt", L"html", nullptr}},
-    {L"pptx", L"pdf",  {L"pdf", L"odp", nullptr}},
-    {L"ppt",  L"pptx", {L"pptx", L"pdf", L"odp", nullptr}},
-    {L"odp",  L"pptx", {L"pptx", L"pdf", nullptr}},
+    {L"pptx", L"pdf",  {L"pdf", L"docx", L"odp", nullptr}},
+    {L"ppt",  L"pptx", {L"pptx", L"pdf", L"docx", L"odp", nullptr}},
+    {L"odp",  L"pptx", {L"pptx", L"pdf", L"docx", nullptr}},
     {L"csv",  L"xlsx", {L"xlsx", L"pdf", L"ods", L"txt", L"html", L"docx", nullptr}},
     {L"tsv",  L"xlsx", {L"xlsx", L"pdf", L"csv", L"ods", L"txt", L"html", nullptr}},
     {L"txt",  L"docx", {L"docx", L"pdf", L"md", L"html", L"rtf", L"odt", nullptr}},
