@@ -1130,6 +1130,48 @@ def conv_image_to_pdf(src: Path, dst: Path) -> None:
         lo_convert(src, dst)
 
 
+def conv_pdf_to_html_fidelity(src: Path, dst: Path) -> None:
+    """Pixel-faithful PDF -> HTML: every page becomes an inline SVG produced by
+    MuPDF with exact embedded font glyph paths, vector shapes, gradients, masks,
+    and raster images, laid out like a PDF viewer."""
+    fitz: Any = importlib.import_module("fitz")
+    doc = fitz.open(str(src))
+    try:
+        if doc.needs_pass:
+            raise RuntimeError("PDF is password protected")
+        pages: list[str] = []
+        for i, page in enumerate(doc, start=1):
+            svg = page.get_svg_image(matrix=fitz.Identity, text_as_path=True)
+            svg = re.sub(r"^\s*<\?xml[^>]*\?>\s*", "", svg)
+            svg = re.sub(r"^\s*<!DOCTYPE[^>]*>\s*", "", svg)
+            # Prefix MuPDF's per-page SVG ids (clip_1, mask_2, ...) so pages never collide
+            prefix = f"p{i}_"
+            svg = re.sub(r'\bid="([^"]+)"', rf'id="{prefix}\1"', svg)
+            svg = re.sub(r"url\(#([^)]+)\)", rf"url(#{prefix}\1)", svg)
+            svg = re.sub(r'((?:xlink:)?href="#)([^"]+)"', rf'\1{prefix}\2"', svg)
+            w, h = page.rect.width, page.rect.height
+            pages.append(
+                f'<section class="page" id="page-{i}" style="aspect-ratio:{w:.2f}/{h:.2f};'
+                f'max-width:{w * 4 / 3:.0f}px">{svg}</section>'
+            )
+        title = _html_mod.escape((doc.metadata or {}).get("title") or src.stem)
+    finally:
+        doc.close()
+    dst.write_text(
+        "<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        f"<title>{title}</title><style>"
+        "html,body{margin:0;background:#525659}"
+        "body{padding:24px 12px;display:flex;flex-direction:column;align-items:center;gap:24px}"
+        ".page{width:100%;background:#fff;box-shadow:0 2px 10px rgba(0,0,0,.45);overflow:hidden}"
+        ".page>svg{display:block;width:100%;height:100%}"
+        "@media print{html,body{background:#fff;padding:0;gap:0}"
+        ".page{box-shadow:none;max-width:none!important;page-break-after:always}}"
+        "</style></head><body>\n" + "\n".join(pages) + "\n</body></html>\n",
+        encoding="utf-8",
+    )
+
+
 def conv_pdf_to_text(src: Path, dst: Path) -> None:
     ext = dst.suffix.lstrip(".").lower()
     if BACKENDS.pymupdf:
@@ -1207,7 +1249,10 @@ def _routes_for(src_ext: str, dst_ext: str) -> list[Route]:
         if BACKENDS.pypdf and BACKENDS.python_docx:
             add("pypdf-docx", conv_pdf_to_docx_pypdf, 50)
     elif s == "pdf" and d in ("txt", "md", "csv", "html", "htm"):
-        add("pypdf", conv_pdf_to_text, 90)
+        if d in ("html", "htm") and BACKENDS.pymupdf:
+            add("pymupdf-html", conv_pdf_to_html_fidelity, 99)
+        else:
+            add("pypdf", conv_pdf_to_text, 90 if d not in ("html", "htm") else 45)
         if word_available and d in _WORD_ONLY_FMTS:
             add("office-com", conv_office_com, 60)
         add("libreoffice", conv_libreoffice, 40)

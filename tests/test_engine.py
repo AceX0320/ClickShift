@@ -145,3 +145,32 @@ def test_shaded_line_tables_merged_into_one_box():
     assert text.count("<w:tbl>") == 2                   # red header + one grey box
     assert "trHeight" not in text.split("line one")[0].split("e60000")[-1]
     assert text.index("line one") < text.index("line two") < text.index("line three")
+
+
+def test_pdf_to_html_fidelity_multipage(tmp_path, engine):
+    """PDF -> HTML routes via pymupdf-html and emits per-page scoped SVGs."""
+    import fitz
+
+    routes = [r.name for r in _routes_for(".pdf", ".html")]
+    assert routes and routes[0] == "pymupdf-html"
+    assert "pypdf" not in routes
+
+    src = tmp_path / "sample.pdf"
+    doc = fitz.open()
+    for label in ("First", "Second"):
+        page = doc.new_page(width=400, height=300)
+        page.draw_rect(fitz.Rect(20, 20, 380, 70), color=(0.9, 0, 0), fill=(0.9, 0, 0))
+        page.insert_text((36, 52), f"{label} Page", fontsize=18, color=(1, 1, 1))
+    doc.save(src)
+    doc.close()
+
+    res = engine.convert(src, "html")
+    assert res.ok, res.error
+    assert res.backend == "pymupdf-html"
+    html_text = Path(res.target).read_text(encoding="utf-8")
+    assert html_text.count('<section class="page"') == 2
+    assert html_text.count("<svg") == 2
+    assert "#e60000" in html_text
+    ids = __import__("re").findall(r'\bid="([^"]+)"', html_text)
+    assert len(ids) == len(set(ids)), f"Duplicate SVG IDs across pages: {ids}"
+

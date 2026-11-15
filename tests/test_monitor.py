@@ -73,3 +73,31 @@ def test_daemon_ipc_delegation(tmp_path, monkeypatch):
         assert (tmp_path / "ipc_note.html").exists()
     finally:
         srv.stop()
+
+
+def test_win11_shell_ext_skips_duplicate_classic_cascade(monkeypatch):
+    """When Win11 IExplorerCommand shell ext installs, remove registry ConFas.Menu
+    instead of writing a second cascading entry in the 'Show more options' menu."""
+    deleted, written = [], []
+    monkeypatch.setattr(monitor, "IS_WINDOWS", True)
+    monkeypatch.setattr(monitor, "winreg", None)
+    monkeypatch.setattr(monitor, "_save_exe_path_registry", lambda: None)
+    monkeypatch.setattr(monitor, "_purge_duplicate_class_verbs", lambda: None)
+    monkeypatch.setattr(monitor, "_set_win11_both_menus", lambda _v: None)
+    monkeypatch.setattr(monitor, "_register_openwith", lambda _ext: None)
+    monkeypatch.setattr(monitor, "_verb_locations", lambda ext: [rf"Software\Classes\SystemFileAssociations\.{ext}"])
+    monkeypatch.setattr(monitor, "_delete_verb", lambda loc, verb: deleted.append((loc, verb)))
+    monkeypatch.setattr(monitor, "_write_cascading_menu", lambda loc, *_a: written.append(loc))
+
+    monkeypatch.setattr(monitor, "_is_win11", lambda: True)
+    monkeypatch.setattr(monitor, "_install_win11_shell_extension", lambda: True)
+    assert monitor.install_context_menu(extensions=["pdf"]) == 1
+    assert any(verb == monitor.VERB_MENU for _loc, verb in deleted)
+    assert written == []
+
+    # Fallback (e.g. Win10) still writes the registry cascade
+    deleted.clear()
+    monkeypatch.setattr(monitor, "_is_win11", lambda: False)
+    assert monitor.install_context_menu(extensions=["pdf"]) == 1
+    assert written == [r"Software\Classes\SystemFileAssociations\.pdf"]
+

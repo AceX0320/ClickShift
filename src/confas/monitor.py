@@ -650,6 +650,13 @@ def install_context_menu(extensions: Optional[list[str]] = None) -> int:
         return 0
     _save_exe_path_registry()
     _purge_duplicate_class_verbs()
+    # Windows 11: the packaged IExplorerCommand extension shows ONE expandable
+    # 'Convert with ConFas >' in the main menu AND automatically in
+    # 'Show more options'. Writing the registry cascade as well would make the
+    # classic menu show it twice, so the registry cascade is only a fallback
+    # (Windows 10, or when the package could not be registered).
+    _set_win11_both_menus(False)
+    shell_ext_ok = _is_win11() and _install_win11_shell_extension()
     exts = extensions or MENU_EXTENSIONS
     n = 0
     for ext in exts:
@@ -662,13 +669,16 @@ def install_context_menu(extensions: Optional[list[str]] = None) -> int:
             # Remove any legacy flat top-level verbs and any duplicate ProgID cascading menus
             for verb, _label, _cmd in _verbs_for(ext):
                 _delete_verb(loc, verb)
-            if loc != primary_loc:
+            if shell_ext_ok or loc != primary_loc:
                 _delete_verb(loc, VERB_MENU)
-        try:
-            _write_cascading_menu(primary_loc, targets, default_t)
+        if shell_ext_ok:
             ok = True
-        except Exception as exc:
-            _log(f"cascading menu .{ext} failed at {primary_loc}: {exc}")
+        else:
+            try:
+                _write_cascading_menu(primary_loc, targets, default_t)
+                ok = True
+            except Exception as exc:
+                _log(f"cascading menu .{ext} failed at {primary_loc}: {exc}")
         try:
             _register_openwith(ext)
         except Exception as exc:
@@ -681,12 +691,16 @@ def install_context_menu(extensions: Optional[list[str]] = None) -> int:
         _delete_verb(r"Software\Classes\*", VERB_CHOOSE)
         _delete_verb(r"Software\Classes\*", VERB_AUTO)
 
-    # Keep the modern Windows 11 primary menu active and register our native Win11 expandable shell extension
-    _set_win11_both_menus(False)
-    _install_win11_shell_extension()
     _log(f"context menu installed for {n}/{len(exts)} extensions "
-         f"(single expandable menu in both Win11 main menu and classic menu)")
+         f"({'Win11 shell extension' if shell_ext_ok else 'registry cascade'}; single entry per menu)")
     return n
+
+
+def _is_win11() -> bool:
+    try:
+        return IS_WINDOWS and sys.getwindowsversion().build >= 22000  # type: ignore[attr-defined]
+    except Exception:
+        return False
 
 
 def remove_context_menu(extensions: Optional[list[str]] = None) -> int:
