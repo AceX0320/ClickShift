@@ -174,3 +174,38 @@ def test_pdf_to_html_fidelity_multipage(tmp_path, engine):
     ids = __import__("re").findall(r'\bid="([^"]+)"', html_text)
     assert len(ids) == len(set(ids)), f"Duplicate SVG IDs across pages: {ids}"
 
+
+def test_pdf_to_md_structured(tmp_path, engine):
+    """PDF -> MD routes via pymupdf-md and emits real Markdown structure without BOM."""
+    import fitz
+
+    routes = [r.name for r in _routes_for(".pdf", ".md")]
+    assert routes and routes[0] == "pymupdf-md"
+    assert "pypdf" not in routes
+
+    src = tmp_path / "paper.pdf"
+    doc = fitz.open()
+    page = doc.new_page(width=500, height=700)
+    page.insert_text((72, 70), "My Paper Title", fontsize=18, fontname="helv")
+    page.insert_text((72, 110), "1. Introduction", fontsize=14, fontname="hebo")
+    page.insert_text((72, 140), "Hello ", fontsize=11, fontname="helv")
+    page.insert_text((104, 140), "world", fontsize=11, fontname="hebo")
+    page.insert_text((138, 140), " in Markdown.", fontsize=11, fontname="helv")
+    page.insert_text((72, 175), "int main() {\n    return 0;\n}", fontsize=9, fontname="cour")
+    page.insert_text((240, 660), "1", fontsize=10, fontname="helv")
+    doc.save(src)
+    doc.close()
+
+    res = engine.convert(src, "md")
+    assert res.ok, res.error
+    assert res.backend == "pymupdf-md"
+    raw = Path(res.target).read_bytes()
+    assert not raw.startswith(b"\xef\xbb\xbf")  # clean UTF-8 without BOM
+    md = raw.decode("utf-8")
+    assert "# My Paper Title" in md
+    assert "## 1. Introduction" in md
+    assert "**world**" in md
+    assert "```" in md and "return 0;" in md
+    assert "\n1\n" not in md
+
+

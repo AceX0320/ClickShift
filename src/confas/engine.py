@@ -46,6 +46,7 @@ import time
 import traceback
 import uuid
 import zipfile
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -1210,6 +1211,347 @@ def conv_pdf_to_text(src: Path, dst: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
+#  Structured PDF -> Markdown (PyMuPDF layout & typography analysis)
+# --------------------------------------------------------------------------- #
+
+_PDF_PUA_MAP = str.maketrans({
+    "\ue084": "<", "\ue085": ">", "\ue086": "≤", "\ue087": "≥",
+    "\ue09e": "(", "\ue09f": ")", "\ue0a0": "[", "\ue0a1": "]",
+    "\ue0c1": "λ", "\uf0b7": "•", "\uf0a7": "▪", "\uf076": "✓",
+})
+_MD_MONO_RE = re.compile(r"(courier|consolas|mono|menlo|monaco|inconsolata|fira|sourcecode)", re.I)
+_MD_SYM_RE = re.compile(r"(opensymbol|wingdings|webdings|zapfdingbats|^symbol$)", re.I)
+_MD_BULLET_RE = re.compile(r"^([•◦▪▫●○■□–—-]|\uf0b7|\*)\s+(.*)$")
+_MD_SOLO_BULLET_RE = re.compile(r"^([•◦▪▫●○■□]|\*)$")
+_MD_NUM_RE = re.compile(r"^(\d{1,3})[.)]\s+(.*)$")
+_MD_SOLO_NUM_RE = re.compile(r"^(\d{1,3})\)$")
+_MD_REF_RE = re.compile(r"^(\[\d{1,4}\])\s+(.*)$")
+_MD_SOLO_REF_RE = re.compile(r"^(\[\d{1,4}\])$")
+
+
+def _md_clean_text(s: str) -> str:
+    s = s.translate(_PDF_PUA_MAP).replace("\u00a0", " ").replace("\ufeff", "")
+    return re.sub(r" {2,}", " ", s)
+
+
+def _md_is_mono(font: str) -> bool:
+    return bool(_MD_MONO_RE.search(font or ""))
+
+
+def _md_is_sym(font: str) -> bool:
+    return bool(_MD_SYM_RE.search(font or ""))
+
+
+def _md_is_bold(font: str, flags: int) -> bool:
+    fl = (font or "").lower()
+    return bool(flags & 16) or "bold" in fl or "black" in fl
+
+
+def _md_is_italic(font: str, flags: int) -> bool:
+    fl = (font or "").lower()
+    return bool(flags & 2) or "italic" in fl or "oblique" in fl
+
+
+def _md_analyze_typography(doc: Any) -> tuple[float, list[float], set[str]]:
+    """Return (body_size, heading_tiers_desc, doc_words_lower) from document spans."""
+    size_counts: Counter[float] = Counter()
+    words: set[str] = set()
+    for i in range(min(len(doc), 60)):
+        for b in doc[i].get_text("dict")["blocks"]:
+            if b["type"] != 0:
+                continue
+            for ln in b["lines"]:
+                line_txt: list[str] = []
+                for sp in ln["spans"]:
+                    txt = sp["text"]
+                    stripped = txt.strip()
+                    if not stripped:
+                        continue
+                    line_txt.append(txt)
+                    if not _md_is_mono(sp["font"]) and not _md_is_sym(sp["font"]):
+                        size_counts[round(sp["size"], 1)] += len(stripped)
+                for w in re.findall(r"[A-Za-z]{4,}", "".join(line_txt)):
+                    words.add(w.lower())
+
+    body_size = size_counts.most_common(1)[0][0] if size_counts else 11.0
+    large = sorted((sz for sz, cnt in size_counts.items() if sz >= body_size * 1.11 and cnt >= 3), reverse=True)
+    tiers: list[float] = []
+    for sz in large:
+        if not tiers or abs(tiers[-1] - sz) > 1.2:
+            tiers.append(sz)
+    return body_size, tiers[:4], words
+
+
+def _md_heading_level(size: float, body_size: float, tiers: list[float],
+                      is_bold: bool, has_sym: bool, text: str, line_count: int) -> int:
+    if not text or has_sym or len(text) <= 1 or len(text) > 160 or line_count > 3:
+        return 0
+    if re.search(r"[={}<>≤≥∑⋅]|^\w\s*=", text):
+        return 0
+    for idx, tier_sz in enumerate(tiers):
+        if abs(size - tier_sz) <= 1.2 or size >= tier_sz - 0.5:
+            return min(idx + 1, 4)
+    if size >= body_size * 1.11 and not re.search(r"[,;]$", text):
+        return 2 if size < body_size * 1.35 else 1
+    if is_bold and line_count == 1 and len(text) <= 72:
+        if not re.search(r"[,;:!?]$", text) and (not text.endswith(".") or re.match(r"^\d+(\.\d+)*\.", text)):
+            if not _MD_REF_RE.match(text) and not text.startswith("©") and len(text.split()) <= 10:
+                return min(len(tiers) + 1, 4) if tiers else 3
+    return 0
+
+
+def _md_diagram_boxes(page: Any) -> list[tuple[float, float, float, float]]:
+    """Cluster dense non-frame vector drawings into diagram regions."""
+    pw, ph = page.rect.width, page.rect.height
+    rects = []
+    for d in page.get_drawings():
+        r = d.get("rect")
+        if not r or (r.width > pw * 0.88 and r.height > ph * 0.85) or (r.width < 1 and r.height < 1):
+            continue
+        rects.append((r.x0, r.y0, r.x1, r.y1))
+    if len(rects) < 4:
+        return []
+    pad = 14.0
+    clusters: list[list[Any]] = []
+    for x0, y0, x1, y1 in sorted(rects, key=lambda r: (r[1], r[0])):
+        hit = next(
+            (c for c in clusters if not (x1 + pad < c[0][0] or x0 - pad > c[0][2] or y1 + pad < c[0][1] or y0 - pad > c[0][3])),
+            None,
+        )
+        if hit is not None:
+            cb = hit[0]
+            cb[0], cb[1], cb[2], cb[3] = min(cb[0], x0), min(cb[1], y0), max(cb[2], x1), max(cb[3], y1)
+            hit[1] += 1
+        else:
+            clusters.append([[x0, y0, x1, y1], 1])
+    changed = True
+    while changed:
+        changed = False
+        nxt: list[list[Any]] = []
+        for b, cnt in clusters:
+            hit = next(
+                (o for o in nxt if not (b[2] + pad < o[0][0] or b[0] - pad > o[0][2] or b[3] + pad < o[0][1] or b[1] - pad > o[0][3])),
+                None,
+            )
+            if hit is not None:
+                ob = hit[0]
+                ob[0], ob[1], ob[2], ob[3] = min(ob[0], b[0]), min(ob[1], b[1]), max(ob[2], b[2]), max(ob[3], b[3])
+                hit[1] += cnt
+                changed = True
+            else:
+                nxt.append([b, cnt])
+        clusters = nxt
+    return [(b[0], b[1], b[2], b[3]) for b, cnt in clusters if cnt >= 4 and (b[2] - b[0]) >= 35 and (b[3] - b[1]) >= 20]
+
+
+def _md_overlap(inner: tuple[float, float, float, float],
+                outer: tuple[float, float, float, float], pad: float = 0.0) -> float:
+    ix0, iy0 = max(inner[0], outer[0] - pad), max(inner[1], outer[1] - pad)
+    ix1, iy1 = min(inner[2], outer[2] + pad), min(inner[3], outer[3] + pad)
+    if ix1 <= ix0 or iy1 <= iy0:
+        return 0.0
+    return ((ix1 - ix0) * (iy1 - iy0)) / max((inner[2] - inner[0]) * (inner[3] - inner[1]), 1.0)
+
+
+def _md_real_tables(page: Any) -> list[tuple[tuple[float, float, float, float], str]]:
+    """Extract genuine grid tables while ignoring sparse flowchart diagram boxes."""
+    out: list[tuple[tuple[float, float, float, float], str]] = []
+    try:
+        finder = page.find_tables()
+    except Exception:
+        return out
+    for t in getattr(finder, "tables", []):
+        if t.row_count < 2 or t.col_count < 2:
+            continue
+        rows = t.extract()
+        if not rows:
+            continue
+        non_empty = [sum(1 for c in row if c and c.strip()) for row in rows]
+        if sum(1 for k in non_empty if k >= 2) < 2 or sum(non_empty) < (t.row_count * t.col_count) * 0.5:
+            continue
+        if max((len((c or "").splitlines()) for row in rows for c in row), default=1) > 4:
+            continue
+        clean = [[re.sub(r"\s+", " ", (c or "")).strip().replace("|", "\\|") for c in row] for row in rows]
+        hdr = "| " + " | ".join(clean[0]) + " |"
+        sep = "| " + " | ".join("---" for _ in clean[0]) + " |"
+        body = ["| " + " | ".join(r) + " |" for r in clean[1:]]
+        out.append((tuple(t.bbox), "\n".join([hdr, sep, *body])))
+    return out
+
+
+def _md_format_spans(spans: list[dict]) -> str:
+    runs: list[tuple[str, str]] = []
+    for sp in spans:
+        txt = _md_clean_text(sp["text"])
+        if not txt:
+            continue
+        if _md_is_sym(sp["font"]):
+            st = ""
+        elif _md_is_mono(sp["font"]):
+            st = "c"
+        else:
+            b, it = _md_is_bold(sp["font"], sp["flags"]), _md_is_italic(sp["font"], sp["flags"])
+            st = "bi" if (b and it) else ("b" if b else ("i" if it else ""))
+        if runs and runs[-1][0] == st:
+            runs[-1] = (st, runs[-1][1] + txt)
+        else:
+            runs.append((st, txt))
+    wrap = {"b": "**", "i": "*", "bi": "***", "c": "`"}
+    parts = []
+    for st, txt in runs:
+        m = wrap.get(st)
+        if not m or not txt.strip():
+            parts.append(txt)
+            continue
+        lead = txt[: len(txt) - len(txt.lstrip())]
+        trail = txt[len(txt.rstrip()) :]
+        parts.append(f"{lead}{m}{txt.strip()}{m}{trail}")
+    return "".join(parts)
+
+
+def _md_join_lines(lines: list[str], doc_words: set[str]) -> str:
+    out = ""
+    for raw in lines:
+        seg = raw.strip()
+        if not seg:
+            continue
+        if not out:
+            out = seg
+            continue
+        if out.endswith("-") and len(out) >= 2 and out[-2].isalpha() and seg[0].islower():
+            lw = re.findall(r"[A-Za-z]+$", out[:-1])
+            rw = re.findall(r"^[A-Za-z]+", seg)
+            out = (out[:-1] + seg) if (lw and rw and (lw[0] + rw[0]).lower() in doc_words) else (out + seg)
+        else:
+            out = out + " " + seg
+    return re.sub(r"\* \*", " ", re.sub(r"\*\* \*\*", " ", out))
+
+
+def _md_merge_split_markers(raw_lines: list[str], styled_lines: list[str]) -> tuple[list[str], list[str]]:
+    p_out, s_out, i = [], [], 0
+    while i < len(raw_lines):
+        rp = raw_lines[i]
+        sp = styled_lines[i] if i < len(styled_lines) else rp
+        if (_MD_SOLO_NUM_RE.match(rp) or _MD_SOLO_BULLET_RE.match(rp) or _MD_SOLO_REF_RE.match(rp)) and i + 1 < len(raw_lines):
+            sp_n = styled_lines[i + 1] if i + 1 < len(styled_lines) else raw_lines[i + 1]
+            p_out.append(f"{rp} {raw_lines[i + 1]}")
+            s_out.append(f"{sp} {sp_n}")
+            i += 2
+        else:
+            p_out.append(rp)
+            s_out.append(sp)
+            i += 1
+    return p_out, s_out
+
+
+def conv_pdf_to_md_structured(src: Path, dst: Path) -> None:
+    """Convert PDF to clean structured GitHub-Flavored Markdown via PyMuPDF."""
+    fitz: Any = importlib.import_module("fitz")
+    doc = fitz.open(str(src))
+    try:
+        if doc.needs_pass:
+            raise RuntimeError("PDF is password protected")
+        body_size, tiers, doc_words = _md_analyze_typography(doc)
+        items_all: list[tuple[str, str]] = []
+
+        for page in doc:
+            ph = page.rect.height
+            diag_boxes = _md_diagram_boxes(page)
+            tables = _md_real_tables(page)
+            tbl_boxes = [tb for tb, _ in tables]
+            blocks = [b for b in page.get_text("dict")["blocks"] if b["type"] == 0]
+            blocks.sort(key=lambda b: (round(b["bbox"][1] / 5.0), b["bbox"][0]))
+
+            page_items: list[tuple[float, str, str]] = [(tb[1], "table", md) for tb, md in tables]
+            for b in blocks:
+                bbox = tuple(b["bbox"])
+                if any(_md_overlap(bbox, tb) >= 0.5 for tb in tbl_boxes):
+                    continue
+                spans = [sp for ln in b["lines"] for sp in ln["spans"] if sp["text"].strip()]
+                if not spans:
+                    continue
+                raw_lines = [_md_clean_text("".join(sp["text"] for sp in ln["spans"])).strip() for ln in b["lines"]]
+                raw_lines = [x for x in raw_lines if x]
+                plain = " ".join(raw_lines).strip()
+                if not plain:
+                    continue
+                if (bbox[1] > ph * 0.87 or bbox[3] < ph * 0.08) and re.fullmatch(
+                    r"(?:page\s*)?\d{1,4}|[-–—]\s*\d{1,4}\s*[-–—]", plain, re.I
+                ):
+                    continue
+                dom_size = max(
+                    Counter(round(sp["size"], 1) for sp in spans for _ in range(len(sp["text"].strip()))).items(),
+                    key=lambda kv: kv[1],
+                )[0]
+                dom_bold = all(_md_is_bold(sp["font"], sp["flags"]) for sp in spans)
+                has_sym = any(_md_is_sym(sp["font"]) for sp in spans)
+                all_mono = all(_md_is_mono(sp["font"]) for sp in spans)
+
+                if dom_size < body_size * 0.85 and any(_md_overlap(bbox, db, pad=28.0) >= 0.5 for db in diag_boxes):
+                    continue
+
+                if all_mono:
+                    min_x = min(ln["bbox"][0] for ln in b["lines"] if any(sp["text"].strip() for sp in ln["spans"]))
+                    char_w = max(dom_size * 0.58, 3.0)
+                    code_lines = []
+                    for ln in b["lines"]:
+                        lt = "".join(sp["text"] for sp in ln["spans"]).replace("\u00a0", " ").rstrip()
+                        if not lt.strip():
+                            continue
+                        if lt == lt.lstrip():
+                            lt = (" " * max(0, int(round((ln["bbox"][0] - min_x) / char_w)))) + lt
+                        code_lines.append(lt)
+                    body = "\n".join(code_lines)
+                    lang = "c" if ("#include " in body or ("double " in body and "{" in body)) else ""
+                    page_items.append((bbox[1], "code", f"```{lang}\n{body}\n```"))
+                    continue
+
+                h_lvl = _md_heading_level(dom_size, body_size, tiers, dom_bold, has_sym, plain, len(raw_lines))
+                if h_lvl:
+                    page_items.append((bbox[1], "h", f"{'#' * h_lvl} {_md_clean_text(_md_join_lines(raw_lines, doc_words)).strip()}"))
+                    continue
+
+                styled = [x for x in (_md_format_spans(ln["spans"]).strip() for ln in b["lines"]) if x]
+                raw_m, styled_m = _md_merge_split_markers(raw_lines, styled)
+                if any(_MD_BULLET_RE.match(p) or _MD_NUM_RE.match(p) or _MD_REF_RE.match(p) for p in raw_m):
+                    items_md, cur, pfx = [], [], ""
+                    for pl, sl in zip(raw_m, styled_m):
+                        mb, mn, mr = _MD_BULLET_RE.match(pl), _MD_NUM_RE.match(pl), _MD_REF_RE.match(pl)
+                        if mb or mn or mr:
+                            if cur:
+                                items_md.append(f"{pfx}{_md_join_lines(cur, doc_words)}")
+                            pfx = "- " if (mb or mr) else f"{mn.group(1)}. "
+                            cur = [_MD_BULLET_RE.sub(r"\2", sl, 1) if mb else (_MD_NUM_RE.sub(r"\2", sl, 1) if mn else sl)]
+                        else:
+                            cur.append(sl)
+                    if cur:
+                        items_md.append(f"{pfx}{_md_join_lines(cur, doc_words)}")
+                    page_items.append((bbox[1], "list", "\n".join(items_md)))
+                    continue
+
+                para_md = (
+                    "  \n".join(styled)
+                    if len(raw_lines) <= 4 and all(len(x) < 42 and not x.endswith(".") for x in raw_lines)
+                    else _md_join_lines(styled, doc_words)
+                )
+                page_items.append((bbox[1], "para", para_md))
+
+            page_items.sort(key=lambda it: it[0])
+            for _y0, kind, md in page_items:
+                if (
+                    kind == "code" and items_all and items_all[-1][0] == "code"
+                    and items_all[-1][1].startswith("```\n") and md.startswith("```\n")
+                ):
+                    items_all[-1] = ("code", f"```\n{items_all[-1][1][4:-4]}\n\n{md[4:-4]}\n```")
+                else:
+                    items_all.append((kind, md))
+
+        dst.write_text("\n\n".join(md for _k, md in items_all).strip() + "\n", encoding="utf-8")
+    finally:
+        doc.close()
+
+
+# --------------------------------------------------------------------------- #
 #  Routing table
 # --------------------------------------------------------------------------- #
 
@@ -1248,7 +1590,13 @@ def _routes_for(src_ext: str, dst_ext: str) -> list[Route]:
         add("libreoffice", conv_libreoffice, 65)
         if BACKENDS.pypdf and BACKENDS.python_docx:
             add("pypdf-docx", conv_pdf_to_docx_pypdf, 50)
-    elif s == "pdf" and d in ("txt", "md", "csv", "html", "htm"):
+    elif s == "pdf" and d in ("md", "markdown"):
+        if BACKENDS.pymupdf:
+            add("pymupdf-md", conv_pdf_to_md_structured, 99)
+        else:
+            add("pypdf", conv_pdf_to_text, 90)
+        add("libreoffice", conv_libreoffice, 40)
+    elif s == "pdf" and d in ("txt", "csv", "html", "htm"):
         if d in ("html", "htm") and BACKENDS.pymupdf:
             add("pymupdf-html", conv_pdf_to_html_fidelity, 99)
         else:
