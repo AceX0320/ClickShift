@@ -135,10 +135,6 @@ def _pick_target_popup(src: Path) -> Optional[str]:
 def _latest_report(res) -> str:
     """Path of the debug txt report produced for this conversion (if any)."""
     try:
-        out = Path(res.target or "")
-        cand = out.with_name(out.name + ".confas-debug.txt")
-        if cand.exists():
-            return str(cand)
         dd = monitor.DATA_DIR / "debug"
         if dd.exists():
             stem = Path(res.source).stem[:60]

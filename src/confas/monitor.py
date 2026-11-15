@@ -145,8 +145,8 @@ DEFAULT_CONFIG = {
     "ml_enabled": True,
     "notify": True,
     "win11_both_menus": True,      # surface full ConFas menu on Win11 1st & 2nd right-click menus
-    # --- full debugging layer: *.confas-debug.txt after every conversion --- #
-    "debug_reports": "always",      # always | onerror | off
+    # --- opt-in diagnostic logging (off by default: no *.confas-debug.txt) #
+    "debug_reports": "off",         # off | onerror | always
     "debug_keep": 200,              # central reports kept in ~/.confas/debug/
     # --- shared-learnings cloud sync (opt-in, aggregate stats only) ------ #
     "cloud_enabled": False,         # enable with: confas config cloud_sync=on
@@ -163,10 +163,15 @@ DEFAULT_CONFIG = {
 }
 
 
+def config_file() -> Path:
+    """Resolve the config file path at call time (honours CONFAS_HOME changes/tests)."""
+    return data_dir() / "config.json"
+
+
 def load_config() -> dict:
     cfg = dict(DEFAULT_CONFIG)
     try:
-        cfg.update(json.loads(CONFIG_FILE.read_text(encoding="utf-8")))
+        cfg.update(json.loads(config_file().read_text(encoding="utf-8")))
     except FileNotFoundError:
         pass
     except Exception:
@@ -175,10 +180,11 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict) -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = CONFIG_FILE.with_suffix(".tmp")
+    cfile = config_file()
+    cfile.parent.mkdir(parents=True, exist_ok=True)
+    tmp = cfile.with_suffix(".tmp")
     tmp.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-    tmp.replace(CONFIG_FILE)
+    tmp.replace(cfile)
 
 
 def exe_path() -> str:

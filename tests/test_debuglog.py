@@ -20,8 +20,23 @@ def home(tmp_path, monkeypatch):
     return h, monitor, debuglog
 
 
-def test_success_writes_report_next_to_output(home):
+def test_default_produces_no_debug_txt(home):
     h, monitor, debuglog = home
+    src = Path(monitor.__file__).parent.parent.parent / "README.md"
+    assert src.exists()
+    from confas.engine import ConversionEngine
+    eng = ConversionEngine(enable_ml=False)
+    out_dir = h.parent / "out_default"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    res = eng.convert(src, "txt", out_dir=out_dir)
+    assert res.ok, res.error
+    assert not (Path(res.target + ".confas-debug.txt")).exists()
+    assert not (h / "debug").exists() or not list((h / "debug").glob("*.txt"))
+
+
+def test_success_writes_central_report_only_when_enabled(home, monkeypatch):
+    h, monitor, debuglog = home
+    monkeypatch.setenv("CONFAS_DEBUG_REPORTS", "always")
     src = Path(monitor.__file__).parent.parent.parent / "README.md"
     assert src.exists()
     from confas.engine import ConversionEngine
@@ -31,20 +46,20 @@ def test_success_writes_report_next_to_output(home):
     res = eng.convert(src, "txt", out_dir=out_dir)
     assert res.ok, res.error
     rep = Path(res.target + ".confas-debug.txt")
-    assert rep.exists(), "debug txt must appear next to converted file"
-    text = rep.read_text(encoding="utf-8")
+    assert not rep.exists(), "no debug txt should be dropped next to converted user file"
+    central = list((h / "debug").glob("*-OK.confas-debug.txt"))
+    assert central, "central copy stored under ~/.confas/debug/ when explicitly enabled"
+    text = central[-1].read_text(encoding="utf-8")
     assert "ConFas CONVERSION DEBUG REPORT" in text
     assert "SUCCESS" in text
     assert "What went RIGHT" in text
     assert "[CANDIDATE CHAIN & ATTEMPTS]" in text
     assert "+ SUCCESS" in text
-    # central copy too
-    central = list((h / "debug").glob("*-OK.confas-debug.txt"))
-    assert central, "central copy stored under ~/.confas/debug/"
 
 
-def test_failure_report_shows_traceback(home):
+def test_failure_report_shows_traceback(home, monkeypatch):
     h, monitor, debuglog = home
+    monkeypatch.setenv("CONFAS_DEBUG_REPORTS", "onerror")
     # corrupt pdf -> all backends should fail (no libreoffice/office here)
     bad = h.parent / "broken.pdf"
     bad.write_bytes(b"%PDF-1.4 not a real pdf at all \x00\x01garbage")
@@ -98,21 +113,24 @@ def test_report_never_breaks_conversion(home, monkeypatch):
     assert res.ok, "conversion must be unaffected by broken debug writer"
 
 
-def test_ml_scores_recorded(home):
+def test_ml_scores_recorded(home, monkeypatch):
     h, monitor, debuglog = home
+    monkeypatch.setenv("CONFAS_DEBUG_REPORTS", "always")
     from confas.engine import ConversionEngine
     eng = ConversionEngine(enable_ml=True, history_file=h / "history.jsonl")
     src = Path(monitor.__file__).parent.parent.parent / "README.md"
     res = eng.convert(src, "txt", out_dir=h.parent / "o5")
     assert res.ok
-    rep = Path(res.target + ".confas-debug.txt")
-    text = rep.read_text(encoding="utf-8")
+    central = list((h / "debug").glob("*-OK.confas-debug.txt"))
+    assert central
+    text = central[-1].read_text(encoding="utf-8")
     assert "[ML BACKEND SELECTION]" in text
     assert "enabled        : True" in text
 
 
 def test_retention_pruning(home, monkeypatch):
     h, monitor, debuglog = home
+    monkeypatch.setenv("CONFAS_DEBUG_REPORTS", "always")
     dd = h / "debug"
     dd.mkdir(parents=True, exist_ok=True)
     for i in range(25):

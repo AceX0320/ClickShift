@@ -2,7 +2,7 @@
 
 **One EXE. Right-click any document → converted. Learns to get faster.**
 
-> **📥 Direct EXE Download (Latest — v1.0.11):** [**Download `ConFas.exe`**](https://github.com/AceX0320/ConFas/releases/latest/download/ConFas.exe) · [**v1.0.11 Direct Link**](https://github.com/AceX0320/ConFas/releases/download/v1.0.11/ConFas.exe)  
+> **📥 Direct EXE Download (Latest — v1.0.12):** [**Download `ConFas.exe`**](https://github.com/AceX0320/ConFas/releases/latest/download/ConFas.exe) · [**v1.0.12 Direct Link**](https://github.com/AceX0320/ConFas/releases/download/v1.0.12/ConFas.exe)  
 > *(Or grab the latest CI artifact from [GitHub Actions](https://github.com/AceX0320/ConFas/actions/workflows/build.yml) / browse [Releases](https://github.com/AceX0320/ConFas/releases))*
 
 ConFas is a 100 % local, offline document conversion tool:
@@ -124,7 +124,7 @@ https://github.com/AceX0320/ConFas/releases/latest/download/ConFas.exe
 ```
 
 * **Direct Download (Always Latest):** [https://github.com/AceX0320/ConFas/releases/latest/download/ConFas.exe](https://github.com/AceX0320/ConFas/releases/latest/download/ConFas.exe)
-* **Direct Download (v1.0.11 Pinned):** [https://github.com/AceX0320/ConFas/releases/download/v1.0.11/ConFas.exe](https://github.com/AceX0320/ConFas/releases/download/v1.0.11/ConFas.exe)
+* **Direct Download (v1.0.12 Pinned):** [https://github.com/AceX0320/ConFas/releases/download/v1.0.12/ConFas.exe](https://github.com/AceX0320/ConFas/releases/download/v1.0.12/ConFas.exe)
 * **All Releases:** [https://github.com/AceX0320/ConFas/releases](https://github.com/AceX0320/ConFas/releases)
 * **CI Build Artifacts (`ConFas-windows-exe`):** [https://github.com/AceX0320/ConFas/actions/workflows/build.yml](https://github.com/AceX0320/ConFas/actions/workflows/build.yml)
 * `/releases/latest/download/ConFas.exe` **always resolves to the newest published version** — one permanent link that never goes stale.
@@ -133,8 +133,8 @@ Publishing happens automatically on every push to `main` (via `.github/workflows
 
 1. Push to `main` (or tag and push a version) → CI runs the full 40-test suite, builds `ConFas.exe` on a Windows runner, uploads the `ConFas-windows-exe` artifact, and publishes `ConFas.exe` to the latest GitHub Release:
    ```bat
-   git tag v1.0.11
-   git push origin v1.0.11
+   git tag v1.0.12
+   git push origin v1.0.12
    ```
 2. Share the permanent link above. Anyone who downloads and double-clicks the
    EXE gets the self-install (both Windows right-click menus + Task Manager Startup entry).
@@ -177,7 +177,7 @@ python build.py        REM -> dist\ConFas.exe
    * stays running in the tray (watch folder + warm local IPC daemon).
    * Explorer is notified automatically (`SHChangeNotify`); if needed, sign out/in once so the Windows 11 menu mode takes effect.
 2. **Right-click a document → Convert with ConFas → pick any target format** (or choose **Auto / Pick target format…**) → output appears next to it in the newest format version (PDF→DOCX gives real OOXML `.docx`).
-3. **Automatic debug logs:** If a conversion ever fails (or when `CONFAS_DEBUG=1` is set), ConFas automatically writes `<filename>.confas-debug.txt` next to the input file and appends to `%USERPROFILE%\.confas\debug.log` with full per-backend timings and tracebacks.
+3. **Clean output folders (opt-in diagnostic logs):** By default, ConFas writes zero `*.confas-debug.txt` log files when converting. If needed for troubleshooting, run `ConFas.exe config debug=onerror` or `debug=always` to save logs inside `%USERPROFILE%\.confas\debug\`.
 4. Bonus: drop files into **`%USERPROFILE%\ConFasDrop`** → auto-converted.
 
 CLI (same binary):

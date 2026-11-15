@@ -52,18 +52,18 @@ jobs:
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.11
-          name: ConFas v1.0.11 (Latest Build)
+          tag_name: v1.0.12
+          name: ConFas v1.0.12 (Latest Build)
           make_latest: "true"
           files: dist/ConFas.exe
           body: |
-            ## ConFas Windows EXE (v1.0.11)
+            ## ConFas Windows EXE (v1.0.12)
 
             **Direct download (always the newest release):**
             https://github.com/${{ github.repository }}/releases/latest/download/ConFas.exe
 
-            **Direct download (pinned to v1.0.11):**
-            https://github.com/${{ github.repository }}/releases/download/v1.0.11/ConFas.exe
+            **Direct download (pinned to v1.0.12):**
+            https://github.com/${{ github.repository }}/releases/download/v1.0.12/ConFas.exe
 
             Built automatically from commit `${{ github.sha }}`.
 

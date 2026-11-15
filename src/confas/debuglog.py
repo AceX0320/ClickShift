@@ -1,18 +1,9 @@
-"""ConFas full debugging layer.
-After every conversion the engine writes a human-readable `*.confas-debug.txt`
-report next to the output file showing exactly what went right and what went
-wrong: environment, backend availability, the ordered candidate chain, ML
-ranking scores, every attempt (success or failure with full traceback), timing
-and byte counts.
-The layer is fail-safe by design: a broken/unwritable report can NEVER break
-or slow down an actual conversion (all writer errors are swallowed).
-Modes (config key `debug_reports`, CLI `ConFas.exe config debug=...`):
-  always  - write a report after every conversion            (default)
-  onerror - only write reports when a conversion failed
-  off     - never write reports
-Env override: CONFAS_DEBUG_REPORTS=always|onerror|off
-Retention:    the last `debug_keep` (default 200) reports are kept in the
-              data dir; older ones are pruned automatically.
+"""ConFas optional conversion diagnostic logger.
+
+Disabled by default (`debug_reports = "off"`). When explicitly enabled via
+`ConFas.exe config debug=onerror|always` or `CONFAS_DEBUG_REPORTS=always`,
+human-readable `*.confas-debug.txt` diagnostics are written exclusively inside
+the central data dir (`~/.confas/debug/`) — never next to converted user files.
 """
 from __future__ import annotations
 
@@ -48,7 +39,7 @@ def _cfg_value(key: str, default):
         return default
 
 def get_mode() -> str:
-    m = os.environ.get("CONFAS_DEBUG_REPORTS") or _cfg_value("debug_reports", MODE_ALWAYS)
+    m = os.environ.get("CONFAS_DEBUG_REPORTS") or _cfg_value("debug_reports", MODE_OFF)
     m = str(m).strip().lower()
     if m in ("1", "true", "yes", "on", MODE_ALWAYS):
         return MODE_ALWAYS
@@ -56,7 +47,7 @@ def get_mode() -> str:
         return MODE_ON_ERROR
     if m in ("0", "false", "no", MODE_OFF):
         return MODE_OFF
-    return MODE_ALWAYS
+    return MODE_OFF
 
 def should_write(ok: bool) -> bool:
     mode = get_mode()
@@ -253,33 +244,21 @@ def finalize(sess: dict, result) -> None:
         pass
 
 def write_report(session: dict) -> Optional[Path]:
-    """Write the debug txt report. Never raises - returns path or None."""
+    """Write the debug txt report inside ~/.confas/debug/ if enabled. Never raises."""
     try:
         if not should_write(bool(session.get("ok"))):
             return None
         text = render_report(session)
 
-        # primary copy: next to the converted file (only when one was actually
-        # produced, otherwise the central copy below is the single source)
-        out_path_str = session.get("out_path") or ""
-        primary: Optional[Path] = None
-        if session.get("ok") and out_path_str:
-            out = Path(out_path_str)
-            if out.exists():
-                cand = out.with_name(out.name + ".confas-debug.txt")
-                try:
-                    cand.write_text(text, encoding="utf-8")
-                    primary = cand
-                except OSError:
-                    primary = None
-
-        # central copy: ~/.confas/debug/ (always, so failures are findable)
+        # Store diagnostics strictly under ~/.confas/debug/ so converted user
+        # folders stay completely free of *.confas-debug.txt files.
         try:
             from . import monitor
             data_dir = monitor.data_dir()
         except Exception:
             data_dir = Path.home() / ".confas"
         session["data_dir"] = str(data_dir)
+        central: Optional[Path] = None
         try:
             dd = data_dir / "debug"
             dd.mkdir(parents=True, exist_ok=True)
@@ -292,9 +271,9 @@ def write_report(session: dict) -> Optional[Path]:
                 central.write_text(text, encoding="utf-8")
                 _prune(dd, keep_count())
         except Exception:
-            pass
-        session["report_path"] = str(primary) if primary else ""
-        return primary
+            central = None
+        session["report_path"] = str(central) if central else ""
+        return central
     except Exception:
         # the debugging layer must never break conversions
         return None
