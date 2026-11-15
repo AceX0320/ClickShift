@@ -1375,7 +1375,8 @@ def _md_real_tables(page: Any) -> list[tuple[tuple[float, float, float, float], 
         hdr = "| " + " | ".join(clean[0]) + " |"
         sep = "| " + " | ".join("---" for _ in clean[0]) + " |"
         body = ["| " + " | ".join(r) + " |" for r in clean[1:]]
-        out.append((tuple(t.bbox), "\n".join([hdr, sep, *body])))
+        tb = t.bbox
+        out.append(((float(tb[0]), float(tb[1]), float(tb[2]), float(tb[3])), "\n".join([hdr, sep, *body])))
     return out
 
 
@@ -1464,7 +1465,8 @@ def conv_pdf_to_md_structured(src: Path, dst: Path) -> None:
 
             page_items: list[tuple[float, str, str]] = [(tb[1], "table", md) for tb, md in tables]
             for b in blocks:
-                bbox = tuple(b["bbox"])
+                rb = b["bbox"]
+                bbox: tuple[float, float, float, float] = (float(rb[0]), float(rb[1]), float(rb[2]), float(rb[3]))
                 if any(_md_overlap(bbox, tb) >= 0.5 for tb in tbl_boxes):
                     continue
                 spans = [sp for ln in b["lines"] for sp in ln["spans"] if sp["text"].strip()]
@@ -1520,8 +1522,15 @@ def conv_pdf_to_md_structured(src: Path, dst: Path) -> None:
                         if mb or mn or mr:
                             if cur:
                                 items_md.append(f"{pfx}{_md_join_lines(cur, doc_words)}")
-                            pfx = "- " if (mb or mr) else f"{mn.group(1)}. "
-                            cur = [_MD_BULLET_RE.sub(r"\2", sl, 1) if mb else (_MD_NUM_RE.sub(r"\2", sl, 1) if mn else sl)]
+                            if mb is not None:
+                                pfx = "- "
+                                cur = [_MD_BULLET_RE.sub(r"\2", sl, 1)]
+                            elif mr is not None:
+                                pfx = "- "
+                                cur = [sl]
+                            elif mn is not None:
+                                pfx = f"{mn.group(1)}. "
+                                cur = [_MD_NUM_RE.sub(r"\2", sl, 1)]
                         else:
                             cur.append(sl)
                     if cur:
