@@ -50,7 +50,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 from xml.etree import ElementTree as ET
 
 if __package__ in (None, ""):
@@ -175,7 +175,7 @@ def all_targets_for(src_ext: str) -> list[str]:
     if src_ext in OFFICE_SLIDE_IN:
         out += ["pptx", "pdf", "docx", "odp", "png", "jpg", "webp"]
     if src_ext in IMAGE_EXTS or src_ext in ("wmf", "emf"):
-        out += ["webp", "png", "jpg", "pdf", "avif", "jxl", "tiff", "bmp", "ico", "gif"]
+        out += ["webp", "png", "jpg", "pdf", "docx", "pptx", "avif", "jxl", "tiff", "bmp", "ico", "gif"]
     if src_ext in TEXT_EXTS:
         out += ["docx", "pdf", "txt", "md", "html", "rtf", "odt"]
     if src_ext == "epub":
@@ -1125,15 +1125,110 @@ def conv_docx_to_text(src: Path, dst: Path) -> None:
     dst.write_text("\n".join(lines), encoding="utf-8-sig")
 
 
+def _load_transposed_rgb(src: Path) -> Any:
+    """Open an image with EXIF orientation applied and alpha composited onto white."""
+    Image: Any = importlib.import_module("PIL.Image")
+    ImageOps: Any = importlib.import_module("PIL.ImageOps")
+    with Image.open(src) as raw:
+        im = ImageOps.exif_transpose(raw)
+        if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
+            rgba = im.convert("RGBA")
+            bg = Image.new("RGB", rgba.size, (255, 255, 255))
+            bg.paste(rgba, mask=rgba.split()[-1])
+            return bg
+        return im.convert("RGB")
+
+
+def _image_to_png_stream(src: Path) -> tuple[io.BytesIO, int, int]:
+    """Return (PNG BytesIO, width_px, height_px) for embedding into DOCX/PPTX."""
+    im = _load_transposed_rgb(src)
+    w, h = im.size
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
+    buf.seek(0)
+    return buf, w, h
+
+
+def conv_images_to_pdf(srcs: list[Path], dst: Path) -> None:
+    """Combine one or more images (in exact order) into a multi-page PDF."""
+    if not srcs:
+        raise ValueError("No images provided")
+    if not BACKENDS.pillow:
+        if len(srcs) == 1:
+            lo_convert(srcs[0], dst)
+            return
+        raise RuntimeError("Pillow is required to combine images into PDF")
+    pages = [_load_transposed_rgb(p) for p in srcs]
+    pages[0].save(
+        dst,
+        "PDF",
+        resolution=200.0,
+        save_all=True,
+        append_images=pages[1:],
+    )
+
+
 def conv_image_to_pdf(src: Path, dst: Path) -> None:
-    if BACKENDS.pillow:
-        Image: Any = importlib.import_module("PIL.Image")
-        with Image.open(src) as im:
-            if im.mode != "RGB":
-                im = im.convert("RGB")
-            im.save(dst, "PDF", resolution=200.0)
-    else:
-        lo_convert(src, dst)
+    conv_images_to_pdf([src], dst)
+
+
+def conv_images_to_docx(srcs: list[Path], dst: Path) -> None:
+    """Combine one or more images (in exact order) into a Word document (.docx)."""
+    if not srcs:
+        raise ValueError("No images provided")
+    docx_mod: Any = importlib.import_module("docx")
+    docx_shared: Any = importlib.import_module("docx.shared")
+    Inches = docx_shared.Inches
+
+    doc = docx_mod.Document()
+    sec = doc.sections[0]
+    sec.top_margin = Inches(0.6)
+    sec.bottom_margin = Inches(0.6)
+    sec.left_margin = Inches(0.6)
+    sec.right_margin = Inches(0.6)
+    max_w_in = float(sec.page_width.inches - sec.left_margin.inches - sec.right_margin.inches)
+    max_h_in = float(sec.page_height.inches - sec.top_margin.inches - sec.bottom_margin.inches)
+
+    for idx, src in enumerate(srcs):
+        if idx > 0:
+            doc.add_page_break()
+        stream, w_px, h_px = _image_to_png_stream(src)
+        scale = min(max_w_in / max(1, w_px), max_h_in / max(1, h_px))
+        doc.add_picture(stream, width=Inches(max(0.5, w_px * scale)))
+
+    doc.save(str(dst))
+
+
+def conv_images_to_pptx(srcs: list[Path], dst: Path) -> None:
+    """Combine one or more images (in exact order) into a widescreen PowerPoint (.pptx)."""
+    if not srcs:
+        raise ValueError("No images provided")
+    pptx_mod: Any = importlib.import_module("pptx")
+    pptx_util: Any = importlib.import_module("pptx.util")
+    Inches = pptx_util.Inches
+
+    prs = pptx_mod.Presentation()
+    SLIDE_W, SLIDE_H = 13.333, 7.5
+    MARGIN = 0.25
+    prs.slide_width = Inches(SLIDE_W)
+    prs.slide_height = Inches(SLIDE_H)
+    blank_layout = prs.slide_layouts[min(6, len(prs.slide_layouts) - 1)]
+    avail_w = SLIDE_W - 2 * MARGIN
+    avail_h = SLIDE_H - 2 * MARGIN
+
+    for src in srcs:
+        slide = prs.slides.add_slide(blank_layout)
+        stream, w_px, h_px = _image_to_png_stream(src)
+        scale = min(avail_w / max(1, w_px), avail_h / max(1, h_px))
+        w_in = w_px * scale
+        h_in = h_px * scale
+        left = (SLIDE_W - w_in) / 2.0
+        top = (SLIDE_H - h_in) / 2.0
+        slide.shapes.add_picture(
+            stream, Inches(left), Inches(top), width=Inches(w_in), height=Inches(h_in)
+        )
+
+    prs.save(str(dst))
 
 
 def conv_pdf_to_html_fidelity(src: Path, dst: Path) -> None:
@@ -2657,6 +2752,12 @@ def _routes_for(src_ext: str, dst_ext: str) -> list[Route]:
         if BACKENDS.pillow:
             add("pillow-pdf", conv_image_to_pdf, 100)
         add("libreoffice", conv_libreoffice, 30)
+    elif s in IMAGE_EXTS and d == "docx":
+        if BACKENDS.pillow and BACKENDS.python_docx:
+            add("pillow-python-docx", lambda s_, d_: conv_images_to_docx([s_], d_), 100)
+    elif s in IMAGE_EXTS and d == "pptx":
+        if BACKENDS.pillow and BACKENDS.python_pptx:
+            add("pillow-python-pptx", lambda s_, d_: conv_images_to_pptx([s_], d_), 100)
     elif s == "docx" and d == "pptx":
         if BACKENDS.python_docx and BACKENDS.python_pptx:
             add("python-docx-python-pptx", conv_docx_to_pptx, 95)
@@ -2893,6 +2994,51 @@ class ConversionEngine:
                     total_ms=ms, out_path=str(base))
         debuglog.finalize(sess, res)
         return res
+
+    # -- combine multiple images -> single pdf/docx/pptx -------------------- #
+    def combine_images(self, srcs: Sequence[str | Path], dst_ext: str,
+                       out_dir: Optional[str | Path] = None,
+                       out_path: Optional[str | Path] = None) -> ConversionResult:
+        from . import debuglog
+        from .debuglog import _fmt_exc
+        paths = [Path(s) for s in srcs if Path(s).exists()]
+        ext = _norm_ext(dst_ext)
+        if not paths:
+            return ConversionResult("", "", "-", 0, False, "no source images found")
+        if ext not in (".pdf", ".docx", ".pptx"):
+            return ConversionResult(str(paths[0]), "", "-", 0, False,
+                                    f"unsupported combine target: {dst_ext}")
+        base = Path(out_path) if out_path else (Path(out_dir) if out_dir else paths[0].parent) / (paths[0].stem + ext)
+        base = _unique(Path(base))
+        sess = debuglog.new_session(paths[0], ext)
+        sess["planned_out"] = str(base)
+        sess["dst_ext"] = ext
+        bytes_in = sum((p.stat().st_size for p in paths), 0)
+        sess["bytes_in"] = bytes_in
+        backend_name = {".pdf": "pillow-pdf", ".docx": "pillow-python-docx", ".pptx": "pillow-python-pptx"}[ext]
+        fn = {".pdf": conv_images_to_pdf, ".docx": conv_images_to_docx, ".pptx": conv_images_to_pptx}[ext]
+        t0 = time.perf_counter()
+        try:
+            base.parent.mkdir(parents=True, exist_ok=True)
+            fn(paths, base)
+            ms = (time.perf_counter() - t0) * 1000
+            bytes_out = base.stat().st_size if base.exists() else 0
+            res = ConversionResult(str(paths[0]), str(base), backend_name, ms, True,
+                                   bytes_in=bytes_in, bytes_out=bytes_out)
+            sess.update(ok=True, winning_backend=backend_name, total_ms=ms,
+                        out_path=str(base), bytes_out=bytes_out)
+            debuglog.finalize(sess, res)
+            return res
+        except Exception as exc:
+            ms = (time.perf_counter() - t0) * 1000
+            err = f"{type(exc).__name__}: {exc}"
+            res = ConversionResult(str(paths[0]), str(base), backend_name, ms, False, err,
+                                   bytes_in=bytes_in)
+            sess.update(ok=False, final_error=err, total_ms=ms, out_path=str(base),
+                        attempts=[{"backend": backend_name, "ok": False, "ms": ms,
+                                   "error": err, "traceback": _fmt_exc(exc)}])
+            debuglog.finalize(sess, res)
+            return res
 
     # -- batch -------------------------------------------------------------- #
     def convert_many(self, jobs: list[tuple[str, str]],

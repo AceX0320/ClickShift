@@ -102,21 +102,21 @@ _FAMILY_TARGETS = {
     "htm": ["docx", "pdf", "txt", "md", "odt", "rtf"],
     "epub": ["docx", "pdf", "txt", "html", "md", "png", "jpg", "webp"],
     "xps": ["pdf", "docx", "png", "jpg"],
-    "png": ["webp", "jpg", "pdf", "avif", "jxl", "tiff", "bmp", "ico", "gif"],
-    "jpg": ["webp", "png", "pdf", "avif", "jxl", "tiff", "bmp", "ico", "gif"],
-    "jpeg": ["webp", "png", "pdf", "avif", "jxl", "tiff", "bmp", "ico", "gif"],
-    "gif": ["webp", "png", "jpg", "pdf", "avif", "jxl", "tiff", "bmp", "ico"],
-    "bmp": ["png", "webp", "jpg", "pdf", "avif", "jxl", "tiff", "ico", "gif"],
-    "tif": ["png", "webp", "jpg", "pdf", "avif", "jxl", "bmp", "ico", "gif"],
-    "tiff": ["png", "webp", "jpg", "pdf", "avif", "jxl", "bmp", "ico", "gif"],
-    "webp": ["png", "jpg", "pdf", "avif", "jxl", "tiff", "bmp", "ico", "gif"],
-    "avif": ["png", "jpg", "webp", "pdf", "jxl", "tiff", "bmp", "ico", "gif"],
-    "heic": ["jpg", "png", "webp", "pdf", "avif", "jxl", "tiff", "bmp"],
-    "heif": ["jpg", "png", "webp", "pdf", "avif", "jxl", "tiff", "bmp"],
-    "jxl": ["png", "jpg", "webp", "pdf", "avif", "tiff", "bmp", "ico"],
-    "ico": ["png", "webp", "jpg", "pdf", "bmp"],
-    "wmf": ["png", "webp", "jpg", "pdf"],
-    "emf": ["png", "webp", "jpg", "pdf"],
+    "png": ["webp", "jpg", "pdf", "docx", "pptx", "avif", "jxl", "tiff", "bmp", "ico", "gif"],
+    "jpg": ["webp", "png", "pdf", "docx", "pptx", "avif", "jxl", "tiff", "bmp", "ico", "gif"],
+    "jpeg": ["webp", "png", "pdf", "docx", "pptx", "avif", "jxl", "tiff", "bmp", "ico", "gif"],
+    "gif": ["webp", "png", "jpg", "pdf", "docx", "pptx", "avif", "jxl", "tiff", "bmp", "ico"],
+    "bmp": ["png", "webp", "jpg", "pdf", "docx", "pptx", "avif", "jxl", "tiff", "ico", "gif"],
+    "tif": ["png", "webp", "jpg", "pdf", "docx", "pptx", "avif", "jxl", "bmp", "ico", "gif"],
+    "tiff": ["png", "webp", "jpg", "pdf", "docx", "pptx", "avif", "jxl", "bmp", "ico", "gif"],
+    "webp": ["png", "jpg", "pdf", "docx", "pptx", "avif", "jxl", "tiff", "bmp", "ico", "gif"],
+    "avif": ["png", "jpg", "webp", "pdf", "docx", "pptx", "jxl", "tiff", "bmp", "ico", "gif"],
+    "heic": ["jpg", "png", "webp", "pdf", "docx", "pptx", "avif", "jxl", "tiff", "bmp"],
+    "heif": ["jpg", "png", "webp", "pdf", "docx", "pptx", "avif", "jxl", "tiff", "bmp"],
+    "jxl": ["png", "jpg", "webp", "pdf", "docx", "pptx", "avif", "tiff", "bmp", "ico"],
+    "ico": ["png", "webp", "jpg", "pdf", "docx", "pptx", "bmp"],
+    "wmf": ["png", "webp", "jpg", "pdf", "docx", "pptx"],
+    "emf": ["png", "webp", "jpg", "pdf", "docx", "pptx"],
 }
 
 
@@ -977,7 +977,6 @@ class DaemonIPCServer(threading.Thread):
                 req = json.loads(line)
                 if req.get("token") != self.token:
                     return
-                jobs = [(str(s), str(t)) for s, t in (req.get("jobs") or [])]
                 enable_ml = bool(req.get("enable_ml", True))
                 eng = get_engine(enable_ml=enable_ml)
                 write_lock = threading.Lock()
@@ -987,14 +986,19 @@ class DaemonIPCServer(threading.Thread):
                         wfile.write(json.dumps(res.as_dict()) + "\n")
                         wfile.flush()
 
-                eng.convert_many(jobs, progress=on_done)
+                if req.get("action") == "combine_images":
+                    files = [str(p) for p in (req.get("files") or [])]
+                    target = str(req.get("target") or "pdf")
+                    on_done(eng.combine_images(files, target))
+                else:
+                    jobs = [(str(s), str(t)) for s, t in (req.get("jobs") or [])]
+                    eng.convert_many(jobs, progress=on_done)
         except Exception as exc:
             _log(f"ipc handler error: {exc}")
 
 
-def try_daemon_convert(jobs: list[tuple[str, str]], enable_ml: bool = True,
-                       progress=None) -> Optional[list]:
-    """Send conversion jobs to the warm daemon if running; return None on any IPC miss."""
+def _ipc_request(payload_fields: dict, progress=None) -> Optional[list]:
+    """Send an authenticated JSON request to the running warm daemon."""
     if os.environ.get("CONFAS_NO_IPC") == "1":
         return None
     f = ipc_file()
@@ -1013,7 +1017,8 @@ def try_daemon_convert(jobs: list[tuple[str, str]], enable_ml: bool = True,
             sock.settimeout(300.0)
             rfile = sock.makefile("r", encoding="utf-8")
             wfile = sock.makefile("w", encoding="utf-8")
-            wfile.write(json.dumps({"token": token, "jobs": jobs, "enable_ml": enable_ml}) + "\n")
+            body = {"token": token, **payload_fields}
+            wfile.write(json.dumps(body) + "\n")
             wfile.flush()
             for line in rfile:
                 if not line.strip():
@@ -1035,9 +1040,26 @@ def try_daemon_convert(jobs: list[tuple[str, str]], enable_ml: bool = True,
                         progress(res)
                     except Exception:
                         pass
-        return results if len(results) == len(jobs) else None
+        return results
     except Exception:
         return None
+
+
+def try_daemon_convert(jobs: list[tuple[str, str]], enable_ml: bool = True,
+                       progress=None) -> Optional[list]:
+    """Send conversion jobs to the warm daemon if running; return None on any IPC miss."""
+    results = _ipc_request({"jobs": jobs, "enable_ml": enable_ml}, progress=progress)
+    return results if (results is not None and len(results) == len(jobs)) else None
+
+
+def try_daemon_combine(files: list[str], target: str, enable_ml: bool = True,
+                       progress=None) -> Optional[list]:
+    """Combine ordered images into one document inside the warm daemon if running."""
+    results = _ipc_request(
+        {"action": "combine_images", "files": files, "target": target, "enable_ml": enable_ml},
+        progress=progress,
+    )
+    return results if (results is not None and len(results) == 1) else None
 
 
 # --------------------------------------------------------------------------- #

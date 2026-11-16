@@ -184,11 +184,28 @@ def cmd_convert(args) -> int:
             print(f"      debug report: {rep}")
 
     t0 = time.perf_counter()
-    ipc_res = monitor.try_daemon_convert(jobs, enable_ml=not args.no_ml, progress=on_done)
-    if ipc_res is None:
-        results.clear()
-        engine = get_engine(enable_ml=not args.no_ml)
-        engine.convert_many(jobs, progress=on_done)
+    from .engine import IMAGE_EXTS
+    combine_target = (chosen_target or "").lower().lstrip(".")
+    combine_mode = (
+        len(files) > 1
+        and combine_target in ("pdf", "docx", "pptx")
+        and all(f.suffix.lstrip(".").lower() in IMAGE_EXTS for f in files)
+    )
+    if combine_mode:
+        ordered = [str(f.resolve()) for f in files]
+        ipc_res = monitor.try_daemon_combine(
+            ordered, combine_target, enable_ml=not args.no_ml, progress=on_done
+        )
+        if ipc_res is None:
+            results.clear()
+            engine = get_engine(enable_ml=not args.no_ml)
+            on_done(engine.combine_images(ordered, combine_target))
+    else:
+        ipc_res = monitor.try_daemon_convert(jobs, enable_ml=not args.no_ml, progress=on_done)
+        if ipc_res is None:
+            results.clear()
+            engine = get_engine(enable_ml=not args.no_ml)
+            engine.convert_many(jobs, progress=on_done)
     total_ms = (time.perf_counter() - t0) * 1000
     ok_n = sum(1 for r in results if r.ok)
     fail_n = len(results) - ok_n

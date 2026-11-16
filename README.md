@@ -2,7 +2,7 @@
 
 **One EXE. Right-click any document → converted. Learns to get faster.**
 
-> **📥 Direct EXE Download (Latest — v1.0.16):** [**Download `ConFas-v1.0.16.exe`**](https://github.com/AceX0320/ConFas/releases/download/v1.0.16/ConFas-v1.0.16.exe) · [**Latest Release Page**](https://github.com/AceX0320/ConFas/releases/latest)  
+> **📥 Direct EXE Download (Latest — v1.0.17):** [**Download `ConFas-v1.0.17.exe`**](https://github.com/AceX0320/ConFas/releases/download/v1.0.17/ConFas-v1.0.17.exe) · [**Latest Release Page**](https://github.com/AceX0320/ConFas/releases/latest)  
 > *(Or grab the latest CI artifact from [GitHub Actions](https://github.com/AceX0320/ConFas/actions/workflows/build.yml) / browse [Releases](https://github.com/AceX0320/ConFas/releases))*
 
 ConFas is a 100 % local, offline document conversion tool:
@@ -24,7 +24,7 @@ ConFas is a 100 % local, offline document conversion tool:
 | PPTX → DOCX | **python-pptx + python-docx** (titles, bullets, tables, images, speaker notes) | LibreOffice |
 | Any paged document (`PDF`/`DOCX`/`PPTX`/`XLSX`/`EPUB`…) → Images (`PNG`/`JPG`/`WEBP`/…) | **PyMuPDF (`fitz`) + Pillow** (renders **every page/slide** at 200 DPI into a `<document_name>/` folder as `page_001.<ext>`…) | — |
 | Legacy .doc/.xls/.ppt → modern | Office COM FileFormat **12 / 51 / 24** (= OOXML 2007+) | LibreOffice `MS * 2007 XML` filters |
-| Images ↔ images / PDF | **Pillow** (C-accelerated, 4:4:4 chroma, quality presets) | LibreOffice |
+| Images ↔ images / PDF / DOCX / PPTX | **Pillow** + **python-docx / python-pptx** (selecting multiple images combines them in selection order into one PDF/DOCX/PPTX) | LibreOffice |
 | TXT/MD/CSV/HTML → DOCX | **python-docx** (real headings/lists/bold/code styles) | Office COM → LibreOffice |
 | DOCX → TXT/MD/HTML | **python-docx** direct read | LibreOffice |
 | EPUB → TXT/DOCX/HTML/MD | stdlib zip + spine-order extraction | — |
@@ -127,7 +127,7 @@ https://github.com/AceX0320/ConFas/releases/latest/download/ConFas.exe
 ```
 
 * **Direct Download (Latest Release Page):** [https://github.com/AceX0320/ConFas/releases/latest](https://github.com/AceX0320/ConFas/releases/latest)
-* **Direct Download (v1.0.16 Pinned):** [https://github.com/AceX0320/ConFas/releases/download/v1.0.16/ConFas-v1.0.16.exe](https://github.com/AceX0320/ConFas/releases/download/v1.0.16/ConFas-v1.0.16.exe)
+* **Direct Download (v1.0.17 Pinned):** [https://github.com/AceX0320/ConFas/releases/download/v1.0.17/ConFas-v1.0.17.exe](https://github.com/AceX0320/ConFas/releases/download/v1.0.17/ConFas-v1.0.17.exe)
 * **All Releases:** [https://github.com/AceX0320/ConFas/releases](https://github.com/AceX0320/ConFas/releases)
 * **CI Build Artifacts (`ConFas-windows-exe`):** [https://github.com/AceX0320/ConFas/actions/workflows/build.yml](https://github.com/AceX0320/ConFas/actions/workflows/build.yml)
 * `/releases/latest` **always points to the newest published versioned EXE** (`ConFas-v<version>.exe`), and ConFas checks for new GitHub releases automatically with an in-app update prompt + installer.
@@ -136,8 +136,8 @@ Publishing happens automatically on every push to `main` (via `.github/workflows
 
 1. Push to `main` (or tag and push a version) → CI runs the full test suite, builds `ConFas-v<version>.exe` on a Windows runner, uploads the `ConFas-windows-exe` artifact, and publishes `ConFas-v<version>.exe` to the latest GitHub Release:
    ```bat
-   git tag v1.0.16
-   git push origin v1.0.16
+   git tag v1.0.17
+   git push origin v1.0.17
    ```
 2. Share the permanent link above. Anyone who downloads and double-clicks the
    EXE gets the self-install (both Windows right-click menus + Task Manager Startup entry).

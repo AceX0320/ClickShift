@@ -438,5 +438,72 @@ def test_paged_docs_to_image_folder(tmp_path, engine):
     assert [p.name for p in sorted(s_out.iterdir())] == ["page_001.png", "page_002.png"]
 
 
+def test_selected_images_combine_in_order(tmp_path, monkeypatch):
+    """Selecting multiple images in a custom order -> PDF / DOCX / PPTX preserves selection order."""
+    import docx
+    import fitz
+    import pptx
+    from PIL import Image
+    from confas import cli
+    from confas.monitor import menu_targets
+
+    for fmt in ("pdf", "docx", "pptx"):
+        assert fmt in menu_targets("png")
+        assert fmt in newest_target_for("png")
+
+    # Distinct sizes so order is unambiguously verifiable on output pages/slides/shapes
+    specs = [
+        ("c_first.png", (300, 100), (220, 20, 20)),    # wide (3:1)
+        ("a_second.jpg", (100, 300), (20, 220, 20)),   # tall (1:3)
+        ("b_third.png", (200, 200), (20, 20, 220)),    # square (1:1)
+    ]
+    ordered_paths = []
+    for name, size, color in specs:
+        p = tmp_path / name
+        Image.new("RGB", size, color).save(p)
+        ordered_paths.append(p)
+
+    monkeypatch.setenv("CONFAS_NO_IPC", "1")
+    monkeypatch.setenv("CONFAS_DISABLE_ML", "1")
+
+    # 1. CLI ordered images -> PDF
+    rc = cli.main(["convert", *(str(p) for p in ordered_paths), "-t", "pdf"])
+    assert rc == 0
+    pdf_out = tmp_path / "c_first.pdf"
+    assert pdf_out.exists()
+    doc = fitz.open(str(pdf_out))
+    try:
+        assert len(doc) == 3
+        assert doc[0].rect.width > doc[0].rect.height     # wide
+        assert doc[1].rect.height > doc[1].rect.width     # tall
+        assert abs(doc[2].rect.width - doc[2].rect.height) < 1.0  # square
+    finally:
+        doc.close()
+
+    # 2. CLI ordered images -> DOCX
+    rc = cli.main(["convert", *(str(p) for p in ordered_paths), "-t", "docx"])
+    assert rc == 0
+    docx_out = tmp_path / "c_first.docx"
+    assert docx_out.exists()
+    wd = docx.Document(str(docx_out))
+    assert len(wd.inline_shapes) == 3
+    assert wd.inline_shapes[0].width > wd.inline_shapes[0].height
+    assert wd.inline_shapes[1].height > wd.inline_shapes[1].width
+    assert abs(wd.inline_shapes[2].width - wd.inline_shapes[2].height) < 10_000
+
+    # 3. CLI ordered images -> PPTX
+    rc = cli.main(["convert", *(str(p) for p in ordered_paths), "-t", "pptx"])
+    assert rc == 0
+    pptx_out = tmp_path / "c_first.pptx"
+    assert pptx_out.exists()
+    prs = pptx.Presentation(str(pptx_out))
+    assert len(prs.slides) == 3
+    pics = [[sh for sh in sl.shapes if hasattr(sh, "image")][0] for sl in prs.slides]
+    assert pics[0].width > pics[0].height
+    assert pics[1].height > pics[1].width
+    assert abs(pics[2].width - pics[2].height) < 10_000
+
+
+
 
 
