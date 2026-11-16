@@ -144,11 +144,15 @@ def test_apply_windows_update_writes_self_deleting_script(tmp_path, monkeypatch)
 
     script = updater.apply_windows_update(src, dst, pid_to_wait=99999)
     assert script.exists()
-    content = script.read_text(encoding="utf-8")
+    content = script.read_text(encoding="utf-8-sig")
+    assert script.suffix == ".ps1"
     assert str(src.resolve()) in content
     assert str(dst.resolve()) in content
     assert "99999" in content
-    assert popen_calls == [["cmd.exe", "/c", str(script)]]
+    assert "PYINSTALLER_RESET_ENVIRONMENT" in content
+    assert len(popen_calls) == 1
+    assert popen_calls[0][0].lower().endswith("powershell.exe")
+    assert popen_calls[0][-2:] == ["-File", str(script)]
 
 
 def test_install_progress_popup_suppressed_by_env(monkeypatch):

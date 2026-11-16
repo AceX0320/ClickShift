@@ -331,51 +331,73 @@ def apply_windows_update(
 
     pid = pid_to_wait or os.getpid()
     tmp_dir = Path(tempfile.gettempdir())
-    script = tmp_dir / f"confas_apply_update_{pid}.cmd"
+    script = tmp_dir / f"confas_apply_update_{pid}.ps1"
+    log_path = tmp_dir / "confas_update.log"
 
-    # Wait up to ~20s for the running ConFas process to exit cleanly, then force-stop
-    # any lingering lock, place the versioned EXE (removing the old EXE if renamed),
-    # relaunch setup/tray, and self-delete.
-    src_str = str(downloaded_exe)
-    dst_str = str(final_exe)
-    old_str = str(target_exe)
-    cleanup_old = (
-        f"del /F /Q \"{old_str}\" >nul 2>nul\r\n"
-        if final_exe != target_exe
-        else ""
+    def q(value: object) -> str:
+        """PowerShell single-quoted literal."""
+        return "'" + str(value).replace("'", "''") + "'"
+
+    # NOTE: a previous .cmd helper was launched DETACHED (no console); its child
+    # console tools (ping/tasklist) then received a console Ctrl-C which aborted
+    # the batch before it ever copied the new EXE.  PowerShell needs no console
+    # tools: it waits on the PID natively, retries the copy while antivirus
+    # scans the fresh download, clears PyInstaller's inherited environment so
+    # the new onefile EXE does not reuse the old (deleted) temp extraction dir,
+    # relaunches the app and self-deletes.
+    ps = (
+        "$ErrorActionPreference = 'Continue'\r\n"
+        f"$src = {q(downloaded_exe)}\r\n"
+        f"$dst = {q(final_exe)}\r\n"
+        f"$old = {q(target_exe)}\r\n"
+        f"$log = {q(log_path)}\r\n"
+        f"$oldPid = {int(pid)}\r\n"
+        "function Log($m) { try { Add-Content -LiteralPath $log -Value ('[{0}] {1}' -f (Get-Date -Format s), $m) } catch {} }\r\n"
+        "Log \"update helper started (waiting for pid $oldPid)\"\r\n"
+        "try { Wait-Process -Id $oldPid -Timeout 20 -ErrorAction SilentlyContinue } catch {}\r\n"
+        "if (Get-Process -Id $oldPid -ErrorAction SilentlyContinue) {\r\n"
+        "  Log 'old process still alive; stopping it'\r\n"
+        "  Stop-Process -Id $oldPid -Force -ErrorAction SilentlyContinue\r\n"
+        "  Start-Sleep -Seconds 2\r\n"
+        "}\r\n"
+        "$ok = $false\r\n"
+        "for ($i = 1; $i -le 40 -and -not $ok; $i++) {\r\n"
+        "  try { Copy-Item -LiteralPath $src -Destination $dst -Force -ErrorAction Stop; $ok = $true }\r\n"
+        "  catch { Log \"copy attempt $i failed: $($_.Exception.Message)\"; Start-Sleep -Seconds 1 }\r\n"
+        "}\r\n"
+        "if (-not $ok) { Log 'giving up: could not place new EXE'; exit 1 }\r\n"
+        "Remove-Item -LiteralPath $src -Force -ErrorAction SilentlyContinue\r\n"
+        "try { Unblock-File -LiteralPath $dst -ErrorAction SilentlyContinue } catch {}\r\n"
+        "Log \"installed $dst\"\r\n"
+        "if ($old -ne $dst) {\r\n"
+        "  for ($i = 1; $i -le 15; $i++) {\r\n"
+        "    if (-not (Test-Path -LiteralPath $old)) { break }\r\n"
+        "    try { Remove-Item -LiteralPath $old -Force -ErrorAction Stop; break } catch { Start-Sleep -Seconds 1 }\r\n"
+        "  }\r\n"
+        "}\r\n"
+        "Get-ChildItem Env: | Where-Object { $_.Name -like '_MEIPASS2' -or $_.Name -like '_PYI_*' } | ForEach-Object { Remove-Item -LiteralPath (\"Env:\" + $_.Name) -ErrorAction SilentlyContinue }\r\n"
+        "$env:PYINSTALLER_RESET_ENVIRONMENT = '1'\r\n"
+        "try { Start-Process -FilePath $dst -WorkingDirectory (Split-Path -Parent $dst); Log 'relaunched new EXE' }\r\n"
+        "catch { Log \"relaunch failed: $($_.Exception.Message)\" }\r\n"
+        "Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue\r\n"
     )
-    bat = (
-        "@echo off\r\n"
-        "setlocal enableextensions\r\n"
-        f"set \"SRC={src_str}\"\r\n"
-        f"set \"DST={dst_str}\"\r\n"
-        f"set \"OLDPID={pid}\"\r\n"
-        "for /L %%I in (1,1,20) do (\r\n"
-        "  tasklist /FI \"PID eq %OLDPID%\" 2>nul | find \"%OLDPID%\" >nul\r\n"
-        "  if errorlevel 1 goto copy_now\r\n"
-        "  if %%I EQU 8 taskkill /F /PID %OLDPID% >nul 2>nul\r\n"
-        "  ping 127.0.0.1 -n 2 >nul\r\n"
-        ")\r\n"
-        ":copy_now\r\n"
-        "for /L %%R in (1,1,15) do (\r\n"
-        "  move /Y \"%SRC%\" \"%DST%\" >nul 2>nul && goto launch_new\r\n"
-        "  copy /Y \"%SRC%\" \"%DST%\" >nul 2>nul && (del /F /Q \"%SRC%\" >nul 2>nul & goto launch_new)\r\n"
-        "  ping 127.0.0.1 -n 2 >nul\r\n"
-        ")\r\n"
-        "exit /b 1\r\n"
-        ":launch_new\r\n"
-        f"{cleanup_old}"
-        "start \"\" \"%DST%\"\r\n"
-        "(goto) 2>nul & del /F /Q \"%~f0\"\r\n"
+    script.write_bytes(b"\xef\xbb\xbf" + ps.encode("utf-8"))
+
+    # CREATE_NO_WINDOW gives PowerShell a hidden console (no DETACHED_PROCESS).
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(
+        subprocess, "CREATE_NEW_PROCESS_GROUP", 0
     )
-    script.write_text(bat, encoding="utf-8")
-
-    creationflags = 0
-    for flag in ("CREATE_NO_WINDOW", "DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP"):
-        creationflags |= getattr(subprocess, flag, 0)
-
+    powershell = os.path.join(
+        os.environ.get("SystemRoot", r"C:\Windows"),
+        "System32", "WindowsPowerShell", "v1.0", "powershell.exe",
+    )
+    if not os.path.exists(powershell):
+        powershell = "powershell.exe"
     subprocess.Popen(
-        ["cmd.exe", "/c", str(script)],
+        [
+            powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+            "-WindowStyle", "Hidden", "-File", str(script),
+        ],
         creationflags=creationflags,
         close_fds=True,
     )

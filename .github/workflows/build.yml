@@ -52,15 +52,15 @@ jobs:
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.14
-          name: ConFas v1.0.14 (Latest Build)
+          tag_name: v1.0.15
+          name: ConFas v1.0.15 (Latest Build)
           make_latest: "true"
           files: dist/ConFas-v*.exe
           body: |
-            ## ConFas Windows EXE (v1.0.14)
+            ## ConFas Windows EXE (v1.0.15)
 
             **Direct download:**
-            https://github.com/${{ github.repository }}/releases/download/v1.0.14/ConFas-v1.0.14.exe
+            https://github.com/${{ github.repository }}/releases/download/v1.0.15/ConFas-v1.0.15.exe
 
             **Latest release page:**
             https://github.com/${{ github.repository }}/releases/latest
