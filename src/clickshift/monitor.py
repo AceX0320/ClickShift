@@ -1,19 +1,19 @@
-r"""ConFas always-on services:
+r"""ClickShift always-on services:
 
 Tray daemon          - runs forever, shows an icon in the notification area
                        (Task Manager > Startup apps friendly), lets you
                        pause/quit and open your watch folder.
-Watch-folder         - drop any document into `%USERPROFILE%/ConFasDrop` (or a folder
+Watch-folder         - drop any document into `%USERPROFILE%/ClickShiftDrop` (or a folder
 watcher              you pick) and it is converted automatically to its
                        "latest generation" format using the engine + ML.
 Startup registration - `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` entry
-                       so ConFas starts with Windows (appears under
+                       so ClickShift starts with Windows (appears under
                        Task Manager -> Startup apps).
 Context-menu         - per-extension shell keys (HKCU\Software\Classes) that add
-installer              "Convert with ConFas" + one "Convert to <FMT> with ConFas"
+installer              "Convert with ClickShift" + one "Convert to <FMT> with ClickShift"
                        row per sensible target to the Explorer right-click menu
                        (classic menu / "Show more options" on Win11), and also
-                       registers ConFas under "Open with" so it is reachable
+                       registers ClickShift under "Open with" so it is reachable
                        from the Windows 11 first-level menu.  Verbs are written
                        to *every* location modern Windows consults:
                          1. the effective ProgID (FileExts UserChoice),
@@ -41,7 +41,7 @@ from typing import Any, Optional
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    __package__ = "confas"
+    __package__ = "clickshift"
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -54,17 +54,17 @@ def _opt_import(name: str) -> Any:
 
 
 winreg: Any = _opt_import("winreg") if IS_WINDOWS else None
-APP_NAME = "ConFas"
+APP_NAME = "ClickShift"
 
-DATA_DIR = Path(os.environ.get("CONFAS_HOME", str(Path.home() / ".confas")))
+DATA_DIR = Path(os.environ.get("CLICKSHIFT_HOME", str(Path.home() / ".clickshift")))
 
 
 def data_dir() -> Path:
-    """Resolve the data dir at call time (honours CONFAS_HOME changes/tests)."""
-    return Path(os.environ.get("CONFAS_HOME", str(Path.home() / ".confas")))
+    """Resolve the data dir at call time (honours CLICKSHIFT_HOME changes/tests)."""
+    return Path(os.environ.get("CLICKSHIFT_HOME", str(Path.home() / ".clickshift")))
 
 
-DROP_DIR = Path(os.environ.get("CONFAS_DROP", str(Path.home() / "ConFasDrop")))
+DROP_DIR = Path(os.environ.get("CLICKSHIFT_DROP", str(Path.home() / "ClickShiftDrop")))
 CONFIG_FILE = DATA_DIR / "config.json"
 LOG_FILE = DATA_DIR / "daemon.log"
 PID_FILE = DATA_DIR / "daemon.pid"
@@ -144,12 +144,12 @@ DEFAULT_CONFIG = {
     "auto_target": "pdf",          # what dropped files are converted to by default
     "ml_enabled": True,
     "notify": True,
-    "win11_both_menus": True,      # surface full ConFas menu on Win11 1st & 2nd right-click menus
-    # --- opt-in diagnostic logging (off by default: no *.confas-debug.txt) #
+    "win11_both_menus": True,      # surface full ClickShift menu on Win11 1st & 2nd right-click menus
+    # --- opt-in diagnostic logging (off by default: no *.clickshift-debug.txt) #
     "debug_reports": "off",         # off | onerror | always
-    "debug_keep": 200,              # central reports kept in ~/.confas/debug/
+    "debug_keep": 200,              # central reports kept in ~/.clickshift/debug/
     # --- shared-learnings cloud sync (opt-in, aggregate stats only) ------ #
-    "cloud_enabled": False,         # enable with: confas config cloud_sync=on
+    "cloud_enabled": False,         # enable with: clickshift config cloud_sync=on
     "cloud_mode": "gist",           # "gist" (zero-backend) or "url" (own server)
     "cloud_gist_id": "REPLACE_WITH_YOUR_GIST_ID",
     "cloud_url": "",                # used when cloud_mode=url
@@ -158,13 +158,14 @@ DEFAULT_CONFIG = {
     "cloud_pull_on_start": True,
     # --- GitHub auto-updater --------------------------------------------- #
     "auto_update_check": True,
-    "update_check_interval_s": 21600,
+    "update_check_interval_s": 43200,   # check every 12 hours
+    "last_update_check_ts": 0.0,
     "skipped_update_version": "",
 }
 
 
 def config_file() -> Path:
-    """Resolve the config file path at call time (honours CONFAS_HOME changes/tests)."""
+    """Resolve the config file path at call time (honours CLICKSHIFT_HOME changes/tests)."""
     return data_dir() / "config.json"
 
 
@@ -198,7 +199,7 @@ def launch_command(args: list[str]) -> list[str]:
     """Command list that re-launches this program with given args."""
     if getattr(sys, "frozen", False):
         return [sys.executable] + args
-    return [sys.executable, "-m", "confas"] + args
+    return [sys.executable, "-m", "clickshift"] + args
 
 
 def _log(msg: str) -> None:
@@ -219,7 +220,7 @@ RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 
 def register_startup() -> bool:
-    """Add ConFas to the current user's Run key -> shows up in Task Manager."""
+    """Add ClickShift to the current user's Run key -> shows up in Task Manager."""
     if not IS_WINDOWS or winreg is None:
         return False
     try:
@@ -227,6 +228,10 @@ def register_startup() -> bool:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
                             winreg.KEY_SET_VALUE) as k:
             winreg.SetValueEx(k, APP_NAME, 0, winreg.REG_SZ, cmd)
+            try:
+                winreg.DeleteValue(k, "ConFas")
+            except OSError:
+                pass
         _log(f"startup registered: {cmd}")
         return True
     except Exception as exc:
@@ -240,7 +245,11 @@ def unregister_startup() -> bool:
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
                             winreg.KEY_SET_VALUE) as k:
-            winreg.DeleteValue(k, APP_NAME)
+            for name in (APP_NAME, "ConFas"):
+                try:
+                    winreg.DeleteValue(k, name)
+                except FileNotFoundError:
+                    pass
         return True
     except FileNotFoundError:
         return True
@@ -263,10 +272,10 @@ def is_startup_registered() -> bool:
 #  Right-click context menu (Cascading submenu + Full verbs + Win11 both menus)
 # --------------------------------------------------------------------------- #
 
-VERB_MENU = "ConFas.Menu"
-VERB_AUTO = "ConFas.Convert"
-VERB_CHOOSE = "ConFas.Choose"
-OPENWITH_APP = "ConFas.exe"
+VERB_MENU = "ClickShift.Menu"
+VERB_AUTO = "ClickShift.Convert"
+VERB_CHOOSE = "ClickShift.Choose"
+OPENWITH_APP = "ClickShift.exe"
 WIN11_CLASSIC_CLSID = r"Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}"
 UNIVERSAL_TARGETS = ["pdf", "docx", "xlsx", "pptx", "txt", "md", "html", "png", "jpg", "webp", "csv"]
 
@@ -367,13 +376,14 @@ def _write_verb(base: str, verb: str, label: str, cmd: str) -> None:
 
 
 def _write_cascading_menu(base: str, targets: list[str], default_target: Optional[str] = None) -> None:
-    """Write a cascading 'Convert with ConFas' flyout menu containing ALL target choices."""
+    """Write a cascading 'Convert with ClickShift' flyout menu containing ALL target choices."""
     assert winreg is not None
     menu_key = base + rf"\shell\{VERB_MENU}"
-    # Clean any stale subcommands first
+    # Clean any stale subcommands first (including legacy ConFas menu if upgrading)
+    _delete_key_tree(winreg.HKEY_CURRENT_USER, base + r"\shell\ConFas.Menu")
     _delete_key_tree(winreg.HKEY_CURRENT_USER, menu_key)
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER, menu_key) as km:
-        winreg.SetValueEx(km, "MUIVerb", 0, winreg.REG_SZ, "Convert with ConFas")
+        winreg.SetValueEx(km, "MUIVerb", 0, winreg.REG_SZ, "Convert with ClickShift")
         winreg.SetValueEx(km, "Icon", 0, winreg.REG_SZ, exe_path() + ",0")
         winreg.SetValueEx(km, "SubCommands", 0, winreg.REG_SZ, "")
         winreg.SetValueEx(km, "Position", 0, winreg.REG_SZ, "Top")
@@ -415,13 +425,13 @@ def _verbs_for(ext: str) -> list[tuple[str, str, str]]:
     targets = menu_targets(ext)
     best = targets[0].upper() if targets else "LATEST"
     out = [
-        (VERB_AUTO, f"Convert with ConFas (Auto -> {best})", _verb_cmd(None)),
+        (VERB_AUTO, f"Convert with ClickShift (Auto -> {best})", _verb_cmd(None)),
     ]
     for t in targets:
-        out.append((f"ConFas.To{t.capitalize()}",
-                    f"Convert to {t.upper()} with ConFas",
+        out.append((f"ClickShift.To{t.capitalize()}",
+                    f"Convert to {t.upper()} with ClickShift",
                     _verb_cmd(t)))
-    out.append((VERB_CHOOSE, "Convert with ConFas (Choose format...)", _verb_cmd(None, choose=True)))
+    out.append((VERB_CHOOSE, "Convert with ClickShift (Choose format...)", _verb_cmd(None, choose=True)))
     return out
 
 
@@ -447,13 +457,13 @@ def _delete_key_tree(root, path: str) -> None:
 
 
 def _register_openwith(ext: str) -> None:
-    """Make ConFas appear in Explorer's 'Open with' (Windows 11 first menu) with all choices."""
+    """Make ClickShift appear in Explorer's 'Open with' (Windows 11 first menu) with all choices."""
     assert winreg is not None
     app = OPENWITH_APP
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER,
                           rf"Software\Classes\Applications\{app}") as k:
         winreg.SetValueEx(k, "FriendlyAppName", 0, winreg.REG_SZ,
-                          "ConFas — Convert Document (All Formats)")
+                          "ClickShift — Convert Document (All Formats)")
         winreg.SetValueEx(k, "ApplicationDescription", 0, winreg.REG_SZ,
                           "Ultra-fast local document converter")
         with winreg.CreateKey(k, "DefaultIcon") as ki:
@@ -473,7 +483,11 @@ def _unregister_openwith(ext: str) -> None:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
                             rf"Software\Classes\.{ext}\OpenWithList", 0,
                             winreg.KEY_SET_VALUE) as kol:
-            winreg.DeleteValue(kol, OPENWITH_APP)
+            for app in (OPENWITH_APP, "ConFas.exe"):
+                try:
+                    winreg.DeleteValue(kol, app)
+                except OSError:
+                    pass
     except Exception:
         pass
 
@@ -504,37 +518,38 @@ def _assets_dir() -> Path:
 
 
 def _save_exe_path_registry() -> None:
-    """Store the current ConFas executable path in HKCU\\Software\\ConFas for ConFasShell.dll."""
+    """Store the current ClickShift executable path in HKCU\\Software\\ClickShift for ClickShiftShell.dll."""
     if not IS_WINDOWS or winreg is None:
         return
     try:
-        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\ConFas") as k:
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\ClickShift") as k:
             winreg.SetValueEx(k, "ExePath", 0, winreg.REG_SZ, exe_path())
+        _delete_key_tree(winreg.HKEY_CURRENT_USER, r"Software\ConFas")
     except Exception as exc:
         _log(f"save ExePath registry failed: {exc}")
 
 
 def _install_win11_shell_extension() -> bool:
-    """Install the packaged IExplorerCommand shell extension (ConFasShell.dll) so
-    the expandable 'Convert with ConFas >' submenu appears in the Windows 11 main menu.
+    """Install the packaged IExplorerCommand shell extension (ClickShiftShell.dll) so
+    the expandable 'Convert with ClickShift >' submenu appears in the Windows 11 main menu.
     """
     if not IS_WINDOWS:
         return False
     try:
         import shutil
         src_assets = _assets_dir()
-        dll_src = src_assets / "ConFasShell.dll"
+        dll_src = src_assets / "ClickShiftShell.dll"
         manifest_src = src_assets / "AppxManifest.xml"
         if not dll_src.exists() or not manifest_src.exists():
             _log(f"Win11 shell extension assets not found in {src_assets}")
             return False
 
         local_app = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
-        shell_dir = local_app / "ConFas" / "win11_shell"
+        shell_dir = local_app / "ClickShift" / "win11_shell"
         shell_dir.mkdir(parents=True, exist_ok=True)
 
-        for fname in ("ConFasShell.dll", "ConFasStub.exe", "AppxManifest.xml",
-                      "confas.png", "confas.ico", "ConFasShell.msix", "ConFasShell.cer"):
+        for fname in ("ClickShiftShell.dll", "ClickShiftStub.exe", "AppxManifest.xml",
+                      "clickshift.png", "clickshift.ico", "ClickShiftShell.msix", "ClickShiftShell.cer"):
             s = src_assets / fname
             if s.exists():
                 try:
@@ -542,12 +557,15 @@ def _install_win11_shell_extension() -> bool:
                 except Exception:
                     pass
 
-        msix_path = shell_dir / "ConFasShell.msix"
-        cer_path = shell_dir / "ConFasShell.cer"
+        msix_path = shell_dir / "ClickShiftShell.msix"
+        cer_path = shell_dir / "ClickShiftShell.cer"
         manifest_path = shell_dir / "AppxManifest.xml"
 
-        # 1. Remove any stale version and try direct registration into WindowsApps first
-        prep_remove = 'Get-AppxPackage -Name "ConFas.ShellExtension" -ErrorAction SilentlyContinue | Remove-AppxPackage -ErrorAction SilentlyContinue; '
+        # 1. Remove any stale version (or legacy ConFas extension) and try direct registration
+        prep_remove = (
+            'Get-AppxPackage -Name "ClickShift.ShellExtension" -ErrorAction SilentlyContinue | Remove-AppxPackage -ErrorAction SilentlyContinue; '
+            'Get-AppxPackage -Name "ConFas.ShellExtension" -ErrorAction SilentlyContinue | Remove-AppxPackage -ErrorAction SilentlyContinue; '
+        )
         direct_cmd = prep_remove + (
             f'Add-AppxPackage -Path "{msix_path}" -ForceApplicationShutdown -ErrorAction Stop'
             if msix_path.exists()
@@ -599,7 +617,10 @@ def _remove_win11_shell_extension() -> None:
     if not IS_WINDOWS:
         return
     try:
-        cmd = 'Get-AppxPackage -Name "ConFas.ShellExtension" | Remove-AppxPackage -ErrorAction SilentlyContinue'
+        cmd = (
+            'Get-AppxPackage -Name "ClickShift.ShellExtension" -ErrorAction SilentlyContinue | Remove-AppxPackage -ErrorAction SilentlyContinue; '
+            'Get-AppxPackage -Name "ConFas.ShellExtension" -ErrorAction SilentlyContinue | Remove-AppxPackage -ErrorAction SilentlyContinue'
+        )
         subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", cmd],
             capture_output=True, text=True, timeout=20,
@@ -610,7 +631,7 @@ def _remove_win11_shell_extension() -> None:
 
 
 def _purge_duplicate_class_verbs() -> None:
-    """Remove any ConFas* verbs from HKCU\\Software\\Classes\\<subkey>\\shell
+    """Remove any ClickShift* / ConFas* verbs from HKCU\\Software\\Classes\\<subkey>\\shell
     (outside SystemFileAssociations) so the classic menu never shows duplicate entries.
     """
     if not IS_WINDOWS or winreg is None:
@@ -637,7 +658,7 @@ def _purge_duplicate_class_verbs() -> None:
                         try:
                             v = winreg.EnumKey(sh_key, j)
                             j += 1
-                            if v.lower().startswith("confas"):
+                            if v.lower().startswith(("clickshift", "confas")):
                                 verbs.append(v)
                         except OSError:
                             break
@@ -653,8 +674,8 @@ def install_context_menu(
     extensions: Optional[list[str]] = None,
     progress_cb: Optional[Any] = None,
 ) -> int:
-    """Create the single expandable 'Convert with ConFas >' menu on both the
-    Windows 11 primary context menu (via ConFasShell.dll IExplorerCommand) and
+    """Create the single expandable 'Convert with ClickShift >' menu on both the
+    Windows 11 primary context menu (via ClickShiftShell.dll IExplorerCommand) and
     the secondary classic menu (via cascading SubCommands), removing any
     duplicate flat or ProgID verb entries.
     Returns number of extensions handled.
@@ -673,8 +694,10 @@ def install_context_menu(
     _save_exe_path_registry()
     _report("Cleaning up duplicate shell entries...", 30)
     _purge_duplicate_class_verbs()
+    if winreg is not None:
+        _delete_key_tree(winreg.HKEY_CURRENT_USER, r"Software\Classes\Applications\ConFas.exe")
     # Windows 11: the packaged IExplorerCommand extension shows ONE expandable
-    # 'Convert with ConFas >' in the main menu AND automatically in
+    # 'Convert with ClickShift >' in the main menu AND automatically in
     # 'Show more options'. Writing the registry cascade as well would make the
     # classic menu show it twice, so the registry cascade is only a fallback
     # (Windows 10, or when the package could not be registered).
@@ -749,6 +772,9 @@ def remove_context_menu(extensions: Optional[list[str]] = None) -> int:
     _delete_verb(r"Software\Classes\*", VERB_AUTO)
     _delete_key_tree(winreg.HKEY_CURRENT_USER,
                      rf"Software\Classes\Applications\{OPENWITH_APP}")
+    if winreg is not None:
+        _delete_key_tree(winreg.HKEY_CURRENT_USER, r"Software\Classes\Applications\ConFas.exe")
+    _delete_key_tree(winreg.HKEY_CURRENT_USER, r"Software\ClickShift")
     _delete_key_tree(winreg.HKEY_CURRENT_USER, r"Software\ConFas")
     _set_win11_both_menus(False)
     _remove_win11_shell_extension()
@@ -786,7 +812,7 @@ class WatchFolder(threading.Thread):
     STABLE_CHECKS = 2   # file size must be unchanged N polls before we convert
 
     def __init__(self, folder: Path, cfg: dict, on_done=None) -> None:
-        super().__init__(daemon=True, name="confas-watch")
+        super().__init__(daemon=True, name="clickshift-watch")
         self.folder = folder
         self.cfg = cfg
         self.on_done = on_done
@@ -802,7 +828,8 @@ class WatchFolder(threading.Thread):
             try:
                 now = {}
                 for p in self.folder.iterdir():
-                    if p.is_file() and not p.name.startswith("~$") and not p.name.endswith(".confas-debug.txt"):
+                    if (p.is_file() and not p.name.startswith("~$")
+                            and not p.name.endswith((".clickshift-debug.txt", ".confas-debug.txt"))):
                         try:
                             now[str(p)] = p.stat().st_size
                         except OSError:
@@ -865,7 +892,7 @@ class WatchFolder(threading.Thread):
 # --------------------------------------------------------------------------- #
 
 def acquire_single_instance() -> bool:
-    """Return True if this process is the only ConFas daemon."""
+    """Return True if this process is the only ClickShift daemon."""
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         if PID_FILE.exists():
@@ -915,7 +942,7 @@ class DaemonIPCServer(threading.Thread):
     """Loopback IPC server so CLI/right-click conversions run inside the warm daemon."""
 
     def __init__(self, cfg: dict) -> None:
-        super().__init__(daemon=True, name="confas-ipc")
+        super().__init__(daemon=True, name="clickshift-ipc")
         self.cfg = cfg
         self.token = uuid.uuid4().hex
         self.stop_event = threading.Event()
@@ -999,7 +1026,7 @@ class DaemonIPCServer(threading.Thread):
 
 def _ipc_request(payload_fields: dict, progress=None) -> Optional[list]:
     """Send an authenticated JSON request to the running warm daemon."""
-    if os.environ.get("CONFAS_NO_IPC") == "1":
+    if os.environ.get("CLICKSHIFT_NO_IPC") == "1":
         return None
     f = ipc_file()
     if not f.exists():
@@ -1067,11 +1094,11 @@ def try_daemon_combine(files: list[str], target: str, enable_ml: bool = True,
 # --------------------------------------------------------------------------- #
 
 def _make_tray_icon_image():
-    """Load assets/confas.ico (or confas.png) for the system tray, with fallback."""
+    """Load assets/clickshift.ico (or clickshift.png) for the system tray, with fallback."""
     Image: Any = importlib.import_module("PIL.Image")
     ImageDraw: Any = importlib.import_module("PIL.ImageDraw")
     assets = _assets_dir()
-    for name in ("confas.ico", "confas.png"):
+    for name in ("clickshift.ico", "clickshift.png"):
         p = assets / name
         if p.exists():
             try:
@@ -1090,8 +1117,55 @@ def _make_tray_icon_image():
     return img
 
 
+DEFAULT_UPDATE_INTERVAL_S = 43200  # 12 hours
+
+
+def update_check_due_in(cfg: dict, now: Optional[float] = None) -> tuple[bool, float]:
+    """Return (is_due_now, seconds_until_next_check) for the 12-hour background updater."""
+    interval = max(300, int(cfg.get("update_check_interval_s", DEFAULT_UPDATE_INTERVAL_S)))
+    last_ts = float(cfg.get("last_update_check_ts", 0.0) or 0.0)
+    cur = time.time() if now is None else float(now)
+    elapsed = cur - last_ts
+    if last_ts <= 0.0 or elapsed >= interval:
+        return True, 0.0
+    return False, max(1.0, float(interval) - elapsed)
+
+
+def perform_background_update_check(
+    current_version: str,
+    on_before_restart: Optional[Any] = None,
+    updater_mod: Optional[Any] = None,
+    now: Optional[float] = None,
+) -> str:
+    """Record check timestamp and silently download+install if a newer release exists.
+
+    Returns one of: 'updated', 'not_frozen', 'up_to_date', 'disabled', 'error'.
+    """
+    cfg = load_config()
+    if not cfg.get("auto_update_check", True):
+        return "disabled"
+    if updater_mod is None:
+        from . import updater as updater_mod
+    cfg["last_update_check_ts"] = float(time.time() if now is None else now)
+    save_config(cfg)
+    try:
+        info = updater_mod.check_for_update(current_version=current_version)
+        if info is None:
+            return "up_to_date"
+        return str(
+            updater_mod.run_background_update(
+                info,
+                current_version=current_version,
+                on_before_restart=on_before_restart,
+            )
+        )
+    except Exception as exc:
+        _log(f"background update check failed: {exc}")
+        return "error"
+
+
 def run_daemon(headless: bool = False) -> int:
-    """Main entry for `ConFas.exe run` - stays alive forever."""
+    """Main entry for `ClickShift.exe run` - stays alive forever."""
     cfg = load_config()
     if not acquire_single_instance():
         _log("another instance already running; exiting")
@@ -1146,29 +1220,33 @@ def run_daemon(headless: bool = False) -> int:
                 except Exception:
                     pass
 
-        def _check_and_prompt_update(manual: bool = False) -> None:
+        def _check_for_update(manual: bool = False) -> None:
             if not update_lock.acquire(blocking=False):
                 return
             try:
+                if not manual:
+                    perform_background_update_check(
+                        current_version=_ver,
+                        on_before_restart=_stop_for_update,
+                        updater_mod=_updater,
+                    )
+                    return
+                cfg_now = load_config()
+                cfg_now["last_update_check_ts"] = time.time()
+                save_config(cfg_now)
                 info = _updater.check_for_update(current_version=_ver)
                 if info is None:
-                    if manual and icon_holder.get("icon") is not None:
+                    if icon_holder.get("icon") is not None:
                         try:
-                            icon_holder["icon"].notify(f"ConFas v{_ver} is up to date.")
+                            icon_holder["icon"].notify(f"ClickShift v{_ver} is up to date.")
                         except Exception:
                             pass
                     return
-                latest_cfg = load_config()
-                if (not manual) and latest_cfg.get("skipped_update_version") == info.tag_name:
-                    return
-                result = _updater.run_interactive_update(
+                _updater.run_interactive_update(
                     info,
                     current_version=_ver,
                     on_before_restart=_stop_for_update,
                 )
-                if result == "skip":
-                    latest_cfg["skipped_update_version"] = info.tag_name
-                    save_config(latest_cfg)
             except Exception as exc:
                 _log(f"update check failed: {exc}")
             finally:
@@ -1180,9 +1258,13 @@ def run_daemon(headless: bool = False) -> int:
             while not update_stop.is_set():
                 cur_cfg = load_config()
                 if cur_cfg.get("auto_update_check", True):
-                    _check_and_prompt_update(manual=False)
-                interval = max(300, int(cur_cfg.get("update_check_interval_s", 21600)))
-                if update_stop.wait(interval):
+                    due, wait_s = update_check_due_in(cur_cfg)
+                    if due:
+                        _check_for_update(manual=False)
+                        wait_s = max(300, int(load_config().get("update_check_interval_s", DEFAULT_UPDATE_INTERVAL_S)))
+                else:
+                    wait_s = max(300, int(cur_cfg.get("update_check_interval_s", DEFAULT_UPDATE_INTERVAL_S)))
+                if update_stop.wait(wait_s):
                     return
 
         def toggle_pause(icon, item):
@@ -1195,14 +1277,14 @@ def run_daemon(headless: bool = False) -> int:
                     w2 = WatchFolder(Path(cfg["watch_folder"]), cfg)
                     w2.start()
                     globals()["_ACTIVE_WATCH"] = w2
-            icon.notify(f"ConFas {'paused' if paused['v'] else 'active'}")
+            icon.notify(f"ClickShift {'paused' if paused['v'] else 'active'}")
 
         def open_drop(icon, item):
             subprocess.Popen(["explorer", str(Path(cfg["watch_folder"]))])
 
         def check_updates_menu(icon, item):
             threading.Thread(
-                target=lambda: _check_and_prompt_update(manual=True),
+                target=lambda: _check_for_update(manual=True),
                 daemon=True,
             ).start()
 
@@ -1214,21 +1296,33 @@ def run_daemon(headless: bool = False) -> int:
                 ipc.stop()
             icon.stop()
 
+        def _on_tray_ready(ic) -> None:
+            ic.visible = True
+            notice = _updater.consume_update_notice()
+            if notice:
+                title, msg = _updater.format_update_notification(notice)
+                _log(msg)
+                time.sleep(1.0)
+                try:
+                    ic.notify(msg, title)
+                except Exception:
+                    pass
+            if os.environ.get("CLICKSHIFT_NO_POPUP") != "1":
+                threading.Thread(target=_auto_update_loop, daemon=True).start()
+
         menu = pystray.Menu(
-            pystray.MenuItem(lambda i: f"ConFas v{_ver} - {'paused' if paused['v'] else 'watching ' + cfg['watch_folder']}",
+            pystray.MenuItem(lambda i: f"ClickShift v{_ver} - {'paused' if paused['v'] else 'watching ' + cfg['watch_folder']}",
                              None, enabled=False),
             pystray.MenuItem("Pause/Resume watching", toggle_pause),
             pystray.MenuItem("Open drop folder", open_drop),
             pystray.MenuItem("Check for updates...", check_updates_menu),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Quit ConFas", quit_app),
+            pystray.MenuItem("Quit ClickShift", quit_app),
         )
-        icon = pystray.Icon(APP_NAME, _make_tray_icon_image(), f"ConFas v{_ver} - document converter", menu)
+        icon = pystray.Icon(APP_NAME, _make_tray_icon_image(), f"ClickShift v{_ver} - document converter", menu)
         icon_holder["icon"] = icon
-        if os.environ.get("CONFAS_NO_POPUP") != "1":
-            threading.Thread(target=_auto_update_loop, daemon=True).start()
         _log("tray daemon started")
-        icon.run()
+        icon.run(setup=_on_tray_ready)
         return 0
     except Exception as exc:
         update_stop.set()

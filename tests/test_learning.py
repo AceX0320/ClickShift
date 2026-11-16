@@ -3,11 +3,11 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-os.environ.setdefault("CONFAS_HOME", str(Path(__file__).parent / "_tmp_home"))
+os.environ.setdefault("CLICKSHIFT_HOME", str(Path(__file__).parent / "_tmp_home"))
 
 import numpy as np  # noqa: E402
-from confas.learning import BanditSelector, _features, DIM  # noqa: E402
-from confas.engine import Route  # noqa: E402
+from clickshift.learning import BanditSelector, _features, DIM  # noqa: E402
+from clickshift.engine import Route  # noqa: E402
 
 
 def make_routes():

@@ -1,12 +1,12 @@
-"""ConFas command line interface.
+"""ClickShift command line interface.
 This is what the Windows right-click menu invokes:
-    ConFas.exe convert "C:\\path\\file.pdf"              # -> newest generation (docx)
-    ConFas.exe convert "C:\\path\\file.pdf" -t docx      # explicit target
-    ConFas.exe convert file1 file2 file3 -t pdf          # batch, parallel
-    ConFas.exe run [--headless]                          # tray daemon + watcher
-    ConFas.exe install                                     # startup + context menu
-    ConFas.exe uninstall
-    ConFas.exe status | stats | config
+    ClickShift.exe convert "C:\\path\\file.pdf"              # -> newest generation (docx)
+    ClickShift.exe convert "C:\\path\\file.pdf" -t docx      # explicit target
+    ClickShift.exe convert file1 file2 file3 -t pdf          # batch, parallel
+    ClickShift.exe run [--headless]                          # tray daemon + watcher
+    ClickShift.exe install                                     # startup + context menu
+    ClickShift.exe uninstall
+    ClickShift.exe status | stats | config
 """
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from typing import Optional
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    __package__ = "confas"
+    __package__ = "clickshift"
 
 from . import __version__ as version
 from .engine import get_engine, newest_target_for, BACKENDS, _norm_ext
@@ -46,7 +46,7 @@ ERRSIGN = "×" if _is_ascii_console() else "x"
 
 def _popup(title: str, text: str) -> None:
     """Small native notification when launched from Explorer right-click."""
-    if monitor.IS_WINDOWS and os.environ.get("CONFAS_NO_POPUP") != "1":
+    if monitor.IS_WINDOWS and os.environ.get("CLICKSHIFT_NO_POPUP") != "1":
         try:
             import ctypes
             MB_OK = 0x0
@@ -67,7 +67,7 @@ def _pick_target_popup(src: Path) -> Optional[str]:
     if not targets:
         targets = newest_target_for(src.suffix) or ["pdf"]
     best = targets[0]
-    if not monitor.IS_WINDOWS or os.environ.get("CONFAS_NO_POPUP") == "1":
+    if not monitor.IS_WINDOWS or os.environ.get("CLICKSHIFT_NO_POPUP") == "1":
         return best
     try:
         import ctypes
@@ -102,7 +102,7 @@ def _pick_target_popup(src: Path) -> Optional[str]:
         hwnd = user32.CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
             "Static",
-            "ConFasMenuHost",
+            "ClickShiftMenuHost",
             WS_POPUP,
             pt.x, pt.y, 1, 1,
             None, None, hinst, None,
@@ -139,7 +139,7 @@ def _latest_report(res) -> str:
         if dd.exists():
             stem = Path(res.source).stem[:60]
             status = "OK" if res.ok else "FAIL"
-            matches = sorted(dd.glob(f"*-{stem}-{status}.confas-debug.txt"),
+            matches = sorted(dd.glob(f"*-{stem}-{status}.clickshift-debug.txt"),
                              key=lambda p: p.stat().st_mtime)
             if matches:
                 return str(matches[-1])
@@ -214,7 +214,7 @@ def cmd_convert(args) -> int:
     # appearing next to the original is the confirmation); only failures pop.
     if (getattr(sys, "frozen", False) or args.popup) and fail_n:
         errs = "\n".join(f"{Path(r.source).name}: {r.error}" for r in results if not r.ok)
-        _popup("ConFas - errors", f"{fail_n} conversion(s) failed:\n{errs[:900]}")
+        _popup("ClickShift - errors", f"{fail_n} conversion(s) failed:\n{errs[:900]}")
     return 0 if fail_n == 0 else 1
 
 
@@ -225,20 +225,20 @@ def cmd_run(args) -> int:
 def cmd_install(args) -> int:
     from .updater import InstallProgressPopup
 
-    print("ConFas setup")
+    print("ClickShift setup")
     quiet = bool(getattr(args, "quiet", False))
     show_popup = (
         monitor.IS_WINDOWS
         and not quiet
-        and os.environ.get("CONFAS_NO_POPUP") != "1"
+        and os.environ.get("CLICKSHIFT_NO_POPUP") != "1"
     )
     popup = InstallProgressPopup(
-        title="ConFas Setup",
-        heading=f"Installing ConFas v{version}...",
+        title="ClickShift Setup",
+        heading=f"Installing ClickShift v{version}...",
         enabled=show_popup,
     ).start()
     try:
-        popup.update("Preparing ConFas configuration...", progress=10, detail="Creating data and watch folders")
+        popup.update("Preparing ClickShift configuration...", progress=10, detail="Creating data and watch folders")
         monitor.DATA_DIR.mkdir(parents=True, exist_ok=True)
         monitor.save_config(monitor.load_config())
         Path(monitor.DEFAULT_CONFIG["watch_folder"]).mkdir(exist_ok=True)
@@ -251,7 +251,7 @@ def cmd_install(args) -> int:
             )
             print(f"  right-click menu entries installed : {n} extensions")
 
-            popup.update("Adding ConFas to Windows Startup apps...", progress=90, detail="Writing Startup entry")
+            popup.update("Adding ClickShift to Windows Startup apps...", progress=90, detail="Writing Startup entry")
             if monitor.register_startup():
                 print("  added to Startup apps (Task Manager > Startup apps)")
             else:
@@ -260,10 +260,10 @@ def cmd_install(args) -> int:
             popup.update("Refreshing Windows Explorer...", progress=96, detail="Finalizing installation")
             monitor.refresh_explorer()
             print("\nDone. Sign out/in once so Explorer refreshes its menus.")
-            popup.complete("ConFas installed! Running in system tray.", delay_s=0.7)
+            popup.complete("ClickShift installed! Running in system tray.", delay_s=0.7)
         else:
-            print("  non-Windows: only watch-folder daemon available (`confas run`)")
-            popup.complete("ConFas configured.", delay_s=0.3)
+            print("  non-Windows: only watch-folder daemon available (`clickshift run`)")
+            popup.complete("ClickShift configured.", delay_s=0.3)
         return 0
     except Exception as exc:
         popup.error(f"Setup failed: {exc}", delay_s=2.0)
@@ -275,7 +275,7 @@ def cmd_uninstall(args) -> int:
         monitor.remove_context_menu()
         monitor.unregister_startup()
         monitor.refresh_explorer()
-    print("ConFas removed from Startup apps and context menus.")
+    print("ClickShift removed from Startup apps and context menus.")
     return 0
 
 
@@ -320,9 +320,9 @@ def cmd_stats(args) -> int:
             avg = sum(i["ms"] for i in items) / max(len(items), 1)
             print(f"{pair:<14}{arm:<16}{len(items):>5}{100 * oks // len(items):>5}% "
                   f"{avg:>9.0f}")
-    ml_on = bool(monitor.load_config().get("ml_enabled")) and os.environ.get("CONFAS_DISABLE_ML") != "1"
+    ml_on = bool(monitor.load_config().get("ml_enabled")) and os.environ.get("CLICKSHIFT_DISABLE_ML") != "1"
     print(f"\nML backend-selection: {'ENABLED' if ml_on else 'disabled'}  "
-          f"(toggle with `confas config ml=off` or CONFAS_DISABLE_ML=1)")
+          f"(toggle with `clickshift config ml=off` or CLICKSHIFT_DISABLE_ML=1)")
     # cloud sync status
     try:
         from .cloud import CloudSync, DEFAULT_GIST_ID
@@ -334,9 +334,9 @@ def cmd_stats(args) -> int:
               f"(mode={cs.mode}, endpoint={'set' if cs.enabled() else 'not configured'})")
         if not cs.enabled() and not gist_cfgured and not cfg.get("cloud_url"):
             print("  -> share your ML improvements with other users:")
-            print("     ConFas.exe config cloud_gist=<your-gist-id>")
-            print("     setx CONFAS_CLOUD_TOKEN <github-pat-with-gist-scope>")
-            print("     ConFas.exe config cloud_sync=on   (see README: Shared learnings)")
+            print("     ClickShift.exe config cloud_gist=<your-gist-id>")
+            print("     setx CLICKSHIFT_CLOUD_TOKEN <github-pat-with-gist-scope>")
+            print("     ClickShift.exe config cloud_sync=on   (see README: Shared learnings)")
         elif cs.cfg.get("cloud_last_pull"):
             print(f"  last pull: {time.strftime('%Y-%m-%d %H:%M', time.localtime(cs.cfg['cloud_last_pull']))} "
                   f" | last push: "
@@ -412,6 +412,8 @@ def cmd_config(args) -> int:
             cfg["cloud_interval_s"] = max(60, int(float(v)))
         elif k in ("auto_update", "auto_update_check"):
             cfg["auto_update_check"] = v.lower() in ("1", "on", "true", "yes")
+        elif k in ("update_interval", "update_check_interval_s"):
+            cfg["update_check_interval_s"] = max(300, int(float(v)))
         else:
             print(f"unknown key '{k}'", file=sys.stderr)
             continue
@@ -435,7 +437,7 @@ def cmd_update(args) -> int:
 
     info = check_for_update(current_version=version)
     if info is None:
-        print(f"ConFas v{version} is up to date.")
+        print(f"ClickShift v{version} is up to date.")
         return 0
     print(f"Update available: {info.tag_name} (installed: v{version})")
     print(f"Release page: {info.html_url}")
@@ -452,8 +454,8 @@ def cmd_update(args) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="ConFas",
-        description=f"ConFas v{version} - ultra-fast local document converter "
+        prog="ClickShift",
+        description=f"ClickShift v{version} - ultra-fast local document converter "
                     "(right-click menu + watch folder + adaptive ML routing)",
     )
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -474,7 +476,7 @@ def build_parser() -> argparse.ArgumentParser:
     i.set_defaults(fn=cmd_install)
     u = sub.add_parser("uninstall", help="remove startup entry + context menu")
     u.set_defaults(fn=cmd_uninstall)
-    up = sub.add_parser("update", help="check GitHub for a newer ConFas release")
+    up = sub.add_parser("update", help="check GitHub for a newer ClickShift release")
     up.add_argument("--check", action="store_true", help="only check and print status")
     up.set_defaults(fn=cmd_update)
     s = sub.add_parser("status", help="show detected backends & registration state")

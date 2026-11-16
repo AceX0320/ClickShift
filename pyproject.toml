@@ -3,8 +3,8 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "confas"
-version = "1.0.17"
+name = "clickshift"
+version = "1.0.18"
 description = "Ultra-fast local document converter with right-click menu, startup daemon and adaptive ML backend routing"
 requires-python = ">=3.10"
 dependencies = [
@@ -23,7 +23,7 @@ windows = ["pywin32>=306", "pystray>=0.19.5"]
 dev = ["pytest>=8.0", "pyinstaller>=6.6"]
 
 [project.scripts]
-confas = "confas.cli:main"
+clickshift = "clickshift.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -1,13 +1,13 @@
-"""Cross-platform unit tests for the ConFas engine (run anywhere)."""
+"""Cross-platform unit tests for the ClickShift engine (run anywhere)."""
 import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-os.environ["CONFAS_HOME"] = str(Path(__file__).parent / "_tmp_home")
+os.environ["CLICKSHIFT_HOME"] = str(Path(__file__).parent / "_tmp_home")
 
 import pytest  # noqa: E402
-from confas.engine import ConversionEngine, newest_target_for, _routes_for  # noqa: E402
+from clickshift.engine import ConversionEngine, newest_target_for, _routes_for  # noqa: E402
 
 
 @pytest.fixture()
@@ -104,7 +104,7 @@ def test_pdf_to_docx_routes_present(engine):
 # ---- pdf2docx shading fixes (translucent panels -> per-line dark highlight) -- #
 
 def test_translucent_fill_blended_over_white():
-    from confas.engine import _flatten_path_opacity
+    from clickshift.engine import _flatten_path_opacity
     dark = (0.145, 0.157, 0.169)
     out = _flatten_path_opacity([
         {"fill": dark, "fill_opacity": 0.1, "color": None},
@@ -133,7 +133,7 @@ _SPACER = ('<w:p><w:pPr><w:spacing w:line="20" w:lineRule="exact" w:before="0" '
 
 
 def test_shaded_line_tables_merged_into_one_box():
-    from confas.engine import _merge_shaded_line_tables
+    from clickshift.engine import _merge_shaded_line_tables
     ns = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
     body = (_line_table("Header", fill="e60000") + _SPACER
             + _line_table("line one") + _SPACER + _line_table("line two", ind=60, width=9000)
@@ -210,7 +210,7 @@ def test_pdf_to_md_structured(tmp_path, engine):
 
 
 def test_pptx_targets_and_routes():
-    from confas.monitor import menu_targets
+    from clickshift.monitor import menu_targets
 
     for getter in (newest_target_for, menu_targets):
         assert "pptx" in getter("pdf")
@@ -307,7 +307,7 @@ def test_pptx_to_docx_and_pdf_roundtrip(tmp_path, engine):
     import pptx
     from pptx.util import Inches
     from PIL import Image
-    from confas.engine import conv_pptx_to_pdf
+    from clickshift.engine import conv_pptx_to_pdf
 
     img_buf = io.BytesIO()
     Image.new("RGB", (90, 90), (20, 160, 90)).save(img_buf, format="PNG")
@@ -374,7 +374,7 @@ def test_paged_docs_to_image_folder(tmp_path, engine):
     import fitz
     import pptx
     from PIL import Image
-    from confas.monitor import menu_targets
+    from clickshift.monitor import menu_targets
 
     for src_ext in ("pdf", "docx", "pptx"):
         for img_ext in ("png", "jpg", "webp"):
@@ -444,8 +444,8 @@ def test_selected_images_combine_in_order(tmp_path, monkeypatch):
     import fitz
     import pptx
     from PIL import Image
-    from confas import cli
-    from confas.monitor import menu_targets
+    from clickshift import cli
+    from clickshift.monitor import menu_targets
 
     for fmt in ("pdf", "docx", "pptx"):
         assert fmt in menu_targets("png")
@@ -463,8 +463,8 @@ def test_selected_images_combine_in_order(tmp_path, monkeypatch):
         Image.new("RGB", size, color).save(p)
         ordered_paths.append(p)
 
-    monkeypatch.setenv("CONFAS_NO_IPC", "1")
-    monkeypatch.setenv("CONFAS_DISABLE_ML", "1")
+    monkeypatch.setenv("CLICKSHIFT_NO_IPC", "1")
+    monkeypatch.setenv("CLICKSHIFT_DISABLE_ML", "1")
 
     # 1. CLI ordered images -> PDF
     rc = cli.main(["convert", *(str(p) for p in ordered_paths), "-t", "pdf"])
@@ -487,6 +487,10 @@ def test_selected_images_combine_in_order(tmp_path, monkeypatch):
     assert docx_out.exists()
     wd = docx.Document(str(docx_out))
     assert len(wd.inline_shapes) == 3
+    assert len(wd.paragraphs) == 3  # no extra blank page-break paragraphs
+    assert not wd.paragraphs[0].paragraph_format.page_break_before
+    assert all(p.paragraph_format.page_break_before for p in wd.paragraphs[1:])
+    assert all((p.paragraph_format.space_after or 0) == 0 for p in wd.paragraphs)
     assert wd.inline_shapes[0].width > wd.inline_shapes[0].height
     assert wd.inline_shapes[1].height > wd.inline_shapes[1].width
     assert abs(wd.inline_shapes[2].width - wd.inline_shapes[2].height) < 10_000

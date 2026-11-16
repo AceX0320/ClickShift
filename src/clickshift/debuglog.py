@@ -1,9 +1,9 @@
-"""ConFas optional conversion diagnostic logger.
+"""ClickShift optional conversion diagnostic logger.
 
 Disabled by default (`debug_reports = "off"`). When explicitly enabled via
-`ConFas.exe config debug=onerror|always` or `CONFAS_DEBUG_REPORTS=always`,
-human-readable `*.confas-debug.txt` diagnostics are written exclusively inside
-the central data dir (`~/.confas/debug/`) — never next to converted user files.
+`ClickShift.exe config debug=onerror|always` or `CLICKSHIFT_DEBUG_REPORTS=always`,
+human-readable `*.clickshift-debug.txt` diagnostics are written exclusively inside
+the central data dir (`~/.clickshift/debug/`) — never next to converted user files.
 """
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from typing import Optional
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    __package__ = "confas"
+    __package__ = "clickshift"
 
 MODE_ALWAYS = "always"
 MODE_ON_ERROR = "onerror"
@@ -39,7 +39,7 @@ def _cfg_value(key: str, default):
         return default
 
 def get_mode() -> str:
-    m = os.environ.get("CONFAS_DEBUG_REPORTS") or _cfg_value("debug_reports", MODE_OFF)
+    m = os.environ.get("CLICKSHIFT_DEBUG_REPORTS") or _cfg_value("debug_reports", MODE_OFF)
     m = str(m).strip().lower()
     if m in ("1", "true", "yes", "on", MODE_ALWAYS):
         return MODE_ALWAYS
@@ -77,7 +77,7 @@ def render_report(session: dict) -> str:
     L: list[str] = []
     bar = "=" * 78
     L.append(bar)
-    L.append("ConFas CONVERSION DEBUG REPORT")
+    L.append("ClickShift CONVERSION DEBUG REPORT")
     L.append(bar)
     L.append(f"Run id      : {session.get('run_id', '')}")
     L.append(f"Started     : {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(session.get('t_start', time.time())))}"
@@ -87,7 +87,7 @@ def render_report(session: dict) -> str:
         L.append(f"Finished    : {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(finished))}")
     L.append("")
     L.append("[ENVIRONMENT]")
-    L.append(f"  ConFas version : {session.get('version', '?')}")
+    L.append(f"  ClickShift version : {session.get('version', '?')}")
     L.append(f"  OS             : {platform.platform()}")
     L.append(f"  Python         : {sys.version.split()[0]} ({'frozen EXE' if getattr(sys, 'frozen', False) else 'source'})")
     L.append(f"  Data dir       : {session.get('data_dir', '')}")
@@ -169,12 +169,12 @@ def render_report(session: dict) -> str:
             err = session.get("final_error") or "no conversion path or backend available"
             L.append(f"    - error: {err}")
     L.append(bar)
-    L.append("End of report. (disable with `ConFas.exe config debug=off`)")
+    L.append("End of report. (disable with `ClickShift.exe config debug=off`)")
     return "\n".join(L) + "\n"
 
 def _prune(data_dir: Path, keep: int) -> None:
     try:
-        files = sorted(data_dir.glob("*.confas-debug.txt"),
+        files = sorted(data_dir.glob("*.clickshift-debug.txt"),
                        key=lambda p: p.stat().st_mtime, reverse=True)[keep:]
         for old in files:
             try:
@@ -192,7 +192,7 @@ def new_session(src, dst_ext: str) -> dict:
         from . import monitor
         data_dir = str(monitor.DATA_DIR)
     except Exception:
-        data_dir = str(Path.home() / ".confas")
+        data_dir = str(Path.home() / ".clickshift")
     try:
         from . import __version__ as version  # type: ignore
     except Exception:
@@ -244,19 +244,19 @@ def finalize(sess: dict, result) -> None:
         pass
 
 def write_report(session: dict) -> Optional[Path]:
-    """Write the debug txt report inside ~/.confas/debug/ if enabled. Never raises."""
+    """Write the debug txt report inside ~/.clickshift/debug/ if enabled. Never raises."""
     try:
         if not should_write(bool(session.get("ok"))):
             return None
         text = render_report(session)
 
-        # Store diagnostics strictly under ~/.confas/debug/ so converted user
-        # folders stay completely free of *.confas-debug.txt files.
+        # Store diagnostics strictly under ~/.clickshift/debug/ so converted user
+        # folders stay completely free of *.clickshift-debug.txt files.
         try:
             from . import monitor
             data_dir = monitor.data_dir()
         except Exception:
-            data_dir = Path.home() / ".confas"
+            data_dir = Path.home() / ".clickshift"
         session["data_dir"] = str(data_dir)
         central: Optional[Path] = None
         try:
@@ -267,7 +267,7 @@ def write_report(session: dict) -> Optional[Path]:
             stem = Path(src_name).stem[:60] if src_name else "file"
             status = "OK" if session.get("ok") else "FAIL"
             with _write_lock:
-                central = dd / f"{stamp}-{stem}-{status}.confas-debug.txt"
+                central = dd / f"{stamp}-{stem}-{status}.clickshift-debug.txt"
                 central.write_text(text, encoding="utf-8")
                 _prune(dd, keep_count())
         except Exception:

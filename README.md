@@ -1,16 +1,16 @@
-# ConFas ⚡ — ultra-fast local document converter for Windows
+# ClickShift ⚡ — ultra-fast local document converter for Windows
 
 **One EXE. Right-click any document → converted. Learns to get faster.**
 
-> **📥 Direct EXE Download (Latest — v1.0.17):** [**Download `ConFas-v1.0.17.exe`**](https://github.com/AceX0320/ConFas/releases/download/v1.0.17/ConFas-v1.0.17.exe) · [**Latest Release Page**](https://github.com/AceX0320/ConFas/releases/latest)  
-> *(Or grab the latest CI artifact from [GitHub Actions](https://github.com/AceX0320/ConFas/actions/workflows/build.yml) / browse [Releases](https://github.com/AceX0320/ConFas/releases))*
+> **📥 Direct EXE Download (Latest — v1.0.18):** [**Download `ClickShift-v1.0.18.exe`**](https://github.com/AceX0320/ClickShift/releases/download/v1.0.18/ClickShift-v1.0.18.exe) · [**Latest Release Page**](https://github.com/AceX0320/ClickShift/releases/latest)  
+> *(Or grab the latest CI artifact from [GitHub Actions](https://github.com/AceX0320/ClickShift/actions/workflows/build.yml) / browse [Releases](https://github.com/AceX0320/ClickShift/releases))*
 
-ConFas is a 100 % local, offline document conversion tool:
+ClickShift is a 100 % local, offline document conversion tool:
 
-* **Both Windows 11 & Classic right-click menus** in Explorer — *"Convert with ConFas"* cascading submenu + *"Open with"* quick target picker (`--choose`) exposing **all compatible conversion targets** on every document/image type.
+* **Both Windows 11 & Classic right-click menus** in Explorer — *"Convert with ClickShift"* cascading submenu + *"Open with"* quick target picker (`--choose`) exposing **all compatible conversion targets** on every document/image type.
 * **Always running** — after the first double-click it registers itself in **Task Manager → Startup apps** and lives in the system tray forever, delegating right-click conversions to a warm local IPC daemon (`127.0.0.1:45829`) for zero cold-start overhead.
 * **Latest-generation output only** — `.doc` never produces legacy Word 97; you get `.docx` (OOXML 2007+), `.xlsx`, `.pptx`, modern image codecs (WebP/AVIF/JPEG XL), UTF-8 text…
-* **Adaptive ML routing** *(the "trick")* — a lightweight contextual bandit (LinUCB) learns from every conversion which backend is fastest/most reliable **on your machine for files like yours**, and re-orders the fallback chain accordingly. Speed improves with use; correctness can never degrade (fallbacks are always kept). If you don't want it: `confas config ml=off` or `CONFAS_DISABLE_ML=1`.
+* **Adaptive ML routing** *(the "trick")* — a lightweight contextual bandit (LinUCB) learns from every conversion which backend is fastest/most reliable **on your machine for files like yours**, and re-orders the fallback chain accordingly. Speed improves with use; correctness can never degrade (fallbacks are always kept). If you don't want it: `clickshift config ml=off` or `CLICKSHIFT_DISABLE_ML=1`.
 
 ---
 
@@ -33,23 +33,23 @@ ConFas is a 100 % local, offline document conversion tool:
 Notes on *perfection*:
 * LibreOffice filters used are explicitly the **2007 XML** generation ones (plus `writer_pdf_import` when reading PDFs) — never `MS Word 97`.
 * Text outputs are written as UTF-8 (with BOM where Windows consumers expect it).
-* Every pair has an ordered fallback chain; if all fail you get a clear error popup and a `<filename>.confas-debug.txt` diagnostic report next to the source file instead of a silent failure or broken output.
+* Every pair has an ordered fallback chain; if all fail you get a clear error popup (and opt-in central diagnostics inside `~/.clickshift/debug/` if enabled).
 * Persistent worker pool + warm local IPC daemon means no cold-start per conversion and persistent COM/bandit caches.
 
-## The ML part (`src/confas/learning.py`)
+## The ML part (`src/clickshift/learning.py`)
 
 For each `(source→target, backend)` arm the engine records latency + success + output quality sanity.
-A LinUCB linear bandit over a dense **10-dimensional content-aware feature vector** (`[bias, norm_log_bytes, is_large, depth, sin_h, cos_h, structure_density, media_ratio, complexity_proxy, interaction]`, extracted via fast 32 KB header probing) picks the next attempt order using $O(d^2)$ Sherman–Morrison rank-1 inverse updates (`A_inv`) and exponential discounting ($\gamma = 0.995$) for non-stationary adaptation. State persists in `%USERPROFILE%\.confas\bandit.json` (debounced in daemon mode); every run is logged to `history.jsonl` and visible via:
+A LinUCB linear bandit over a dense **10-dimensional content-aware feature vector** (`[bias, norm_log_bytes, is_large, depth, sin_h, cos_h, structure_density, media_ratio, complexity_proxy, interaction]`, extracted via fast 32 KB header probing) picks the next attempt order using $O(d^2)$ Sherman–Morrison rank-1 inverse updates (`A_inv`) and exponential discounting ($\gamma = 0.995$) for non-stationary adaptation. State persists in `%USERPROFILE%\.clickshift\bandit.json` (debounced in daemon mode); every run is logged to `history.jsonl` and visible via:
 
 ```bat
-ConFas.exe stats
+ClickShift.exe stats
 ```
 
 Cold start falls back to static weights; exploration bonus guarantees the model keeps testing alternatives, but a failing arm is demoted instantly and the engine transparently retries the next backend — so results stay correct even mid-learning.
 
 ## Shared learnings (optional cloud sync) — "send the improvements somewhere"
 
-ConFas can **pool everyone's ML learnings** so that a person who downloads the
+ClickShift can **pool everyone's ML learnings** so that a person who downloads the
 tool later starts with an already-trained model instead of a cold one. This is
 **opt-in and privacy-safe**: only aggregate numbers are exchanged (learned
 weight matrices + median latencies per format pair). *Never* file names, paths
@@ -60,28 +60,28 @@ or contents. The conversion itself always stays 100% local.
 1. **Owner (you), once:** create a secret gist containing one small JSON file
    (`merged.json` = `{"version":1,"clock":0,"bandit":{},"median_ms":{}}`),
    note its ID from the URL, then in repo settings add two GitHub Secrets:
-   `CONFAS_GIST_ID` and `CONFAS_CLOUD_TOKEN` (fine-grained PAT with `gist`
+   `CLICKSHIFT_GIST_ID` and `CLICKSHIFT_CLOUD_TOKEN` (fine-grained PAT with `gist`
    scope). The included workflow `.github/workflows/cloud-merge-cron.yml`
    runs every 6 h and merges all `contrib-*.json` files into `merged.json`.
 2. Ship the EXE with defaults baked in, or let each user configure it:
 
 ```bat
-ConFas.exe config cloud_gist=<the-gist-id>
-setx CONFAS_CLOUD_TOKEN <your-pat-with-gist-scope>
-ConFas.exe config cloud_sync=on
+ClickShift.exe config cloud_gist=<the-gist-id>
+setx CLICKSHIFT_CLOUD_TOKEN <your-pat-with-gist-scope>
+ClickShift.exe config cloud_sync=on
 ```
 
 That's it. Every conversion now (debounced to ≤1 upload/minute) pushes your
 aggregate learning as `contrib-<clientid>.json`, and periodically pulls the
 pooled `merged.json` back into your local bandit — so you also benefit from
-everyone else's machines. Check state any time with `ConFas.exe stats`
+everyone else's machines. Check state any time with `ClickShift.exe stats`
 ("Cloud learnings sync: ON/OFF, last pull/push").
 
 Alternative: run any tiny REST endpoint speaking `GET /state` + `PUT /state`
 (Cloudflare Worker/KV, S3, nginx+file…) and use `config cloud_url=https://...`
 instead of the gist.
 
-Merge rules (`src/confas/cloud.py::merge_states`): sample counts sum, both
+Merge rules (`src/clickshift/cloud.py::merge_states`): sample counts sum, both
 covariance matrices `A` and reward vectors `b` average across contributors
 (preserving the $\theta = A^{-1} b$ scale and keeping the ridge prior
 well-conditioned), latency medians take the minimum, and a Lamport clock guards
@@ -96,7 +96,7 @@ ordering — so concurrent users can never corrupt the pool.
   cannot be disabled from config.
 * **Least-privilege credentials:** the token is a fine-grained GitHub PAT with
   the `gist` scope *only* — it cannot touch repos, code, packages, issues or
-  any account data. It is stored locally (`~/.confas/cloud_token`, created via
+  any account data. It is stored locally (`~/.clickshift/cloud_token`, created via
   `os.open(..., 0o600)`; on Windows use `setx` so it stays in your user
   profile) and is sent exclusively to `api.github.com`. Use **your own** token;
   nothing of yours is ever accessible through someone else's.
@@ -114,32 +114,32 @@ ordering — so concurrent users can never corrupt the pool.
   still run, so conversions stay correct offline, online, or under attack.
 * **Fail-open locally:** any sync error is logged and ignored; the local bandit
   keeps learning normally. Turning it off is one command:
-  `ConFas.exe config cloud_sync=off`.
+  `ClickShift.exe config cloud_sync=off`.
 
 ---
 
 ## Download the EXE (no clone, no build)
 
-The direct permanent download link for the latest `ConFas.exe` release is:
+The direct permanent download link for the latest release page is:
 
 ```
-https://github.com/AceX0320/ConFas/releases/latest/download/ConFas.exe
+https://github.com/AceX0320/ClickShift/releases/latest
 ```
 
-* **Direct Download (Latest Release Page):** [https://github.com/AceX0320/ConFas/releases/latest](https://github.com/AceX0320/ConFas/releases/latest)
-* **Direct Download (v1.0.17 Pinned):** [https://github.com/AceX0320/ConFas/releases/download/v1.0.17/ConFas-v1.0.17.exe](https://github.com/AceX0320/ConFas/releases/download/v1.0.17/ConFas-v1.0.17.exe)
-* **All Releases:** [https://github.com/AceX0320/ConFas/releases](https://github.com/AceX0320/ConFas/releases)
-* **CI Build Artifacts (`ConFas-windows-exe`):** [https://github.com/AceX0320/ConFas/actions/workflows/build.yml](https://github.com/AceX0320/ConFas/actions/workflows/build.yml)
-* `/releases/latest` **always points to the newest published versioned EXE** (`ConFas-v<version>.exe`), and ConFas checks for new GitHub releases automatically with an in-app update prompt + installer.
+* **Direct Download (Latest Release Page):** [https://github.com/AceX0320/ClickShift/releases/latest](https://github.com/AceX0320/ClickShift/releases/latest)
+* **Direct Download (v1.0.18 Pinned):** [https://github.com/AceX0320/ClickShift/releases/download/v1.0.18/ClickShift-v1.0.18.exe](https://github.com/AceX0320/ClickShift/releases/download/v1.0.18/ClickShift-v1.0.18.exe)
+* **All Releases:** [https://github.com/AceX0320/ClickShift/releases](https://github.com/AceX0320/ClickShift/releases)
+* **CI Build Artifacts (`ClickShift-windows-exe`):** [https://github.com/AceX0320/ClickShift/actions/workflows/build.yml](https://github.com/AceX0320/ClickShift/actions/workflows/build.yml)
+* `/releases/latest` **always points to the newest published versioned EXE** (`ClickShift-v<version>.exe`). ClickShift checks for new GitHub releases automatically every **12 hours** in the background, updates silently, and leaves a Windows notification showing the old → new version when it restarts.
 
 Publishing happens automatically on every push to `main` (via `.github/workflows/build.yml`) as well as on version tags (via `.github/workflows/release.yml`):
 
-1. Push to `main` (or tag and push a version) → CI runs the full test suite, builds `ConFas-v<version>.exe` on a Windows runner, uploads the `ConFas-windows-exe` artifact, and publishes `ConFas-v<version>.exe` to the latest GitHub Release:
+1. Push to `main` (or tag and push a version) → CI runs the full test suite, builds `ClickShift-v<version>.exe` on a Windows runner, uploads the `ClickShift-windows-exe` artifact, and publishes `ClickShift-v<version>.exe` to the latest GitHub Release:
    ```bat
-   git tag v1.0.17
-   git push origin v1.0.17
+   git tag v1.0.18
+   git push origin v1.0.18
    ```
-2. Share the permanent link above. Anyone who downloads and double-clicks the
+2. Share the link above. Anyone who downloads and double-clicks the
    EXE gets the self-install (both Windows right-click menus + Task Manager Startup entry).
 
 **"Each EXE downloaded with the latest improvements":** ML learnings are
@@ -156,60 +156,60 @@ needs re-releasing when code changes.
 
 ### Option A — one command on your PC
 ```powershell
-git clone https://github.com/AceX0320/ConFas.git
-cd ConFas
+git clone https://github.com/AceX0320/ClickShift.git
+cd ClickShift
 powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
 ```
-The script creates a venv, installs deps, runs `build.py`, copies `dist\ConFas.exe` to `%LOCALAPPDATA%\ConFas`, performs the install (startup + right-click menus) and launches the tray daemon.
+The script creates a venv, installs deps, runs `build.py`, copies `dist\ClickShift-v<version>.exe` to `%LOCALAPPDATA%\ClickShift`, performs the install (startup + right-click menus) and launches the tray daemon.
 
 ### Option B — free GitHub CI
-Push to GitHub; the included workflow **`.github/workflows/build.yml`** runs tests on Linux and builds `ConFas.exe` on `windows-latest`, publishing it both as the downloadable artifact **`ConFas-windows-exe`** and to the latest GitHub Release.
+Push to GitHub; the included workflow **`.github/workflows/build.yml`** runs tests on Linux and builds `ClickShift-v<version>.exe` on `windows-latest`, publishing it both as the downloadable artifact **`ClickShift-windows-exe`** and to the latest GitHub Release.
 
 Manual build if you prefer:
 ```bat
 py -3.12 -m venv .venv && .venv\Scripts\activate
 pip install -r requirements.txt pyinstaller pywin32 pystray
-python build.py        REM -> dist\ConFas.exe
+python build.py        REM -> dist\ClickShift-v<version>.exe
 ```
 
 ## Use
 
-1. **Double-click `ConFas.exe` once.** It self-installs:
-   * adds **"Convert with ConFas"** cascading flyout menus (with all compatible target formats) + **"Open with → ConFas — Convert (pick format…)"** across both the **Windows 11 primary right-click menu** and the **Classic right-click menu** for pdf/doc/docx/xls/xlsx/ppt/pptx/odt/ods/odp/rtf/txt/md/csv/html/epub/png/jpg/webp/avif/jxl/… (`HKCU` shell verbs — no admin needed);
-   * writes `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\ConFas` → it now appears in **Task Manager → Startup apps** and starts with Windows automatically;
-   * stays running in the tray (watch folder + warm local IPC daemon).
+1. **Double-click `ClickShift.exe` once.** It self-installs:
+   * adds **"Convert with ClickShift"** cascading flyout menus (with all compatible target formats) + **"Open with → ClickShift — Convert (pick format…)"** across both the **Windows 11 primary right-click menu** and the **Classic right-click menu** for pdf/doc/docx/xls/xlsx/ppt/pptx/odt/ods/odp/rtf/txt/md/csv/html/epub/png/jpg/webp/avif/jxl/… (`HKCU` shell verbs — no admin needed);
+   * writes `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\ClickShift` → it now appears in **Task Manager → Startup apps** and starts with Windows automatically;
+   * stays running in the tray (watch folder + warm local IPC daemon + 12-hour silent background auto-updater).
    * Explorer is notified automatically (`SHChangeNotify`); if needed, sign out/in once so the Windows 11 menu mode takes effect.
-2. **Right-click a document → Convert with ConFas → pick any target format** (or choose **Auto / Pick target format…**) → output appears next to it in the newest format version (PDF→DOCX gives real OOXML `.docx`).
-3. **Clean output folders (opt-in diagnostic logs):** By default, ConFas writes zero `*.confas-debug.txt` log files when converting. If needed for troubleshooting, run `ConFas.exe config debug=onerror` or `debug=always` to save logs inside `%USERPROFILE%\.confas\debug\`.
-4. Bonus: drop files into **`%USERPROFILE%\ConFasDrop`** → auto-converted.
+2. **Right-click a document → Convert with ClickShift → pick any target format** (or select multiple images and convert to `PDF`, `DOCX`, or `PPTX` in selection order).
+3. **Clean output folders (opt-in diagnostic logs):** By default, ClickShift writes zero `*.clickshift-debug.txt` log files when converting. If needed for troubleshooting, run `ClickShift.exe config debug=onerror` or `debug=always` to save logs inside `%USERPROFILE%\.clickshift\debug\`.
+4. Bonus: drop files into **`%USERPROFILE%\ClickShiftDrop`** → auto-converted.
 
 CLI (same binary):
 ```bat
-ConFas.exe convert report.pdf                     REM -> report.docx (latest gen)
-ConFas.exe convert report.pdf --choose            REM native cursor popup with all valid targets
-ConFas.exe convert report.pdf --debug             REM always emit report.pdf.confas-debug.txt
-ConFas.exe convert a.doc b.xls -t pdf             REM batch, parallel
-ConFas.exe status                                 REM detected backends / registration
-ConFas.exe stats                                  REM learned per-backend performance
-ConFas.exe config auto_target=docx watch_folder=D:\drop ml=on win11_both_menus=on
-ConFas.exe uninstall                              REM removes startup entry + menus
+ClickShift.exe convert report.pdf                     REM -> report.docx (latest gen)
+ClickShift.exe convert report.pdf --choose            REM native cursor popup with all valid targets
+ClickShift.exe convert img1.png img2.jpg -t pdf       REM combine ordered images into one PDF
+ClickShift.exe convert a.doc b.xls -t pdf             REM batch, parallel
+ClickShift.exe status                                 REM detected backends / registration
+ClickShift.exe stats                                  REM learned per-backend performance
+ClickShift.exe config auto_target=docx ml=on auto_update=on update_interval_s=43200
+ClickShift.exe uninstall                              REM removes startup entry + menus
 ```
 
 ## Repository layout
 ```
-src/confas/engine.py     conversion engine + 5-stage PDF->DOCX & newest-gen backend routing
-src/confas/learning.py   10-dim content-aware LinUCB bandit (Sherman-Morrison + discounting)
-src/confas/cloud.py      opt-in privacy-safe pooled learnings sync (GitHub Gist / HTTPS)
-src/confas/monitor.py    tray daemon, warm IPC server, watch folder, Win11 + classic menu installer
-src/confas/cli.py        command line / right-click entry point + native format picker popup
-src/confas/updater.py    GitHub auto-updater, release prompt, progress popup, and Windows self-replacer
-src/confas/debuglog.py   opt-in per-conversion diagnostic report writer
-entry_point.py           frozen-EXE entry (double-click = install + run forever)
-build.py / confas.spec   PyInstaller single-file EXE build configuration
-scripts/install.ps1      one-shot Windows setup
-scripts/make_icon.py     generates assets/confas.ico
-tests/                   60+ cross-platform tests (engine, ML, cloud sync, daemon, updater, debuglog)
-.github/workflows/       CI: build.yml (tests + EXE artifact + latest release) & release.yml
+src/clickshift/engine.py     conversion engine + 5-stage PDF->DOCX & newest-gen backend routing
+src/clickshift/learning.py   10-dim content-aware LinUCB bandit (Sherman-Morrison + discounting)
+src/clickshift/cloud.py      opt-in privacy-safe pooled learnings sync (GitHub Gist / HTTPS)
+src/clickshift/monitor.py    tray daemon, warm IPC, 12h auto-update loop, watch folder, menu installer
+src/clickshift/cli.py        command line / right-click entry point + native format picker popup
+src/clickshift/updater.py    GitHub silent background & interactive updater + update notifications
+src/clickshift/debuglog.py   opt-in per-conversion diagnostic report writer
+entry_point.py               frozen-EXE entry (double-click = install + run forever)
+build.py / clickshift.spec   PyInstaller single-file EXE build configuration
+scripts/install.ps1          one-shot Windows setup
+scripts/make_icon.py         generates assets/clickshift.ico
+tests/                       cross-platform tests (engine, ML, cloud sync, daemon, updater, debuglog)
+.github/workflows/           CI: build.yml (tests + EXE artifact + latest release) & release.yml
 ```
 
 ## Requirements

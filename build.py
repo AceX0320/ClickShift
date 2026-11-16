@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """One-shot builder: creates the Windows EXE with PyInstaller.
 Run on Windows:      python build.py
-Produces:            dist/ConFas.exe   (single file, windowed/no-console)
+Produces:            dist/ClickShift-v<ver>.exe   (single file, windowed/no-console)
 The same script sanity-checks imports before freezing so you get an early,
 clear error instead of a broken EXE.
 """
@@ -12,24 +12,24 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 SRC = ROOT / "src"
-SPEC = ROOT / "confas.spec"
+SPEC = ROOT / "clickshift.spec"
 
 
 def check_imports() -> None:
     sys.path.insert(0, str(SRC))
-    import confas.engine, confas.learning, confas.monitor, confas.cli, confas.cloud, confas.debuglog, confas.updater  # noqa: F401
+    import clickshift.engine, clickshift.learning, clickshift.monitor, clickshift.cli, clickshift.cloud, clickshift.debuglog, clickshift.updater  # noqa: F401
     print("imports OK")
 
 
 def _app_version() -> str:
     sys.path.insert(0, str(SRC))
-    from confas import __version__
+    from clickshift import __version__
     return __version__
 
 
 def build() -> int:
     ver = _app_version()
-    exe_name = f"ConFas-v{ver}"
+    exe_name = f"ClickShift-v{ver}"
     args = [
         sys.executable, "-m", "PyInstaller",
         "--noconfirm", "--clean",
@@ -65,20 +65,20 @@ def build() -> int:
         "--hidden-import", "pywintypes",
         "--hidden-import", "pystray",
         "--hidden-import", "pystray._win32",
-        "--hidden-import", "confas.engine",
-        "--hidden-import", "confas.learning",
-        "--hidden-import", "confas.monitor",
-        "--hidden-import", "confas.cli",
-        "--hidden-import", "confas.cloud",
-        "--hidden-import", "confas.debuglog",
-        "--hidden-import", "confas.updater",
+        "--hidden-import", "clickshift.engine",
+        "--hidden-import", "clickshift.learning",
+        "--hidden-import", "clickshift.monitor",
+        "--hidden-import", "clickshift.cli",
+        "--hidden-import", "clickshift.cloud",
+        "--hidden-import", "clickshift.debuglog",
+        "--hidden-import", "clickshift.updater",
         "--hidden-import", "tkinter",
         "--hidden-import", "tkinter.ttk",
     ]
     assets_dir = ROOT / "assets"
     if assets_dir.exists():
         args += ["--add-data", f"{assets_dir}{os.pathsep}assets"]
-    icon = assets_dir / "confas.ico"
+    icon = assets_dir / "clickshift.ico"
     if icon.exists():
         args += ["--icon", str(icon)]
     args.append(str(ROOT / "entry_point.py"))

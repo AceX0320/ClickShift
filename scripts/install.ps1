@@ -1,8 +1,8 @@
-# ConFas one-click installer (run in an ordinary PowerShell - no admin needed).
+# ClickShift one-click installer (run in an ordinary PowerShell - no admin needed).
 #   powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
-Write-Host "== ConFas setup ==" -ForegroundColor Cyan
+Write-Host "== ClickShift setup ==" -ForegroundColor Cyan
 
 # 1. Python check
 $py = Get-Command python -ErrorAction SilentlyContinue
@@ -19,11 +19,11 @@ python -m venv .venv
 & ".\.venv\Scripts\python.exe" build.py
 if ($LASTEXITCODE -ne 0) { Pop-Location; Write-Host "Build failed." -ForegroundColor Red; exit 1 }
 
-# 4. Place the EXE in %LOCALAPPDATA%\ConFas and run first-time setup
-$dest = Join-Path $env:LOCALAPPDATA "ConFas"
+# 4. Place the EXE in %LOCALAPPDATA%\ClickShift and run first-time setup
+$dest = Join-Path $env:LOCALAPPDATA "ClickShift"
 New-Item -ItemType Directory -Force -Path $dest | Out-Null
-$builtExe = Get-ChildItem ".\dist\ConFas*.exe" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-if (-not $builtExe) { Pop-Location; Write-Host "No ConFas EXE found in dist\." -ForegroundColor Red; exit 1 }
+$builtExe = Get-ChildItem ".\dist\ClickShift*.exe" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+if (-not $builtExe) { Pop-Location; Write-Host "No ClickShift EXE found in dist\." -ForegroundColor Red; exit 1 }
 $installedExe = Join-Path $dest $builtExe.Name
 Copy-Item $builtExe.FullName $installedExe -Force
 Start-Process -FilePath $installedExe -ArgumentList "install" -Wait
@@ -34,5 +34,5 @@ Write-Host ""
 Write-Host "Done!" -ForegroundColor Green
 Write-Host "  * $($builtExe.Name) installed to $dest"
 Write-Host "  * Registered in Startup apps (check Task Manager > Startup apps)"
-Write-Host "  * Right-click any document in Explorer -> 'Convert with ConFas'"
-Write-Host "  * Drop files into ~\ConFasDrop for automatic conversion"
+Write-Host "  * Right-click any document in Explorer -> 'Convert with ClickShift'"
+Write-Host "  * Drop files into ~\ClickShiftDrop for automatic conversion"

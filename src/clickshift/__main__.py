@@ -1,4 +1,4 @@
-"""`python -m confas ...` entry point."""
+"""`python -m clickshift ...` entry point."""
 import sys
 
 from .cli import main

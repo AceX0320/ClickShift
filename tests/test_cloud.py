@@ -8,8 +8,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import numpy as np  # noqa: E402
 
-from confas import cloud  # noqa: E402
-from confas.learning import BanditSelector, _features, DIM  # noqa: E402
+from clickshift import cloud  # noqa: E402
+from clickshift.learning import BanditSelector, _features, DIM  # noqa: E402
 
 
 def _mk_state(seed, n_updates=8, arm="pdf>docx|libreoffice"):
@@ -49,7 +49,7 @@ def test_merge_empty_and_bad():
 
 
 def test_selector_records_and_warms(tmp_path, monkeypatch):
-    monkeypatch.setenv("CONFAS_HOME", str(tmp_path))
+    monkeypatch.setenv("CLICKSHIFT_HOME", str(tmp_path))
     sel = BanditSelector(history_file=tmp_path / "history.jsonl")
     src = tmp_path / "a.pdf"
     src.write_bytes(b"x" * 100)
@@ -67,8 +67,8 @@ def test_selector_records_and_warms(tmp_path, monkeypatch):
 
 
 def test_cloudsync_disabled_by_default(tmp_path, monkeypatch):
-    monkeypatch.setenv("CONFAS_HOME", str(tmp_path))
-    from confas.monitor import load_config
+    monkeypatch.setenv("CLICKSHIFT_HOME", str(tmp_path))
+    from clickshift.monitor import load_config
     sel = BanditSelector(history_file=tmp_path / "history.jsonl")
     cs = cloud.CloudSync(sel, load_config())
     assert not cs.enabled()               # opt-in only
@@ -77,7 +77,7 @@ def test_cloudsync_disabled_by_default(tmp_path, monkeypatch):
 
 
 def test_cloudsync_pull_merges_local(tmp_path, monkeypatch):
-    monkeypatch.setenv("CONFAS_HOME", str(tmp_path))
+    monkeypatch.setenv("CLICKSHIFT_HOME", str(tmp_path))
     sel = BanditSelector(history_file=tmp_path / "history.jsonl")
     cfg = {"cloud_enabled": True, "cloud_mode": "url",
            "cloud_url": "https://example.invalid"}
@@ -94,7 +94,7 @@ def test_cloudsync_pull_merges_local(tmp_path, monkeypatch):
 
 
 def test_push_payload_has_no_filenames(tmp_path, monkeypatch):
-    monkeypatch.setenv("CONFAS_HOME", str(tmp_path))
+    monkeypatch.setenv("CLICKSHIFT_HOME", str(tmp_path))
     sel = BanditSelector(history_file=tmp_path / "history.jsonl")
     src = tmp_path / "secret_report.pdf"
     src.write_bytes(b"x" * 10)
@@ -115,8 +115,8 @@ def test_push_payload_has_no_filenames(tmp_path, monkeypatch):
 
 
 def test_engine_attaches_cloud(tmp_path, monkeypatch):
-    monkeypatch.setenv("CONFAS_HOME", str(tmp_path))
-    from confas.engine import ConversionEngine
+    monkeypatch.setenv("CLICKSHIFT_HOME", str(tmp_path))
+    from clickshift.engine import ConversionEngine
     eng = ConversionEngine(enable_ml=True, history_file=tmp_path / "history.jsonl")
     assert eng._selector is not None
     assert eng.cloud is not None               # CloudSync object exists...
@@ -138,7 +138,7 @@ def test_https_only_guard():
 
 
 def test_non_https_push_and_pull_refused(tmp_path, monkeypatch):
-    monkeypatch.setenv("CONFAS_HOME", str(tmp_path))
+    monkeypatch.setenv("CLICKSHIFT_HOME", str(tmp_path))
     sel = BanditSelector(history_file=tmp_path / "history.jsonl")
     calls = []
     def spy(url, method="GET", body=None, headers=None, timeout=15):
@@ -153,7 +153,7 @@ def test_non_https_push_and_pull_refused(tmp_path, monkeypatch):
 
 def test_import_state_rejects_poisoned_arms(tmp_path, monkeypatch):
     """A hostile pooled state can never corrupt the local bandit."""
-    monkeypatch.setenv("CONFAS_HOME", str(tmp_path))
+    monkeypatch.setenv("CLICKSHIFT_HOME", str(tmp_path))
     sel = BanditSelector(history_file=tmp_path / "history.jsonl")
     d = sel.bandit.dim
     good = {"A": (np.eye(d) * 0.1).tolist(), "b": [0.5] * d, "n": 10}
@@ -197,7 +197,7 @@ def test_response_size_cap(monkeypatch):
 
 
 def test_token_saved_owner_only(tmp_path, monkeypatch):
-    monkeypatch.setenv("CONFAS_HOME", str(tmp_path))
+    monkeypatch.setenv("CLICKSHIFT_HOME", str(tmp_path))
     p = cloud.save_token("ghp_secret123")
     assert p.read_text() == "ghp_secret123"
     mode = p.stat().st_mode & 0o777

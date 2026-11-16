@@ -1,4 +1,4 @@
-"""ConFas adaptive learning (lightweight ML) for backend selection.
+"""ClickShift adaptive learning (lightweight ML) for backend selection.
 
 Why this exists
 ---------------
@@ -22,15 +22,15 @@ Reward combines speed and success:
     r = success(0/1) * 1.0  -  penalty for latency  =  success - 0.5*log(ms/median_ms)
 
 so the selector converges to the backend that is both reliable and fast.
-Every completed conversion is appended to ``~/.confas/history.jsonl`` which
-doubles as an audit log (visible via ``confas stats``).
+Every completed conversion is appended to ``~/.clickshift/history.jsonl`` which
+doubles as an audit log (visible via ``clickshift stats``).
 
 Cold start: until enough samples exist, static engine weights are used; the
 bandit only *re-orders* candidates, it never removes fallbacks, therefore
 correctness can never degrade - worst case the first attempt fails and the
 engine transparently retries the next backend.
 
-Set environment variable ``CONFAS_DISABLE_ML=1`` to switch this off entirely
+Set environment variable ``CLICKSHIFT_DISABLE_ML=1`` to switch this off entirely
 (the "scratch that part" option - everything still works).
 """
 
@@ -49,7 +49,7 @@ from typing import Any, Optional
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    __package__ = "confas"
+    __package__ = "clickshift"
 
 def _opt_import(name: str) -> Any:
     try:
@@ -272,7 +272,7 @@ class BanditSelector:
     def __init__(self, history_file: Optional[Path] = None) -> None:
         if not _HAVE_NUMPY:
             raise RuntimeError("numpy required for ML selector")
-        self.data_dir = (history_file or Path.home() / ".confas" / "history.jsonl").parent
+        self.data_dir = (history_file or Path.home() / ".clickshift" / "history.jsonl").parent
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.history_file = self.data_dir / "history.jsonl"
         self.state_file = self.data_dir / "bandit.json"
@@ -283,7 +283,7 @@ class BanditSelector:
         self._load_state()
 
     def attach_cloud(self, cloud: Any) -> None:
-        """Wire a confas.cloud.CloudSync instance into this selector."""
+        """Wire a clickshift.cloud.CloudSync instance into this selector."""
         self.cloud = cloud
 
     # -- persistence -------------------------------------------------------- #

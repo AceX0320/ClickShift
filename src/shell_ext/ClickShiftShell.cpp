@@ -1,5 +1,5 @@
-// ConFasShell.cpp — Windows 11 IExplorerCommand + IEnumExplorerCommand shell extension
-// Provides the expandable "Convert with ConFas >" menu in the primary Windows 11 right-click menu.
+// ClickShiftShell.cpp — Windows 11 IExplorerCommand + IEnumExplorerCommand shell extension
+// Provides the expandable "Convert with ClickShift >" menu in the primary Windows 11 right-click menu.
 
 #define UNICODE
 #define _UNICODE
@@ -21,9 +21,9 @@ static CRITICAL_SECTION g_cs;
 static bool g_csInit = false;
 static std::wstring g_lastExt;
 
-// {9F4E7A21-6C5B-4D8E-B3A1-7C8E9F0A1B2C}
-static const CLSID CLSID_ConFasExplorerCommand = {
-    0x9f4e7a21, 0x6c5b, 0x4d8e, {0xb3, 0xa1, 0x7c, 0x8e, 0x9f, 0x0a, 0x1b, 0x2c}
+// {A7C2D814-3E5F-4B9C-9A12-8D4E6F0C3A5E}
+static const CLSID CLSID_ClickShiftExplorerCommand = {
+    0xa7c2d814, 0x3e5f, 0x4b9c, {0x9a, 0x12, 0x8d, 0x4e, 0x6f, 0x0c, 0x3a, 0x5e}
 };
 
 struct ExtRule {
@@ -149,10 +149,10 @@ static std::wstring GetCachedExt() {
     return out;
 }
 
-static std::wstring GetConFasExePath() {
+static std::wstring GetClickShiftExePath() {
     wchar_t buf[MAX_PATH * 2] = {0};
     DWORD cb = sizeof(buf);
-    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\ConFas", L"ExePath",
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\ClickShift", L"ExePath",
                      RRF_RT_REG_SZ, nullptr, buf, &cb) == ERROR_SUCCESS && buf[0]) {
         if (GetFileAttributesW(buf) != INVALID_FILE_ATTRIBUTES) {
             return std::wstring(buf);
@@ -160,14 +160,14 @@ static std::wstring GetConFasExePath() {
     }
     wchar_t localApp[MAX_PATH] = {0};
     if (GetEnvironmentVariableW(L"LOCALAPPDATA", localApp, MAX_PATH) > 0) {
-        std::wstring candidate = std::wstring(localApp) + L"\\ConFas\\ConFas.exe";
+        std::wstring candidate = std::wstring(localApp) + L"\\ClickShift\\ClickShift.exe";
         if (GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES) {
             return candidate;
         }
     }
     cb = sizeof(buf);
     if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
-                     L"ConFas", RRF_RT_REG_SZ, nullptr, buf, &cb) == ERROR_SUCCESS && buf[0]) {
+                     L"ClickShift", RRF_RT_REG_SZ, nullptr, buf, &cb) == ERROR_SUCCESS && buf[0]) {
         std::wstring cmd(buf);
         if (!cmd.empty() && cmd[0] == L'"') {
             size_t endQ = cmd.find(L'"', 1);
@@ -186,21 +186,21 @@ static std::wstring GetIconString() {
     wchar_t modPath[MAX_PATH] = {0};
     if (GetModuleFileNameW(g_hModule, modPath, MAX_PATH) > 0) {
         PathRemoveFileSpecW(modPath);
-        std::wstring ico = std::wstring(modPath) + L"\\confas.ico";
+        std::wstring ico = std::wstring(modPath) + L"\\clickshift.ico";
         if (GetFileAttributesW(ico.c_str()) != INVALID_FILE_ATTRIBUTES) {
             return ico;
         }
     }
-    std::wstring exe = GetConFasExePath();
+    std::wstring exe = GetClickShiftExePath();
     if (!exe.empty()) {
         return exe + L",0";
     }
     return L"shell32.dll,-154";
 }
 
-static void LaunchConFas(IShellItemArray* psiArray, const std::wstring& target, bool chooseMode) {
+static void LaunchClickShift(IShellItemArray* psiArray, const std::wstring& target, bool chooseMode) {
     if (!psiArray) return;
-    std::wstring exe = GetConFasExePath();
+    std::wstring exe = GetClickShiftExePath();
     if (exe.empty()) return;
 
     DWORD count = 0;
@@ -245,7 +245,7 @@ static void LaunchConFas(IShellItemArray* psiArray, const std::wstring& target, 
 // ---------------------------------------------------------------------------
 // Sub-command item (Auto, Convert to <EXT>, or Choose format...)
 // ---------------------------------------------------------------------------
-class ConFasSubCommand : public IExplorerCommand, public IObjectWithSite {
+class ClickShiftSubCommand : public IExplorerCommand, public IObjectWithSite {
     LONG m_cRef;
     IUnknown* m_pSite;
     std::wstring m_title;
@@ -254,12 +254,12 @@ class ConFasSubCommand : public IExplorerCommand, public IObjectWithSite {
     bool m_isChoose;
 
 public:
-    ConFasSubCommand(const std::wstring& title, const std::wstring& target, bool isAuto, bool isChoose)
+    ClickShiftSubCommand(const std::wstring& title, const std::wstring& target, bool isAuto, bool isChoose)
         : m_cRef(1), m_pSite(nullptr), m_title(title), m_target(target), m_isAuto(isAuto), m_isChoose(isChoose) {
         InterlockedIncrement(&g_cDllRef);
     }
 
-    ~ConFasSubCommand() {
+    ~ClickShiftSubCommand() {
         if (m_pSite) m_pSite->Release();
         InterlockedDecrement(&g_cDllRef);
     }
@@ -354,7 +354,7 @@ public:
     }
 
     IFACEMETHODIMP Invoke(IShellItemArray* psiItemArray, IBindCtx*) override {
-        LaunchConFas(psiItemArray, m_target, m_isChoose);
+        LaunchClickShift(psiItemArray, m_target, m_isChoose);
         return S_OK;
     }
 
@@ -373,38 +373,38 @@ public:
 // ---------------------------------------------------------------------------
 // Sub-command enumerator
 // ---------------------------------------------------------------------------
-class ConFasEnumCommands : public IEnumExplorerCommand {
+class ClickShiftEnumCommands : public IEnumExplorerCommand {
     LONG m_cRef;
     std::vector<IExplorerCommand*> m_cmds;
     size_t m_idx;
 
 public:
-    ConFasEnumCommands(const std::wstring& ext) : m_cRef(1), m_idx(0) {
+    ClickShiftEnumCommands(const std::wstring& ext) : m_cRef(1), m_idx(0) {
         InterlockedIncrement(&g_cDllRef);
         const ExtRule* rule = FindRule(ext);
         std::wstring autoTitle = L"Auto - Convert to latest format";
         if (rule && rule->defaultTarget) {
             autoTitle = L"Auto - Convert to " + ToUpper(rule->defaultTarget) + L" (latest format)";
         }
-        m_cmds.push_back(new ConFasSubCommand(autoTitle, L"", true, false));
+        m_cmds.push_back(new ClickShiftSubCommand(autoTitle, L"", true, false));
 
         if (rule) {
             for (int i = 0; rule->targets[i] != nullptr; ++i) {
                 std::wstring t = rule->targets[i];
                 std::wstring label = L"Convert to " + ToUpper(t);
-                m_cmds.push_back(new ConFasSubCommand(label, t, false, false));
+                m_cmds.push_back(new ClickShiftSubCommand(label, t, false, false));
             }
         } else {
             for (int i = 0; kAllTargets[i] != nullptr; ++i) {
                 std::wstring t = kAllTargets[i];
                 std::wstring label = L"Convert to " + ToUpper(t);
-                m_cmds.push_back(new ConFasSubCommand(label, t, false, false));
+                m_cmds.push_back(new ClickShiftSubCommand(label, t, false, false));
             }
         }
-        m_cmds.push_back(new ConFasSubCommand(L"Choose format...", L"", false, true));
+        m_cmds.push_back(new ClickShiftSubCommand(L"Choose format...", L"", false, true));
     }
 
-    ~ConFasEnumCommands() {
+    ~ClickShiftEnumCommands() {
         for (auto* c : m_cmds) c->Release();
         InterlockedDecrement(&g_cDllRef);
     }
@@ -461,19 +461,19 @@ public:
 };
 
 // ---------------------------------------------------------------------------
-// Root "Convert with ConFas >" command
+// Root "Convert with ClickShift >" command
 // ---------------------------------------------------------------------------
-class ConFasRootCommand : public IExplorerCommand, public IObjectWithSite {
+class ClickShiftRootCommand : public IExplorerCommand, public IObjectWithSite {
     LONG m_cRef;
     IUnknown* m_pSite;
     std::wstring m_ext;
 
 public:
-    ConFasRootCommand() : m_cRef(1), m_pSite(nullptr) {
+    ClickShiftRootCommand() : m_cRef(1), m_pSite(nullptr) {
         InterlockedIncrement(&g_cDllRef);
     }
 
-    ~ConFasRootCommand() {
+    ~ClickShiftRootCommand() {
         if (m_pSite) m_pSite->Release();
         InterlockedDecrement(&g_cDllRef);
     }
@@ -527,7 +527,7 @@ public:
             m_ext = ext;
             SetCachedExt(ext);
         }
-        return SHStrDupW(L"Convert with ConFas", ppszName);
+        return SHStrDupW(L"Convert with ClickShift", ppszName);
     }
 
     IFACEMETHODIMP GetIcon(IShellItemArray* psiItemArray, LPWSTR* ppszIcon) override {
@@ -548,7 +548,7 @@ public:
 
     IFACEMETHODIMP GetCanonicalName(GUID* pguidCommandName) override {
         if (!pguidCommandName) return E_POINTER;
-        *pguidCommandName = CLSID_ConFasExplorerCommand;
+        *pguidCommandName = CLSID_ClickShiftExplorerCommand;
         return S_OK;
     }
 
@@ -568,7 +568,7 @@ public:
     }
 
     IFACEMETHODIMP Invoke(IShellItemArray* psiItemArray, IBindCtx*) override {
-        LaunchConFas(psiItemArray, L"", false);
+        LaunchClickShift(psiItemArray, L"", false);
         return S_OK;
     }
 
@@ -581,7 +581,7 @@ public:
     IFACEMETHODIMP EnumSubCommands(IEnumExplorerCommand** ppEnum) override {
         if (!ppEnum) return E_POINTER;
         std::wstring ext = m_ext.empty() ? GetCachedExt() : m_ext;
-        *ppEnum = new ConFasEnumCommands(ext);
+        *ppEnum = new ClickShiftEnumCommands(ext);
         return S_OK;
     }
 };
@@ -589,13 +589,13 @@ public:
 // ---------------------------------------------------------------------------
 // ClassFactory & DLL exports
 // ---------------------------------------------------------------------------
-class ConFasClassFactory : public IClassFactory {
+class ClickShiftClassFactory : public IClassFactory {
     LONG m_cRef;
 public:
-    ConFasClassFactory() : m_cRef(1) {
+    ClickShiftClassFactory() : m_cRef(1) {
         InterlockedIncrement(&g_cDllRef);
     }
-    ~ConFasClassFactory() {
+    ~ClickShiftClassFactory() {
         InterlockedDecrement(&g_cDllRef);
     }
 
@@ -622,7 +622,7 @@ public:
 
     IFACEMETHODIMP CreateInstance(IUnknown* pUnkOuter, REFIID riid, void** ppv) override {
         if (pUnkOuter) return CLASS_E_NOAGGREGATION;
-        ConFasRootCommand* cmd = new ConFasRootCommand();
+        ClickShiftRootCommand* cmd = new ClickShiftRootCommand();
         HRESULT hr = cmd->QueryInterface(riid, ppv);
         cmd->Release();
         return hr;
@@ -652,8 +652,8 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE hInstance, DWORD dwReason, LPVOID) {
 
 extern "C" HRESULT __stdcall DllGetClassObject(REFCLSID rclsid, REFIID riid, void** ppv) {
     if (!ppv) return E_POINTER;
-    if (rclsid == CLSID_ConFasExplorerCommand) {
-        ConFasClassFactory* cf = new ConFasClassFactory();
+    if (rclsid == CLSID_ClickShiftExplorerCommand) {
+        ClickShiftClassFactory* cf = new ClickShiftClassFactory();
         HRESULT hr = cf->QueryInterface(riid, ppv);
         cf->Release();
         return hr;

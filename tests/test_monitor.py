@@ -5,11 +5,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 _tmp = Path(__file__).parent / "_tmp_home"
-os.environ["CONFAS_HOME"] = str(_tmp)
-os.environ["CONFAS_DROP"] = str(_tmp / "drop")
+os.environ["CLICKSHIFT_HOME"] = str(_tmp)
+os.environ["CLICKSHIFT_DROP"] = str(_tmp / "drop")
 
-from confas import monitor  # noqa: E402
-from confas.monitor import WatchFolder  # noqa: E402
+from clickshift import monitor  # noqa: E402
+from clickshift.monitor import WatchFolder  # noqa: E402
 
 
 def test_config_roundtrip():
@@ -56,7 +56,7 @@ def test_all_choices_available_in_menus():
 
 
 def test_daemon_ipc_delegation(tmp_path, monkeypatch):
-    monkeypatch.setenv("CONFAS_HOME", str(tmp_path))
+    monkeypatch.setenv("CLICKSHIFT_HOME", str(tmp_path))
     src = tmp_path / "ipc_note.txt"
     src.write_text("Hello via warm daemon IPC\n", encoding="utf-8")
     srv = monitor.DaemonIPCServer({"ml_enabled": False})
@@ -76,7 +76,7 @@ def test_daemon_ipc_delegation(tmp_path, monkeypatch):
 
 
 def test_win11_shell_ext_skips_duplicate_classic_cascade(monkeypatch):
-    """When Win11 IExplorerCommand shell ext installs, remove registry ConFas.Menu
+    """When Win11 IExplorerCommand shell ext installs, remove registry ClickShift.Menu
     instead of writing a second cascading entry in the 'Show more options' menu."""
     deleted, written = [], []
     monkeypatch.setattr(monitor, "IS_WINDOWS", True)
@@ -107,15 +107,57 @@ def test_tray_icon_loads_new_asset_and_cli_install_quiet(tmp_path, monkeypatch):
     assert img.mode == "RGBA"
     assert img.size == (64, 64)
 
-    monkeypatch.setenv("CONFAS_NO_POPUP", "1")
-    monkeypatch.setenv("CONFAS_HOME", str(tmp_path))
+    monkeypatch.setenv("CLICKSHIFT_NO_POPUP", "1")
+    monkeypatch.setenv("CLICKSHIFT_HOME", str(tmp_path))
     monkeypatch.setattr(monitor, "DATA_DIR", tmp_path)
     monkeypatch.setitem(monitor.DEFAULT_CONFIG, "watch_folder", str(tmp_path / "drop"))
     monkeypatch.setattr(monitor, "install_context_menu", lambda **_kw: 3)
     monkeypatch.setattr(monitor, "register_startup", lambda: True)
     monkeypatch.setattr(monitor, "refresh_explorer", lambda: None)
 
-    from confas import cli
+    from clickshift import cli
     rc = cli.main(["install", "--quiet"])
     assert rc == 0
+
+
+def test_auto_update_12h_interval_and_background_check(tmp_path, monkeypatch):
+    assert monitor.DEFAULT_CONFIG["update_check_interval_s"] == 43200
+    monkeypatch.setenv("CLICKSHIFT_HOME", str(tmp_path))
+    monkeypatch.setattr(monitor, "DATA_DIR", tmp_path)
+
+    due, wait_s = monitor.update_check_due_in({"update_check_interval_s": 43200, "last_update_check_ts": 0.0}, now=1000.0)
+    assert due is True and wait_s == 0.0
+
+    due, wait_s = monitor.update_check_due_in({"update_check_interval_s": 43200, "last_update_check_ts": 1000.0}, now=4600.0)
+    assert due is False and wait_s == 43200 - 3600
+
+    due, wait_s = monitor.update_check_due_in({"update_check_interval_s": 43200, "last_update_check_ts": 1000.0}, now=1000.0 + 43200.0)
+    assert due is True and wait_s == 0.0
+
+    from clickshift import updater
+    fake_info = updater.ReleaseInfo(
+        tag_name="v1.0.99",
+        version="1.0.99",
+        download_url="https://github.com/AceX0320/ClickShift/releases/download/v1.0.99/ClickShift-v1.0.99.exe",
+    )
+    bg_calls = []
+
+    class _FakeUpdater:
+        @staticmethod
+        def check_for_update(current_version=""):
+            return fake_info
+
+        @staticmethod
+        def run_background_update(info, current_version="", on_before_restart=None):
+            bg_calls.append((info.tag_name, current_version))
+            return "updated"
+
+    res = monitor.perform_background_update_check(
+        current_version="1.0.18",
+        updater_mod=_FakeUpdater,
+        now=50_000.0,
+    )
+    assert res == "updated"
+    assert bg_calls == [("v1.0.99", "1.0.18")]
+    assert monitor.load_config()["last_update_check_ts"] == 50_000.0
 

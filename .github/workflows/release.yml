@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to publish (e.g. v1.0.17)"
+        description: "Release tag to publish (e.g. v1.0.18)"
         required: true
-        default: "v1.0.17"
+        default: "v1.0.18"
 
 permissions:
   contents: write
@@ -42,12 +42,12 @@ jobs:
       - name: Generate icon (if missing)
         shell: pwsh
         run: |
-          if (-not (Test-Path assets/confas.ico) -or -not (Test-Path assets/confas.png)) {
+          if (-not (Test-Path assets/clickshift.ico) -or -not (Test-Path assets/clickshift.png)) {
             python scripts/make_icon.py
           }
       - name: Build Win11 IExplorerCommand Shell Extension & MSIX
         run: powershell -ExecutionPolicy Bypass -File scripts/build_shell_ext.ps1
-      - name: Build versioned ConFas EXE
+      - name: Build versioned ClickShift EXE
         run: python build.py
       - name: Record build commit + timestamp (for freshness checks)
         shell: pwsh
@@ -62,10 +62,10 @@ jobs:
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: |
-            dist/ConFas-v*.exe
+            dist/ClickShift-v*.exe
             build-info.txt
           body: |
-            ## ConFas Windows EXE
+            ## ClickShift Windows EXE
 
             Latest release page:
             https://github.com/${{ github.repository }}/releases/latest

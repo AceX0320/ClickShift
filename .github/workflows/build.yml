@@ -37,30 +37,30 @@ jobs:
       - name: Generate icon (if missing)
         shell: pwsh
         run: |
-          if (-not (Test-Path assets/confas.ico) -or -not (Test-Path assets/confas.png)) {
+          if (-not (Test-Path assets/clickshift.ico) -or -not (Test-Path assets/clickshift.png)) {
             python scripts/make_icon.py
           }
       - name: Build Win11 IExplorerCommand Shell Extension & MSIX
         run: powershell -ExecutionPolicy Bypass -File scripts/build_shell_ext.ps1
-      - name: Build versioned ConFas EXE
+      - name: Build versioned ClickShift EXE
         run: python build.py
       - uses: actions/upload-artifact@v4
         with:
-          name: ConFas-windows-exe
-          path: dist/ConFas-v*.exe
+          name: ClickShift-windows-exe
+          path: dist/ClickShift-v*.exe
       - name: Publish latest GitHub Release (on main push)
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.17
-          name: ConFas v1.0.17 (Latest Build)
+          tag_name: v1.0.18
+          name: ClickShift v1.0.18 (Latest Build)
           make_latest: "true"
-          files: dist/ConFas-v*.exe
+          files: dist/ClickShift-v*.exe
           body: |
-            ## ConFas Windows EXE (v1.0.17)
+            ## ClickShift Windows EXE (v1.0.18)
 
             **Direct download:**
-            https://github.com/${{ github.repository }}/releases/download/v1.0.17/ConFas-v1.0.17.exe
+            https://github.com/${{ github.repository }}/releases/download/v1.0.18/ClickShift-v1.0.18.exe
 
             **Latest release page:**
             https://github.com/${{ github.repository }}/releases/latest

@@ -1,4 +1,4 @@
-"""GitHub auto-updater and branded setup/update progress UI for ConFas."""
+"""GitHub auto-updater and branded setup/update progress UI for ClickShift."""
 from __future__ import annotations
 
 import json
@@ -19,12 +19,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
-from confas import APP_NAME, __version__
+from clickshift import APP_NAME, __version__
 
 
 def _log_info(msg: str) -> None:
     try:
-        from confas import monitor
+        from clickshift import monitor
         monitor._log(msg)
     except Exception:
         pass
@@ -34,7 +34,7 @@ def _log_error(msg: str) -> None:
     _log_info(f"ERROR: {msg}")
 
 GITHUB_OWNER = "AceX0320"
-GITHUB_REPO = "ConFas"
+GITHUB_REPO = "ClickShift"
 LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
 TAGS_API = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/tags?per_page=10"
 RELEASE_BY_TAG_API = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/tags/{{tag}}"
@@ -56,7 +56,7 @@ _VERSION_RE = re.compile(r"^\s*v?(\d+(?:\.\d+)*)")
 
 @dataclass(frozen=True)
 class ReleaseInfo:
-    """Metadata for an available ConFas GitHub release."""
+    """Metadata for an available ClickShift GitHub release."""
 
     tag_name: str
     version: str
@@ -89,12 +89,12 @@ def is_newer_version(remote_version: str, current_version: str) -> bool:
 
 
 def find_icon_path() -> Optional[Path]:
-    """Locate bundled or repository assets/confas.ico without hardcoding user paths."""
+    """Locate bundled or repository assets/clickshift.ico without hardcoding user paths."""
     candidates: list[Path] = []
     meipass = getattr(sys, "_MEIPASS", None)
     if meipass:
-        candidates.append(Path(meipass) / "assets" / "confas.ico")
-    candidates.append(Path(__file__).resolve().parents[2] / "assets" / "confas.ico")
+        candidates.append(Path(meipass) / "assets" / "clickshift.ico")
+    candidates.append(Path(__file__).resolve().parents[2] / "assets" / "clickshift.ico")
     for p in candidates:
         if p.exists():
             return p
@@ -172,7 +172,7 @@ def parse_release_payload(data: object) -> Optional[ReleaseInfo]:
                 continue
             name = str(asset.get("name") or "")
             url = str(asset.get("browser_download_url") or "")
-            if name.lower().startswith("confas") and name.lower().endswith(".exe") and is_allowed_download_url(url):
+            if name.lower().startswith(("clickshift", "confas")) and name.lower().endswith(".exe") and is_allowed_download_url(url):
                 download_url = url
                 asset_size = int(asset.get("size") or 0)
                 break
@@ -321,6 +321,7 @@ def apply_windows_update(
     target_exe: Path,
     pid_to_wait: Optional[int] = None,
     new_exe_path: Optional[Path] = None,
+    relaunch_args: Optional[list[str]] = None,
 ) -> Path:
     """Spawn a detached Windows helper script that installs final_exe and relaunches it."""
     downloaded_exe = Path(downloaded_exe).resolve()
@@ -331,20 +332,21 @@ def apply_windows_update(
 
     pid = pid_to_wait or os.getpid()
     tmp_dir = Path(tempfile.gettempdir())
-    script = tmp_dir / f"confas_apply_update_{pid}.ps1"
-    log_path = tmp_dir / "confas_update.log"
+    script = tmp_dir / f"clickshift_apply_update_{pid}.ps1"
+    log_path = tmp_dir / "clickshift_update.log"
 
     def q(value: object) -> str:
         """PowerShell single-quoted literal."""
         return "'" + str(value).replace("'", "''") + "'"
 
-    # NOTE: a previous .cmd helper was launched DETACHED (no console); its child
-    # console tools (ping/tasklist) then received a console Ctrl-C which aborted
-    # the batch before it ever copied the new EXE.  PowerShell needs no console
-    # tools: it waits on the PID natively, retries the copy while antivirus
-    # scans the fresh download, clears PyInstaller's inherited environment so
-    # the new onefile EXE does not reuse the old (deleted) temp extraction dir,
-    # relaunches the app and self-deletes.
+    if relaunch_args:
+        arg_list = "@(" + ", ".join(q(a) for a in relaunch_args) + ")"
+        start_cmd = f"Start-Process -FilePath $dst -ArgumentList {arg_list} -WorkingDirectory (Split-Path -Parent $dst)"
+    else:
+        start_cmd = "Start-Process -FilePath $dst -WorkingDirectory (Split-Path -Parent $dst)"
+
+    # Wait on old PID natively via PowerShell (no console child tools), retry copy
+    # while AV scans the fresh download, reset PyInstaller env, relaunch, self-delete.
     ps = (
         "$ErrorActionPreference = 'Continue'\r\n"
         f"$src = {q(downloaded_exe)}\r\n"
@@ -377,7 +379,7 @@ def apply_windows_update(
         "}\r\n"
         "Get-ChildItem Env: | Where-Object { $_.Name -like '_MEIPASS2' -or $_.Name -like '_PYI_*' } | ForEach-Object { Remove-Item -LiteralPath (\"Env:\" + $_.Name) -ErrorAction SilentlyContinue }\r\n"
         "$env:PYINSTALLER_RESET_ENVIRONMENT = '1'\r\n"
-        "try { Start-Process -FilePath $dst -WorkingDirectory (Split-Path -Parent $dst); Log 'relaunched new EXE' }\r\n"
+        f"try {{ {start_cmd}; Log 'relaunched new EXE' }}\r\n"
         "catch { Log \"relaunch failed: $($_.Exception.Message)\" }\r\n"
         "Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue\r\n"
     )
@@ -407,18 +409,18 @@ def apply_windows_update(
 class InstallProgressPopup:
     """Thread-safe native progress window for setup and update feedback.
 
-    Suppressed automatically when CONFAS_NO_POPUP=1 or when tkinter is
+    Suppressed automatically when CLICKSHIFT_NO_POPUP=1 or when tkinter is
     unavailable in headless environments.
     """
 
     def __init__(
         self,
-        title: str = "ConFas Setup",
-        heading: str = "Setting up ConFas...",
+        title: str = "ClickShift Setup",
+        heading: str = "Setting up ClickShift...",
         enabled: Optional[bool] = None,
     ) -> None:
         if enabled is None:
-            enabled = (os.name == "nt") and (os.environ.get("CONFAS_NO_POPUP") != "1")
+            enabled = (os.name == "nt") and (os.environ.get("CLICKSHIFT_NO_POPUP") != "1")
         self.enabled = bool(enabled)
         self.title = title
         self.heading = heading
@@ -499,7 +501,7 @@ class InstallProgressPopup:
             except Exception:
                 pass
             style.configure(
-                "ConFas.Horizontal.TProgressbar",
+                "ClickShift.Horizontal.TProgressbar",
                 troughcolor="#1E293B",
                 background="#38BDF8",
                 bordercolor="#1E293B",
@@ -533,7 +535,7 @@ class InstallProgressPopup:
             bar_mode = {"indeterminate": True}
             bar = ttk.Progressbar(
                 frame,
-                style="ConFas.Horizontal.TProgressbar",
+                style="ClickShift.Horizontal.TProgressbar",
                 orient="horizontal",
                 length=386,
                 mode="indeterminate",
@@ -544,7 +546,7 @@ class InstallProgressPopup:
 
             detail_lbl = tk.Label(
                 frame,
-                text=f"ConFas v{__version__}",
+                text=f"ClickShift v{__version__}",
                 bg="#0F172A",
                 fg="#64748B",
                 font=("Segoe UI", 8),
@@ -621,12 +623,90 @@ class InstallProgressPopup:
             self._closed.set()
 
 
+def _norm_vtag(ver: str) -> str:
+    v = str(ver or "").strip()
+    return v if v.startswith("v") else f"v{v}"
+
+
+def _resolve_data_dir(data_dir: Optional[Path] = None) -> Path:
+    if data_dir is not None:
+        return Path(data_dir)
+    try:
+        from clickshift import monitor
+        return monitor.data_dir()
+    except Exception:
+        return Path(os.environ.get("CLICKSHIFT_HOME", str(Path.home() / ".clickshift")))
+
+
+def update_notice_file(data_dir: Optional[Path] = None) -> Path:
+    return _resolve_data_dir(data_dir) / "update_notice.json"
+
+
+def write_update_notice(
+    from_version: str,
+    to_version: str,
+    silent: bool = True,
+    data_dir: Optional[Path] = None,
+) -> Path:
+    """Persist pending post-update notification marker for the restarted process."""
+    p = update_notice_file(data_dir)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "from_version": _norm_vtag(from_version),
+        "to_version": _norm_vtag(to_version),
+        "silent": bool(silent),
+        "ts": time.time(),
+    }
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload), encoding="utf-8")
+    tmp.replace(p)
+    return p
+
+
+def peek_update_notice(data_dir: Optional[Path] = None) -> Optional[dict]:
+    """Read pending update notice without removing it."""
+    p = update_notice_file(data_dir)
+    try:
+        if not p.exists():
+            return None
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def consume_update_notice(data_dir: Optional[Path] = None) -> Optional[dict]:
+    """Read and clear the pending post-update notification marker."""
+    p = update_notice_file(data_dir)
+    data = peek_update_notice(data_dir)
+    try:
+        p.unlink(missing_ok=True)
+    except Exception:
+        pass
+    return data
+
+
+def format_update_notification(notice: dict) -> tuple[str, str]:
+    """Return (title, message) summarizing an applied auto-update."""
+    from_v = str(notice.get("from_version") or "").strip()
+    to_v = str(notice.get("to_version") or "").strip()
+    if from_v and to_v:
+        return (
+            f"{APP_NAME} Updated",
+            f"{APP_NAME} updated automatically from {from_v} to {to_v}.",
+        )
+    return (
+        f"{APP_NAME} Updated",
+        f"{APP_NAME} updated automatically to v{__version__}.",
+    )
+
+
 def prompt_update_dialog(info: ReleaseInfo, current_version: str = __version__) -> str:
     """Show a minimal update prompt with current/available version and an Update button.
 
     Returns 'update' or 'later'.
     """
-    if os.environ.get("CONFAS_NO_POPUP") == "1":
+    if os.environ.get("CLICKSHIFT_NO_POPUP") == "1":
         return "later"
 
     try:
@@ -638,7 +718,7 @@ def prompt_update_dialog(info: ReleaseInfo, current_version: str = __version__) 
                 res = ctypes.windll.user32.MessageBoxW(
                     0,
                     f"Current version: v{current_version}\nAvailable version: {info.tag_name}",
-                    "ConFas Update",
+                    "ClickShift Update",
                     0x04 | 0x40,
                 )
                 return "update" if res == 6 else "later"
@@ -648,7 +728,7 @@ def prompt_update_dialog(info: ReleaseInfo, current_version: str = __version__) 
 
     choice = {"value": "later"}
     root = tk.Tk()
-    root.title("ConFas Update")
+    root.title("ClickShift Update")
     root.resizable(False, False)
     root.configure(bg="#0F172A")
     try:
@@ -716,14 +796,55 @@ def prompt_update_dialog(info: ReleaseInfo, current_version: str = __version__) 
     return choice["value"]
 
 
+def run_background_update(
+    info: ReleaseInfo,
+    current_version: str = __version__,
+    on_before_restart: Optional[Callable[[], None]] = None,
+    is_frozen: Optional[bool] = None,
+    target_exe: Optional[Path] = None,
+    data_dir: Optional[Path] = None,
+) -> str:
+    """Silently download, apply, and restart ClickShift in the background without prompts.
+
+    Returns one of: 'updated', 'not_frozen', 'error'.
+    """
+    frozen = getattr(sys, "frozen", False) if is_frozen is None else is_frozen
+    if not frozen or sys.platform != "win32":
+        _log_info(f"updater: {info.tag_name} available (skipping silent replace in source/non-Windows run)")
+        return "not_frozen"
+
+    dest_exe = Path(target_exe or sys.executable).resolve()
+    versioned_exe = dest_exe.parent / f"{APP_NAME}-{info.tag_name}.exe"
+    staging_exe = Path(tempfile.gettempdir()) / f"ClickShift-update-{info.tag_name}.exe"
+
+    try:
+        _log_info(f"updater: silently downloading {info.tag_name} in background")
+        download_update(info.download_url, staging_exe)
+        write_update_notice(current_version, info.tag_name, silent=True, data_dir=data_dir)
+        apply_windows_update(
+            staging_exe,
+            dest_exe,
+            pid_to_wait=os.getpid(),
+            new_exe_path=versioned_exe,
+            relaunch_args=["--post-update"],
+        )
+        if on_before_restart is not None:
+            on_before_restart()
+        return "updated"
+    except Exception as e:
+        _log_error(f"updater: background update to {info.tag_name} failed: {e}")
+        return "error"
+
+
 def run_interactive_update(
     info: ReleaseInfo,
     current_version: str = __version__,
     on_before_restart: Optional[Callable[[], None]] = None,
     is_frozen: Optional[bool] = None,
     target_exe: Optional[Path] = None,
+    data_dir: Optional[Path] = None,
 ) -> str:
-    """Prompt the user, download the verified update, apply it, and restart ConFas.
+    """Prompt the user, download the verified update, apply it, and restart ClickShift.
 
     Returns one of: 'updated', 'opened_browser', 'later', 'skip', 'error'.
     """
@@ -738,15 +859,15 @@ def run_interactive_update(
 
     dest_exe = Path(target_exe or sys.executable).resolve()
     versioned_exe = dest_exe.parent / f"{APP_NAME}-{info.tag_name}.exe"
-    staging_exe = Path(tempfile.gettempdir()) / f"ConFas-update-{info.tag_name}.exe"
+    staging_exe = Path(tempfile.gettempdir()) / f"ClickShift-update-{info.tag_name}.exe"
 
     popup = InstallProgressPopup(
-        title="Updating ConFas",
-        heading=f"Updating to ConFas {info.tag_name}",
+        title="Updating ClickShift",
+        heading=f"Updating to ClickShift {info.tag_name}",
     ).start()
 
     try:
-        popup.update("Downloading new ConFas release...", progress=0.0, detail=info.tag_name)
+        popup.update("Downloading new ClickShift release...", progress=0.0, detail=info.tag_name)
 
         def on_progress(done: int, total: int) -> None:
             if total > 0:
@@ -754,24 +875,26 @@ def run_interactive_update(
                 mb_done = done / (1024 * 1024)
                 mb_tot = total / (1024 * 1024)
                 popup.update(
-                    f"Downloading ConFas {info.tag_name}...",
+                    f"Downloading ClickShift {info.tag_name}...",
                     progress=pct,
                     detail=f"{mb_done:.1f} MB / {mb_tot:.1f} MB",
                 )
             else:
                 popup.update(
-                    f"Downloading ConFas {info.tag_name}...",
+                    f"Downloading ClickShift {info.tag_name}...",
                     progress=None,
                     detail=f"{done / (1024 * 1024):.1f} MB downloaded",
                 )
 
         download_update(info.download_url, staging_exe, progress_cb=on_progress)
         popup.update("Installing update and restarting...", progress=98.0, detail="Replacing executable")
+        write_update_notice(current_version, info.tag_name, silent=False, data_dir=data_dir)
         apply_windows_update(
             staging_exe,
             dest_exe,
             pid_to_wait=os.getpid(),
             new_exe_path=versioned_exe,
+            relaunch_args=["--post-update"],
         )
         popup.complete(f"Restarting into {info.tag_name}...", delay_s=0.4)
         if on_before_restart is not None:

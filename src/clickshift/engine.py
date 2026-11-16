@@ -1,4 +1,4 @@
-"""ConFas conversion engine.
+"""ClickShift conversion engine.
 
 Design goals: SPEED + PERFECTION (lossless-fidelity conversions).
 
@@ -55,7 +55,7 @@ from xml.etree import ElementTree as ET
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    __package__ = "confas"
+    __package__ = "clickshift"
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -354,7 +354,7 @@ def _patch_pdf2docx_opacity() -> None:
     except Exception:
         return
     cls = getattr(mod, "RawPageFitz", None)
-    if cls is None or getattr(cls, "_confas_opacity_patched", False):
+    if cls is None or getattr(cls, "_clickshift_opacity_patched", False):
         return
 
     def _init_paths(self: Any, **settings: Any) -> Any:
@@ -362,7 +362,7 @@ def _patch_pdf2docx_opacity() -> None:
         return paths_mod.Paths(parent=self).restore(raw_paths)
 
     cls._init_paths = _init_paths
-    cls._confas_opacity_patched = True
+    cls._clickshift_opacity_patched = True
 
 
 _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -562,7 +562,7 @@ def lo_convert(src: Path, dst: Path, extra: Optional[list[str]] = None) -> None:
     dst_ext = dst.suffix.lstrip(".").lower()
     src_ext = src.suffix.lstrip(".").lower()
     filt = _LO_FILTERS.get(dst_ext)
-    prof_dir = Path(tempfile.gettempdir()) / f"confas_lo_profile_{os.getpid()}_{threading.get_ident()}"
+    prof_dir = Path(tempfile.gettempdir()) / f"clickshift_lo_profile_{os.getpid()}_{threading.get_ident()}"
     prof_uri = prof_dir.resolve().as_uri()
     args = [
         BACKENDS.libreoffice, "--headless", "--norestore", "--nologo", "--nofirststartwizard",
@@ -624,7 +624,7 @@ class _OfficeStaWorker:
         with self._lock:
             if self._thread is None or not self._thread.is_alive():
                 self._thread = threading.Thread(
-                    target=self._loop, daemon=True, name=f"confas-com-{self.app_name}"
+                    target=self._loop, daemon=True, name=f"clickshift-com-{self.app_name}"
                 )
                 self._thread.start()
 
@@ -1178,7 +1178,10 @@ def conv_images_to_docx(srcs: list[Path], dst: Path) -> None:
         raise ValueError("No images provided")
     docx_mod: Any = importlib.import_module("docx")
     docx_shared: Any = importlib.import_module("docx.shared")
+    docx_text_enum: Any = importlib.import_module("docx.enum.text")
     Inches = docx_shared.Inches
+    Pt = docx_shared.Pt
+    WD_ALIGN_PARAGRAPH = docx_text_enum.WD_ALIGN_PARAGRAPH
 
     doc = docx_mod.Document()
     sec = doc.sections[0]
@@ -1186,15 +1189,26 @@ def conv_images_to_docx(srcs: list[Path], dst: Path) -> None:
     sec.bottom_margin = Inches(0.6)
     sec.left_margin = Inches(0.6)
     sec.right_margin = Inches(0.6)
-    max_w_in = float(sec.page_width.inches - sec.left_margin.inches - sec.right_margin.inches)
-    max_h_in = float(sec.page_height.inches - sec.top_margin.inches - sec.bottom_margin.inches)
+    # Leave a small height cushion so Word's line-descent / rounding never pushes
+    # an exact-fit image or its break onto a blank separator page.
+    max_w_in = float(sec.page_width.inches - sec.left_margin.inches - sec.right_margin.inches) - 0.05
+    max_h_in = float(sec.page_height.inches - sec.top_margin.inches - sec.bottom_margin.inches) - 0.15
 
     for idx, src in enumerate(srcs):
+        p = doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p.paragraph_format.space_before = Pt(0)
+        p.paragraph_format.space_after = Pt(0)
+        p.paragraph_format.line_spacing = 1.0
         if idx > 0:
-            doc.add_page_break()
+            p.paragraph_format.page_break_before = True
         stream, w_px, h_px = _image_to_png_stream(src)
         scale = min(max_w_in / max(1, w_px), max_h_in / max(1, h_px))
-        doc.add_picture(stream, width=Inches(max(0.5, w_px * scale)))
+        p.add_run().add_picture(
+            stream,
+            width=Inches(max(0.5, w_px * scale)),
+            height=Inches(max(0.5, h_px * scale)),
+        )
 
     doc.save(str(dst))
 
@@ -2429,7 +2443,7 @@ def conv_pptx_to_pdf(src: Path, dst: Path) -> None:
 def conv_via_docx_to_pptx(src: Path, dst: Path) -> None:
     """Convert non-DOCX documents (txt/md/html/doc/odt/rtf) -> temp .docx -> .pptx."""
     s = src.suffix.lstrip(".").lower()
-    with tempfile.TemporaryDirectory(prefix="confas_pptx_") as td:
+    with tempfile.TemporaryDirectory(prefix="clickshift_pptx_") as td:
         tmp_docx = Path(td) / f"{src.stem}.docx"
         if s in TEXT_EXTS:
             if s in ("html", "htm") and BACKENDS.libreoffice:
@@ -2447,7 +2461,7 @@ def conv_via_docx_to_pptx(src: Path, dst: Path) -> None:
 
 def conv_via_pptx_to_docx(src: Path, dst: Path) -> None:
     """Convert legacy/open slide formats (.ppt/.odp) -> temp .pptx -> .docx."""
-    with tempfile.TemporaryDirectory(prefix="confas_docx_") as td:
+    with tempfile.TemporaryDirectory(prefix="clickshift_docx_") as td:
         tmp_pptx = Path(td) / f"{src.stem}.pptx"
         if IS_WINDOWS and "powerpoint" in BACKENDS.office_app:
             conv_office_com(src, tmp_pptx)
@@ -2661,7 +2675,7 @@ def conv_pages_to_image_folder(src: Path, out_dir: Path, ext: str) -> None:
         if s in ("pdf", "xps", "epub"):
             _render_pdf_pages(src, out_dir, ext)
             return
-        with tempfile.TemporaryDirectory(prefix="confas_pages_") as td:
+        with tempfile.TemporaryDirectory(prefix="clickshift_pages_") as td:
             tmp_pdf = Path(td) / f"{src.stem}.pdf"
             last_err = ""
             for r in _routes_for(s, "pdf"):
@@ -2886,13 +2900,13 @@ class ConversionEngine:
     """Thread-safe orchestrator with optional ML backend selection."""
 
     def __init__(self, enable_ml: bool = True, history_file: Optional[Path] = None) -> None:
-        self.enable_ml = enable_ml and os.environ.get("CONFAS_DISABLE_ML") != "1"
+        self.enable_ml = enable_ml and os.environ.get("CLICKSHIFT_DISABLE_ML") != "1"
         self._selector: Any = None
         self.cloud: Any = None
         if self.enable_ml:
             try:
                 from .learning import BanditSelector
-                from .monitor import DATA_DIR   # honours CONFAS_HOME env var
+                from .monitor import DATA_DIR   # honours CLICKSHIFT_HOME env var
                 self._selector = BanditSelector(history_file or (DATA_DIR / "history.jsonl"))
             except Exception:
                 self._selector = None
@@ -2986,7 +3000,7 @@ class ConversionEngine:
                 err = f"{type(exc).__name__}: {exc}"
                 attempts.append({"backend": r.name, "ok": False, "ms": att_ms,
                                  "error": err, "traceback": _fmt_exc(exc)})
-                if os.environ.get("CONFAS_DEBUG"):
+                if os.environ.get("CLICKSHIFT_DEBUG"):
                     traceback.print_exc()
         ms = (time.perf_counter() - t0) * 1000
         res = ConversionResult(str(src), str(base), routes[0].name, ms, False, err)

@@ -1,4 +1,4 @@
-LIBRARY ConFasShell
+LIBRARY ClickShiftShell
 EXPORTS
     DllGetClassObject PRIVATE
     DllCanUnloadNow PRIVATE

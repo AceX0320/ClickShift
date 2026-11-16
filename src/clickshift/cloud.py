@@ -1,4 +1,4 @@
-"""ConFas shared-learnings cloud sync (optional).
+"""ClickShift shared-learnings cloud sync (optional).
 
 What this does
 --------------
@@ -16,10 +16,10 @@ How it works (two supported transports, both extremely simple):
        PUT  {CLOUD_URL}/state        <- same shape (whole-state merge server-side)
 
 2. **GitHub Gist mode** (recommended zero-backend setup) - set a fine-grained
-   PAT with ``gist`` scope in ``CONFAS_CLOUD_TOKEN`` (or write it to
-   ``~/.confas/cloud_token``). The gist holds one file per contributor plus an
+   PAT with ``gist`` scope in ``CLICKSHIFT_CLOUD_TOKEN`` (or write it to
+   ``~/.clickshift/cloud_token``). The gist holds one file per contributor plus an
    aggregated ``merged.json``; the merge worker runs in CI
-   (``python -m confas.cloud --merge-gist``).
+   (``python -m clickshift.cloud --merge-gist``).
 
 Privacy: only aggregate numbers are ever uploaded - learned weight matrices,
 per-pair median latencies and arm sample counts. **No file names, no paths, no
@@ -31,8 +31,8 @@ Security model (defence in depth)
 ---------------------------------
 1. Transport: HTTPS only (allow-listed schemes), TLS certificate verification
    always on (urllib default context; no way to disable it here).
-2. Credentials: the GitHub PAT lives in ``CONFAS_CLOUD_TOKEN`` or
-   ``~/.confas/cloud_token`` (chmod 0600 on write). It can ONLY create/update
+2. Credentials: the GitHub PAT lives in ``CLICKSHIFT_CLOUD_TOKEN`` or
+   ``~/.clickshift/cloud_token`` (chmod 0600 on write). It can ONLY create/update
    gists - never repos, code, packages or user data. Users should supply their
    own token; the tool never sends it anywhere except api.github.com.
 3. Trust boundary for DOWNLOADED state: a pooled model could be poisoned by a
@@ -68,9 +68,9 @@ from typing import Any, Optional
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    __package__ = "confas"
+    __package__ = "clickshift"
 
-log = logging.getLogger("confas.cloud")
+log = logging.getLogger("clickshift.cloud")
 
 
 def _opt_import(name: str) -> Any:
@@ -106,7 +106,7 @@ def _check_url(url: str) -> bool:
 # --------------------------------------------------------------------------- #
 
 def _data_dir() -> Path:
-    return Path(os.environ.get("CONFAS_HOME", str(Path.home() / ".confas")))
+    return Path(os.environ.get("CLICKSHIFT_HOME", str(Path.home() / ".clickshift")))
 
 
 def load_cloud_config() -> dict[str, Any]:
@@ -123,7 +123,7 @@ def load_cloud_config() -> dict[str, Any]:
 
 
 def token() -> str:
-    t = os.environ.get("CONFAS_CLOUD_TOKEN", "").strip()
+    t = os.environ.get("CLICKSHIFT_CLOUD_TOKEN", "").strip()
     if not t:
         f = _data_dir() / "cloud_token"
         if f.exists():
@@ -157,7 +157,7 @@ def _request(url: str, method: str = "GET", body: Optional[dict[str, Any]] = Non
         return None
     data = json.dumps(body).encode("utf-8") if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
-    req.add_header("User-Agent", "ConFas/CloudSync")
+    req.add_header("User-Agent", "ClickShift/CloudSync")
     req.add_header("Content-Type", "application/json")
     for k, v in (headers or {}).items():
         req.add_header(k, v)
@@ -453,7 +453,7 @@ class CloudSync:
             return
         if self.pull_on_start:
             threading.Thread(target=self.pull, daemon=True,
-                             name="confas-cloud-pull").start()
+                             name="clickshift-cloud-pull").start()
         self._schedule(self.interval)
 
     def _schedule(self, delay: Optional[float] = None) -> None:
@@ -501,7 +501,7 @@ class CloudSync:
 
 
 # --------------------------------------------------------------------------- #
-#  CI merge worker:  python -m confas.cloud --merge-gist  (run from repo root)
+#  CI merge worker:  python -m clickshift.cloud --merge-gist  (run from repo root)
 # --------------------------------------------------------------------------- #
 
 def merge_gist_worker(gist_id: Optional[str] = None, token_: Optional[str] = None,
@@ -511,7 +511,7 @@ def merge_gist_worker(gist_id: Optional[str] = None, token_: Optional[str] = Non
     Used by the scheduled GitHub Action so contributors only ever PATCH their
     own file (no lost-update races on the aggregate).
     """
-    gid = (gist_id or os.environ.get("CONFAS_GIST_ID") or "").strip()
+    gid = (gist_id or os.environ.get("CLICKSHIFT_GIST_ID") or "").strip()
     tok = token_ or token()
     if not gid or gid == DEFAULT_GIST_ID or not tok:
         print("cloud pool not configured (gist id/token missing) - nothing to merge.")
@@ -549,7 +549,7 @@ def merge_gist_worker(gist_id: Optional[str] = None, token_: Optional[str] = Non
 
 if __name__ == "__main__":  # pragma: no cover
     import argparse
-    ap = argparse.ArgumentParser(prog="confas.cloud")
+    ap = argparse.ArgumentParser(prog="clickshift.cloud")
     ap.add_argument("--merge-gist", action="store_true")
     ap.add_argument("--gist-id", default=None)
     ap.add_argument("--dry-run", action="store_true")

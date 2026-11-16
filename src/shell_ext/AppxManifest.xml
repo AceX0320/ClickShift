@@ -11,11 +11,11 @@
   xmlns:desktop5="http://schemas.microsoft.com/appx/manifest/desktop/windows10/5"
   xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
   xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10">
-  <Identity Name="ConFas.ShellExtension" ProcessorArchitecture="x64" Publisher="CN=ConFas" Version="1.0.13.0" />
+  <Identity Name="ClickShift.ShellExtension" ProcessorArchitecture="x64" Publisher="CN=ClickShift" Version="1.0.18.0" />
   <Properties>
-    <DisplayName>ConFas</DisplayName>
-    <PublisherDisplayName>ConFas</PublisherDisplayName>
-    <Logo>confas.png</Logo>
+    <DisplayName>ClickShift</DisplayName>
+    <PublisherDisplayName>ClickShift</PublisherDisplayName>
+    <Logo>clickshift.png</Logo>
   </Properties>
   <Dependencies>
     <TargetDeviceFamily Name="Windows.Universal" MinVersion="10.0.17763.0" MaxVersionTested="10.0.22621.0" />
@@ -30,22 +30,22 @@
     <rescap:Capability Name="unvirtualizedResources" />
   </Capabilities>
   <Applications>
-    <Application Id="App" Executable="ConFasStub.exe" EntryPoint="Windows.FullTrustApplication">
-      <uap:VisualElements DisplayName="ConFas" Description="Convert with ConFas" BackgroundColor="transparent" Square150x150Logo="confas.png" Square44x44Logo="confas.png">
+    <Application Id="App" Executable="ClickShiftStub.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements DisplayName="ClickShift" Description="Convert with ClickShift" BackgroundColor="transparent" Square150x150Logo="clickshift.png" Square44x44Logo="clickshift.png">
         <uap:DefaultTile />
       </uap:VisualElements>
       <Extensions>
         <desktop4:Extension Category="windows.fileExplorerContextMenus">
           <desktop4:FileExplorerContextMenus>
             <desktop5:ItemType Type="*">
-              <desktop5:Verb Id="ConFasConvertMenu" Clsid="9f4e7a21-6c5b-4d8e-b3a1-7c8e9f0a1b2c" />
+              <desktop5:Verb Id="ClickShiftConvertMenu" Clsid="a7c2d814-3e5f-4b9c-9a12-8d4e6f0c3a5e" />
             </desktop5:ItemType>
           </desktop4:FileExplorerContextMenus>
         </desktop4:Extension>
         <com:Extension Category="windows.comServer">
           <com:ComServer>
-            <com:SurrogateServer DisplayName="ConFas">
-              <com:Class Id="9f4e7a21-6c5b-4d8e-b3a1-7c8e9f0a1b2c" Path="ConFasShell.dll" ThreadingModel="STA" />
+            <com:SurrogateServer DisplayName="ClickShift">
+              <com:Class Id="a7c2d814-3e5f-4b9c-9a12-8d4e6f0c3a5e" Path="ClickShiftShell.dll" ThreadingModel="STA" />
             </com:SurrogateServer>
           </com:ComServer>
         </com:Extension>

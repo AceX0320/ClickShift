@@ -5,7 +5,7 @@ build/
 dist/
 *.egg-info/
 .venv/
-assets/confas.ico.bak
+assets/clickshift.ico.bak
 tests/_tmp_home/
 logs_118368604049/
 logs_*/

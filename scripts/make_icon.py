@@ -1,7 +1,7 @@
-"""Generate assets/confas.ico and assets/confas.png only when missing (or --force).
+"""Generate assets/clickshift.ico and assets/clickshift.png only when missing (or --force).
 
-When custom assets/confas.ico already exists, missing confas.png is derived
-directly from the highest-resolution layer of assets/confas.ico instead of
+When custom assets/clickshift.ico already exists, missing clickshift.png is derived
+directly from the highest-resolution layer of assets/clickshift.ico instead of
 overwriting the designed icon.
 """
 import sys
@@ -42,8 +42,8 @@ if __name__ == "__main__":
     force = "--force" in sys.argv[1:]
     out = Path(__file__).resolve().parent.parent / "assets"
     out.mkdir(exist_ok=True)
-    ico_path = out / "confas.ico"
-    png_path = out / "confas.png"
+    ico_path = out / "clickshift.ico"
+    png_path = out / "clickshift.png"
 
     if ico_path.exists() and not force:
         if not png_path.exists():
