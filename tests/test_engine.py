@@ -368,4 +368,75 @@ def test_pptx_to_docx_and_pdf_roundtrip(tmp_path, engine):
     assert Path(res_pdf.target).stat().st_size > 0
 
 
+def test_paged_docs_to_image_folder(tmp_path, engine):
+    """Multi-page PDF, DOCX, and PPTX -> image format emit all pages in a document-named folder."""
+    import docx
+    import fitz
+    import pptx
+    from PIL import Image
+    from confas.monitor import menu_targets
+
+    for src_ext in ("pdf", "docx", "pptx"):
+        for img_ext in ("png", "jpg", "webp"):
+            assert img_ext in menu_targets(src_ext)
+            assert img_ext in newest_target_for(src_ext)
+
+    # 1. 3-page PDF -> PNG folder named after PDF stem, plus _unique_dir collision
+    pdf_src = tmp_path / "my_slides.pdf"
+    pdoc = fitz.open()
+    for i in range(1, 4):
+        pg = pdoc.new_page(width=400, height=300)
+        pg.insert_text((40, 80), f"PDF Page {i}", fontsize=20)
+    pdoc.save(pdf_src)
+    pdoc.close()
+
+    res_pdf_png = engine.convert(pdf_src, "png")
+    assert res_pdf_png.ok, res_pdf_png.error
+    out_dir = Path(res_pdf_png.target)
+    assert out_dir == tmp_path / "my_slides"
+    assert out_dir.is_dir()
+    pages = sorted(out_dir.iterdir())
+    assert [p.name for p in pages] == ["page_001.png", "page_002.png", "page_003.png"]
+    with Image.open(pages[0]) as im:
+        assert im.size[0] > 0 and im.size[1] > 0
+
+    # Converting again to jpg must not overwrite my_slides/, creates my_slides_1/
+    res_pdf_jpg = engine.convert(pdf_src, "jpg")
+    assert res_pdf_jpg.ok, res_pdf_jpg.error
+    out_dir_2 = Path(res_pdf_jpg.target)
+    assert out_dir_2 == tmp_path / "my_slides_1"
+    assert [p.name for p in sorted(out_dir_2.iterdir())] == ["page_001.jpg", "page_002.jpg", "page_003.jpg"]
+
+    # 2. 2-page DOCX -> WEBP folder
+    d = docx.Document()
+    d.add_paragraph("First Word Page")
+    d.add_page_break()
+    d.add_paragraph("Second Word Page")
+    docx_src = tmp_path / "notes_doc.docx"
+    d.save(docx_src)
+
+    res_docx_webp = engine.convert(docx_src, "webp")
+    assert res_docx_webp.ok, res_docx_webp.error
+    d_out = Path(res_docx_webp.target)
+    assert d_out == tmp_path / "notes_doc" and d_out.is_dir()
+    d_pages = sorted(d_out.iterdir())
+    assert len(d_pages) >= 2
+    assert all(p.suffix == ".webp" for p in d_pages)
+
+    # 3. 2-slide PPTX -> PNG folder
+    prs = pptx.Presentation()
+    for idx in (1, 2):
+        sl = prs.slides.add_slide(prs.slide_layouts[0])
+        sl.shapes.title.text = f"Deck Slide {idx}"
+    pptx_src = tmp_path / "pitch_deck.pptx"
+    prs.save(pptx_src)
+
+    res_pptx_png = engine.convert(pptx_src, "png")
+    assert res_pptx_png.ok, res_pptx_png.error
+    s_out = Path(res_pptx_png.target)
+    assert s_out == tmp_path / "pitch_deck" and s_out.is_dir()
+    assert [p.name for p in sorted(s_out.iterdir())] == ["page_001.png", "page_002.png"]
+
+
+
 

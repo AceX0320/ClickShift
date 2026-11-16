@@ -169,17 +169,17 @@ def all_targets_for(src_ext: str) -> list[str]:
     if src_ext == "pdf":
         out += ["docx", "pptx", "txt", "md", "html", "csv", "png", "jpg", "webp", "odt", "rtf"]
     if src_ext in OFFICE_DOC_IN:
-        out += ["pdf", "docx", "pptx", "txt", "md", "html", "rtf", "odt"]
+        out += ["pdf", "docx", "pptx", "txt", "md", "html", "rtf", "odt", "png", "jpg", "webp"]
     if src_ext in OFFICE_SHEET_IN or src_ext == "tsv":
-        out += ["xlsx", "pdf", "csv", "ods", "txt", "html"]
+        out += ["xlsx", "pdf", "csv", "ods", "txt", "html", "png", "jpg", "webp"]
     if src_ext in OFFICE_SLIDE_IN:
-        out += ["pptx", "pdf", "docx", "odp"]
+        out += ["pptx", "pdf", "docx", "odp", "png", "jpg", "webp"]
     if src_ext in IMAGE_EXTS or src_ext in ("wmf", "emf"):
         out += ["webp", "png", "jpg", "pdf", "avif", "jxl", "tiff", "bmp", "ico", "gif"]
     if src_ext in TEXT_EXTS:
         out += ["docx", "pdf", "txt", "md", "html", "rtf", "odt"]
     if src_ext == "epub":
-        out += ["txt", "docx", "html", "md", "pdf"]
+        out += ["txt", "docx", "html", "md", "pdf", "png", "jpg", "webp"]
     if src_ext == "xps":
         out += ["pdf", "docx", "png", "jpg"]
     # de-duplicate, keep order, drop self and legacy formats
@@ -2363,6 +2363,228 @@ def conv_via_pptx_to_docx(src: Path, dst: Path) -> None:
         conv_pptx_to_docx(tmp_pptx, dst)
 
 
+def conv_docx_to_pdf(src: Path, dst: Path) -> None:
+    """Pure-Python DOCX -> PDF fallback via python-docx + PyMuPDF."""
+    docx_mod: Any = importlib.import_module("docx")
+    docx_para_mod: Any = importlib.import_module("docx.text.paragraph")
+    docx_tbl_mod: Any = importlib.import_module("docx.table")
+    fitz: Any = importlib.import_module("fitz")
+
+    doc = docx_mod.Document(str(src))
+    pdf = fitz.open()
+    PAGE_W, PAGE_H = 595.0, 842.0  # A4 in pt
+    MARGIN_X, MARGIN_Y = 54.0, 54.0
+    BODY_W = PAGE_W - 2 * MARGIN_X
+    BOTTOM_Y = PAGE_H - MARGIN_Y
+
+    page = pdf.new_page(width=PAGE_W, height=PAGE_H)
+    y = MARGIN_Y
+
+    def _next_page() -> None:
+        nonlocal page, y
+        page = pdf.new_page(width=PAGE_W, height=PAGE_H)
+        y = MARGIN_Y
+
+    try:
+        for child in doc.element.body:
+            tag = child.tag.rsplit("}", 1)[-1]
+            if tag == "p":
+                para = docx_para_mod.Paragraph(child, doc)
+                has_break = bool(getattr(para.paragraph_format, "page_break_before", False))
+                if not has_break:
+                    try:
+                        has_break = bool(child.xpath(".//w:br[@w:type='page']"))
+                    except Exception:
+                        has_break = False
+                if has_break and y > MARGIN_Y + 4.0:
+                    _next_page()
+
+                text = para.text.strip()
+                style_name = (getattr(para.style, "name", "") or "").lower()
+                if text:
+                    if style_name == "title":
+                        fs, fname, sp_after = 20.0, "hebo", 10.0
+                    elif style_name.startswith("heading 1"):
+                        fs, fname, sp_after = 16.0, "hebo", 8.0
+                    elif style_name.startswith("heading"):
+                        fs, fname, sp_after = 13.0, "hebo", 6.0
+                    else:
+                        fs, fname, sp_after = 11.0, "helv", 5.0
+                    if style_name.startswith("list") and not text.startswith(("•", "-", "*")):
+                        text = f"• {text}"
+                    lines_est = max(1, int((len(text) * fs * 0.52) // BODY_W) + text.count("\n") + 1)
+                    needed = lines_est * fs * 1.32 + sp_after
+                    if y + needed > BOTTOM_Y and y > MARGIN_Y + 4.0:
+                        _next_page()
+                    box = fitz.Rect(MARGIN_X, y, MARGIN_X + BODY_W, BOTTOM_Y)
+                    page.insert_textbox(box, text, fontsize=fs, fontname=fname, color=(0.08, 0.09, 0.12))
+                    y += needed
+
+                rids: list[str] = []
+                for attr in (".//a:blip/@r:embed", ".//v:imagedata/@r:id"):
+                    try:
+                        rids.extend(child.xpath(attr))
+                    except Exception:
+                        pass
+                for rid in rids:
+                    part = doc.part.related_parts.get(str(rid))
+                    blob = getattr(part, "blob", None)
+                    if not isinstance(blob, (bytes, bytearray)) or not blob:
+                        continue
+                    stream = _normalize_image_stream(bytes(blob))
+                    if stream is None:
+                        continue
+                    img_h = 180.0
+                    if y + img_h > BOTTOM_Y and y > MARGIN_Y + 4.0:
+                        _next_page()
+                    rect = fitz.Rect(MARGIN_X, y, MARGIN_X + min(BODY_W, 360.0), min(BOTTOM_Y, y + img_h))
+                    try:
+                        page.insert_image(rect, stream=stream.getvalue())
+                        y += img_h + 8.0
+                    except Exception:
+                        pass
+
+            elif tag == "tbl":
+                tbl = docx_tbl_mod.Table(child, doc)
+                nrows = len(tbl.rows)
+                ncols = len(tbl.columns) if nrows else 0
+                if nrows == 0 or ncols == 0:
+                    continue
+                cw = BODY_W / ncols
+                rh = 22.0
+                if y + rh * min(nrows, 2) > BOTTOM_Y and y > MARGIN_Y + 4.0:
+                    _next_page()
+                for r_idx, row in enumerate(tbl.rows):
+                    if y + rh > BOTTOM_Y:
+                        _next_page()
+                    for c_idx in range(min(ncols, len(row.cells))):
+                        crect = fitz.Rect(MARGIN_X + c_idx * cw, y, MARGIN_X + (c_idx + 1) * cw, y + rh)
+                        page.draw_rect(
+                            crect,
+                            color=(0.72, 0.76, 0.82),
+                            width=0.6,
+                            fill=(0.94, 0.96, 0.98) if r_idx == 0 else None,
+                        )
+                        ctext = row.cells[c_idx].text.strip()
+                        if ctext:
+                            inner = fitz.Rect(crect.x0 + 3, crect.y0 + 2, crect.x1 - 3, crect.y1 - 2)
+                            page.insert_textbox(
+                                inner,
+                                ctext,
+                                fontsize=9.5,
+                                fontname="hebo" if r_idx == 0 else "helv",
+                                color=(0.08, 0.09, 0.12),
+                            )
+                    y += rh
+                y += 8.0
+
+        pdf.save(str(dst), deflate=True, garbage=3)
+    finally:
+        pdf.close()
+
+
+# --------------------------------------------------------------------------- #
+#  Multi-page documents -> image folders (every page becomes one image)
+# --------------------------------------------------------------------------- #
+
+# Sources that contain pages/slides/sheets and must never be reduced to one image.
+PAGED_IN = {"pdf", "doc", "docx", "odt", "rtf", "ppt", "pptx", "odp",
+            "xls", "xlsx", "ods", "epub", "xps"}
+PAGE_IMAGE_EXTS = {"png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff", "gif", "avif", "jxl"}
+PAGE_RENDER_DPI = 200
+
+
+def is_pages_to_images(src: Path, dst_ext: str) -> bool:
+    return (src.suffix.lstrip(".").lower() in PAGED_IN
+            and dst_ext.lstrip(".").lower() in PAGE_IMAGE_EXTS)
+
+
+def _unique_dir(path: Path) -> Path:
+    """Return ``path`` if free, else name_1, name_2 ... (folder variant of _unique)."""
+    if not path.exists():
+        return path
+    for i in range(1, 500):
+        cand = path.with_name(f"{path.name}_{i}")
+        if not cand.exists():
+            return cand
+    return path.with_name(f"{path.name}_{uuid.uuid4().hex[:6]}")
+
+
+def _dir_size(path: Path) -> int:
+    total = 0
+    try:
+        for p in path.rglob("*"):
+            if p.is_file():
+                total += p.stat().st_size
+    except OSError:
+        pass
+    return total
+
+
+def _render_pdf_pages(pdf_path: Path, out_dir: Path, ext: str) -> int:
+    """Render every page of ``pdf_path`` into ``out_dir`` as page_001.<ext> ...; return page count."""
+    fitz: Any = importlib.import_module("fitz")
+    ext = ext.lstrip(".").lower()
+    pil_fmt = {"jpg": "JPEG", "jpeg": "JPEG", "png": "PNG", "webp": "WEBP", "bmp": "BMP",
+               "tif": "TIFF", "tiff": "TIFF", "gif": "GIF", "avif": "AVIF", "jxl": "JXL"}[ext]
+    doc = fitz.open(str(pdf_path))
+    try:
+        if getattr(doc, "needs_pass", False):
+            raise RuntimeError("PDF is password protected")
+        n = len(doc)
+        if n == 0:
+            raise RuntimeError("Document has 0 pages")
+        width = max(3, len(str(n)))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for i, page in enumerate(doc, start=1):
+            pix = page.get_pixmap(dpi=PAGE_RENDER_DPI, alpha=False)
+            target = out_dir / f"page_{i:0{width}d}.{ext}"
+            if ext == "png":
+                pix.save(str(target))
+                continue
+            if not BACKENDS.pillow:
+                raise RuntimeError(f"Pillow is required to write .{ext} pages")
+            Image: Any = importlib.import_module("PIL.Image")
+            im = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+            kwargs: dict[str, Any] = {}
+            if pil_fmt == "JPEG":
+                kwargs = {"quality": 92, "optimize": True}
+            elif pil_fmt == "WEBP":
+                kwargs = {"quality": 90}
+            elif pil_fmt == "GIF":
+                im = im.convert("P", palette=Image.ADAPTIVE)
+            im.save(str(target), format=pil_fmt, **kwargs)
+        return n
+    finally:
+        doc.close()
+
+
+def conv_pages_to_image_folder(src: Path, out_dir: Path, ext: str) -> None:
+    """Convert a multi-page document into a folder (``out_dir``) holding one image per page."""
+    s = src.suffix.lstrip(".").lower()
+    try:
+        if s in ("pdf", "xps", "epub"):
+            _render_pdf_pages(src, out_dir, ext)
+            return
+        with tempfile.TemporaryDirectory(prefix="confas_pages_") as td:
+            tmp_pdf = Path(td) / f"{src.stem}.pdf"
+            last_err = ""
+            for r in _routes_for(s, "pdf"):
+                try:
+                    r.fn(src, tmp_pdf)
+                    if tmp_pdf.exists() and tmp_pdf.stat().st_size > 0:
+                        break
+                except Exception as exc:
+                    last_err = f"{r.name}: {type(exc).__name__}: {exc}"
+                    tmp_pdf.unlink(missing_ok=True)
+            if not tmp_pdf.exists():
+                raise RuntimeError(f"Could not render pages ({last_err or 'no PDF route available'})")
+            _render_pdf_pages(tmp_pdf, out_dir, ext)
+    except Exception:
+        shutil.rmtree(out_dir, ignore_errors=True)  # never leave a half-filled folder
+        raise
+
+
 # --------------------------------------------------------------------------- #
 #  Routing table
 # --------------------------------------------------------------------------- #
@@ -2425,21 +2647,12 @@ def _routes_for(src_ext: str, dst_ext: str) -> list[Route]:
         if word_available and d == "rtf":
             add("office-com", conv_office_com, 85)
         add("libreoffice", conv_libreoffice, 75)
-    elif s == "pdf" and d in ("jpg", "jpeg", "png", "webp"):
-        if BACKENDS.pillow and BACKENDS.pymupdf:
-            def pdf_img(src: Path, dst: Path, sub: int = 0) -> None:
-                # render page(s) via pdftoppm-like path using PyMuPDF if present
-                fitz: Any = importlib.import_module("fitz")
-                doc = fitz.open(src)
-                pg = doc[sub]
-                pix = pg.get_pixmap(dpi=200)
-                pix.save(dst.with_suffix(".png"))
-                if dst.suffix.lstrip(".").lower() != "png":
-                    conv_pillow(dst.with_suffix(".png"), dst)
-                    dst.with_suffix(".png").unlink(missing_ok=True)
-                doc.close()
-            add("pymupdf", pdf_img, 90)
-        add("libreoffice", conv_libreoffice, 30)
+    elif s in PAGED_IN and d in PAGE_IMAGE_EXTS:
+        if BACKENDS.pymupdf and (d == "png" or BACKENDS.pillow):
+            _page_img_ext = d
+            add("pages-to-images", lambda src_, dst_, _e=_page_img_ext: conv_pages_to_image_folder(src_, dst_, _e), 100)
+        if s == "pdf":
+            add("libreoffice", conv_libreoffice, 30)
     elif s in IMAGE_EXTS and d == "pdf":
         if BACKENDS.pillow:
             add("pillow-pdf", conv_image_to_pdf, 100)
@@ -2518,6 +2731,8 @@ def _routes_for(src_ext: str, dst_ext: str) -> list[Route]:
         if office_available:
             add("office-com", conv_office_com, 100)
         add("libreoffice", conv_libreoffice, 70)
+        if s == "docx" and BACKENDS.python_docx and BACKENDS.pymupdf:
+            add("python-docx-pymupdf-pdf", conv_docx_to_pdf, 45)
     elif s in OFFICE_DOC_IN and d in ("docx", "odt", "rtf", "html"):
         if office_available:
             add("office-com", conv_office_com, 100)
@@ -2549,7 +2764,7 @@ def _routes_for(src_ext: str, dst_ext: str) -> list[Route]:
             continue
         if ("python-pptx" in r.name) and not BACKENDS.python_pptx:
             continue
-        if ("pymupdf" in r.name) and not BACKENDS.pymupdf:
+        if ("pymupdf" in r.name or "pages-to-images" in r.name) and not BACKENDS.pymupdf:
             continue
         if r.name == "office-com" and not (IS_WINDOWS and BACKENDS.office_app):
             continue
@@ -2613,7 +2828,13 @@ class ConversionEngine:
             debuglog.finalize(sess, res)
             return res
         base = Path(out_path) if out_path else (Path(out_dir) if out_dir else src.parent) / (src.stem + dst_ext)
-        base = _unique(Path(base))
+        pages_mode = is_pages_to_images(src, dst_ext)
+        if pages_mode:
+            # every page -> one image, collected in a folder named after the document
+            folder = Path(out_path) if out_path else (Path(out_dir) if out_dir else src.parent) / src.stem
+            base = _unique_dir(folder)
+        else:
+            base = _unique(Path(base))
         sess["planned_out"] = str(base)
         sess["dst_ext"] = dst_ext
         try:
@@ -2647,9 +2868,11 @@ class ConversionEngine:
                                  "error": "", "traceback": ""})
                 if self._selector:
                     self._selector.record(src, dst_ext, r.name, att_ms, True)
+                out_bytes = (_dir_size(base) if base.is_dir()
+                             else (base.stat().st_size if base.exists() else 0))
                 res = ConversionResult(str(src), str(base), r.name, ms, True,
                                        bytes_in=src.stat().st_size,
-                                       bytes_out=base.stat().st_size if base.exists() else 0)
+                                       bytes_out=out_bytes)
                 sess.update(ok=True, winning_backend=r.name, total_ms=ms,
                             attempts=attempts, out_path=str(base),
                             bytes_out=res.bytes_out)

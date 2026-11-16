@@ -2,7 +2,7 @@
 
 **One EXE. Right-click any document → converted. Learns to get faster.**
 
-> **📥 Direct EXE Download (Latest — v1.0.13):** [**Download `ConFas-v1.0.13.exe`**](https://github.com/AceX0320/ConFas/releases/download/v1.0.13/ConFas-v1.0.13.exe) · [**Latest Release Page**](https://github.com/AceX0320/ConFas/releases/latest)  
+> **📥 Direct EXE Download (Latest — v1.0.16):** [**Download `ConFas-v1.0.16.exe`**](https://github.com/AceX0320/ConFas/releases/download/v1.0.16/ConFas-v1.0.16.exe) · [**Latest Release Page**](https://github.com/AceX0320/ConFas/releases/latest)  
 > *(Or grab the latest CI artifact from [GitHub Actions](https://github.com/AceX0320/ConFas/actions/workflows/build.yml) / browse [Releases](https://github.com/AceX0320/ConFas/releases))*
 
 ConFas is a 100 % local, offline document conversion tool:
@@ -18,8 +18,11 @@ ConFas is a 100 % local, offline document conversion tool:
 
 | Conversion | Fastest backend (auto-picked) | Fallbacks |
 |---|---|---|
-| DOCX/XLSX/PPTX/DOC/XLS/PPT/ODT/RTF → PDF | **Microsoft Office COM** (`SaveAs2` FileFormat 17 / `ExportAsFixedFormat`) | LibreOffice headless |
+| DOCX/XLSX/PPTX/DOC/XLS/PPT/ODT/RTF → PDF | **Microsoft Office COM** (`SaveAs2` FileFormat 17 / 32 / `ExportAsFixedFormat`) | LibreOffice headless → pure-Python **python-docx / python-pptx + PyMuPDF** (`docx`/`pptx`) |
 | PDF → DOCX | **pdf2docx** (layout/table/image preserving) | **Microsoft Office Word COM** (PDF reflow) → **PyMuPDF (`fitz`) + python-docx** (with 200 DPI scanned-page rendering) → **LibreOffice Writer** (`--infilter=writer_pdf_import`, `MS Word 2007 XML`) → **pypdf + python-docx** |
+| PDF / DOCX → PPTX | **PyMuPDF + python-pptx** (editable textboxes, images, 200 DPI scanned fallback) / **python-docx + python-pptx** (headings, bullets, tables, images) | LibreOffice Impress (`--infilter=impress_pdf_import` for PDF) |
+| PPTX → DOCX | **python-pptx + python-docx** (titles, bullets, tables, images, speaker notes) | LibreOffice |
+| Any paged document (`PDF`/`DOCX`/`PPTX`/`XLSX`/`EPUB`…) → Images (`PNG`/`JPG`/`WEBP`/…) | **PyMuPDF (`fitz`) + Pillow** (renders **every page/slide** at 200 DPI into a `<document_name>/` folder as `page_001.<ext>`…) | — |
 | Legacy .doc/.xls/.ppt → modern | Office COM FileFormat **12 / 51 / 24** (= OOXML 2007+) | LibreOffice `MS * 2007 XML` filters |
 | Images ↔ images / PDF | **Pillow** (C-accelerated, 4:4:4 chroma, quality presets) | LibreOffice |
 | TXT/MD/CSV/HTML → DOCX | **python-docx** (real headings/lists/bold/code styles) | Office COM → LibreOffice |
@@ -124,17 +127,17 @@ https://github.com/AceX0320/ConFas/releases/latest/download/ConFas.exe
 ```
 
 * **Direct Download (Latest Release Page):** [https://github.com/AceX0320/ConFas/releases/latest](https://github.com/AceX0320/ConFas/releases/latest)
-* **Direct Download (v1.0.13 Pinned):** [https://github.com/AceX0320/ConFas/releases/download/v1.0.13/ConFas-v1.0.13.exe](https://github.com/AceX0320/ConFas/releases/download/v1.0.13/ConFas-v1.0.13.exe)
+* **Direct Download (v1.0.16 Pinned):** [https://github.com/AceX0320/ConFas/releases/download/v1.0.16/ConFas-v1.0.16.exe](https://github.com/AceX0320/ConFas/releases/download/v1.0.16/ConFas-v1.0.16.exe)
 * **All Releases:** [https://github.com/AceX0320/ConFas/releases](https://github.com/AceX0320/ConFas/releases)
 * **CI Build Artifacts (`ConFas-windows-exe`):** [https://github.com/AceX0320/ConFas/actions/workflows/build.yml](https://github.com/AceX0320/ConFas/actions/workflows/build.yml)
-* `/releases/latest` **always points to the newest published versioned EXE** (`ConFas-v<version>.exe`).
+* `/releases/latest` **always points to the newest published versioned EXE** (`ConFas-v<version>.exe`), and ConFas checks for new GitHub releases automatically with an in-app update prompt + installer.
 
 Publishing happens automatically on every push to `main` (via `.github/workflows/build.yml`) as well as on version tags (via `.github/workflows/release.yml`):
 
-1. Push to `main` (or tag and push a version) → CI runs the full 40-test suite, builds `ConFas-v<version>.exe` on a Windows runner, uploads the `ConFas-windows-exe` artifact, and publishes `ConFas-v<version>.exe` to the latest GitHub Release:
+1. Push to `main` (or tag and push a version) → CI runs the full test suite, builds `ConFas-v<version>.exe` on a Windows runner, uploads the `ConFas-windows-exe` artifact, and publishes `ConFas-v<version>.exe` to the latest GitHub Release:
    ```bat
-   git tag v1.0.13
-   git push origin v1.0.13
+   git tag v1.0.16
+   git push origin v1.0.16
    ```
 2. Share the permanent link above. Anyone who downloads and double-clicks the
    EXE gets the self-install (both Windows right-click menus + Task Manager Startup entry).
@@ -199,18 +202,19 @@ src/confas/learning.py   10-dim content-aware LinUCB bandit (Sherman-Morrison + 
 src/confas/cloud.py      opt-in privacy-safe pooled learnings sync (GitHub Gist / HTTPS)
 src/confas/monitor.py    tray daemon, warm IPC server, watch folder, Win11 + classic menu installer
 src/confas/cli.py        command line / right-click entry point + native format picker popup
-src/confas/debuglog.py   automatic per-conversion diagnostic report writer (*.confas-debug.txt)
+src/confas/updater.py    GitHub auto-updater, release prompt, progress popup, and Windows self-replacer
+src/confas/debuglog.py   opt-in per-conversion diagnostic report writer
 entry_point.py           frozen-EXE entry (double-click = install + run forever)
 build.py / confas.spec   PyInstaller single-file EXE build configuration
 scripts/install.ps1      one-shot Windows setup
 scripts/make_icon.py     generates assets/confas.ico
-tests/                   40 cross-platform tests (engine, ML convergence, cloud sync, daemon IPC, debuglog)
+tests/                   60+ cross-platform tests (engine, ML, cloud sync, daemon, updater, debuglog)
 .github/workflows/       CI: build.yml (tests + EXE artifact + latest release) & release.yml
 ```
 
 ## Requirements
 * Windows 10/11, Python 3.10+ only to *build* (not to run the EXE).
-* For best fidelity/speed install either **Microsoft Office** (COM backend) or **LibreOffice** (headless backend). `Pillow`, `python-docx`, `pdf2docx`, `PyMuPDF` (`fitz`), `pypdf`, `chardet`, and `numpy` are bundled inside the EXE so PDF-to-DOCX, text, and image conversions work out of the box even without Office installed.
+* For best fidelity/speed install either **Microsoft Office** (COM backend) or **LibreOffice** (headless backend). `Pillow`, `python-docx`, `python-pptx`, `pdf2docx`, `PyMuPDF` (`fitz`), `pypdf`, `chardet`, and `numpy` are bundled inside the EXE so PDF/DOCX/PPTX, multi-page image export, text, and image conversions work out of the box even without Office installed.
 * Pure image/text/markup/PDF conversions work with nothing else installed.
 
 
