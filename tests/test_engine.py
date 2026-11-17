@@ -651,6 +651,89 @@ def test_history_hashes_filenames_and_debuglog_redacts_home(tmp_path):
     assert "~/Documents" in rep or "~\\Documents" in rep
 
 
+def test_backends_lazy_avoids_eager_probes_and_routes_cache_invalidates(monkeypatch):
+    from clickshift import engine as eng_mod
+
+    b = eng_mod.Backends()
+    assert b.__dict__ == {"_probe_lock": b._probe_lock}
+    probed: list[str] = []
+    orig_probe = b._probe_attr
+
+    def tracked_probe(name: str):
+        probed.append(name)
+        return orig_probe(name)
+
+    monkeypatch.setattr(b, "_probe_attr", tracked_probe)
+    _ = b.pillow
+    assert probed == ["pillow"]
+
+    routes = eng_mod._routes_for(".md", ".txt")
+    assert [r.name for r in routes] == ["text-passthru"]
+
+    monkeypatch.setattr(eng_mod.BACKENDS, "libreoffice", "fake-soffice")
+    r1 = [r.name for r in eng_mod._routes_for(".doc", ".pdf")]
+    assert "libreoffice" in r1
+    monkeypatch.setattr(eng_mod.BACKENDS, "libreoffice", "")
+    r2 = [r.name for r in eng_mod._routes_for(".doc", ".pdf")]
+    assert "libreoffice" not in r2
+
+
+def test_convert_many_batches_libreoffice_and_falls_back(tmp_path, monkeypatch):
+    from clickshift import engine as eng_mod
+
+    monkeypatch.setattr(eng_mod.BACKENDS, "office_app", {})
+    monkeypatch.setattr(eng_mod.BACKENDS, "libreoffice", "fake-soffice")
+
+    docs = []
+    for name in ("alpha", "beta", "gamma"):
+        p = tmp_path / f"{name}.doc"
+        p.write_text(f"doc {name}", encoding="utf-8")
+        docs.append(p)
+    txt = tmp_path / "note.txt"
+    txt.write_text("hello", encoding="utf-8")
+
+    batch_calls: list[list[tuple[Path, Path]]] = []
+    fallback_calls: list[Path] = []
+
+    def fake_lo_batch(pairs, dst_ext, infilter=None):
+        batch_calls.append(list(pairs))
+        ok_map = {}
+        for src_p, dst_p in pairs:
+            if src_p.stem == "gamma":
+                ok_map[src_p] = False
+            else:
+                dst_p.write_bytes(b"%PDF-1.4\nbatch\n")
+                ok_map[src_p] = True
+        return ok_map, ""
+
+    def fake_lo_single(src_p: Path, dst_p: Path, extra=None):
+        fallback_calls.append(src_p)
+        dst_p.write_bytes(b"%PDF-1.4\nsingle\n")
+
+    monkeypatch.setattr(eng_mod, "_lo_convert_batch", fake_lo_batch)
+    monkeypatch.setattr(eng_mod, "lo_convert", fake_lo_single)
+
+    eng = eng_mod.ConversionEngine(enable_ml=False)
+    try:
+        jobs = [
+            (str(docs[0]), "pdf"),
+            (str(txt), "html"),
+            (str(docs[1]), "pdf"),
+            (str(docs[2]), "pdf"),
+        ]
+        results = eng.convert_many(jobs)
+    finally:
+        eng.shutdown()
+
+    assert len(results) == 4
+    assert all(r.ok for r in results)
+    assert [Path(r.source).name for r in results] == ["alpha.doc", "note.txt", "beta.doc", "gamma.doc"]
+    assert len(batch_calls) == 1 and len(batch_calls[0]) == 3
+    assert fallback_calls == [docs[2]]
+    assert Path(results[1].target).suffix == ".html"
+
+
+
 
 
 

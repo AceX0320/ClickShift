@@ -7,12 +7,11 @@ the central data dir (`~/.clickshift/debug/`) — never next to converted user f
 """
 from __future__ import annotations
 
+import heapq
 import os
-import platform
 import sys
 import threading
 import time
-import traceback
 from pathlib import Path
 from typing import Optional
 
@@ -67,20 +66,43 @@ def keep_count() -> int:
 # report writing
 # ---------------------------------------------------------------------------
 
+_PLATFORM_STR: Optional[str] = None
+
+
+def _get_platform() -> str:
+    global _PLATFORM_STR
+    if _PLATFORM_STR is None:
+        import platform
+
+        _PLATFORM_STR = platform.platform()
+    return _PLATFORM_STR
+
+
 def _fmt_exc(exc: Optional[BaseException]) -> str:
     if exc is None:
         return ""
+    import traceback
+
     return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
 
-def _redact_home_path(value: object) -> str:
+
+def _redact_home_path(value: object, _home: Optional[tuple[str, str]] = None) -> str:
     """Redact user home directory prefixes so shared debug reports avoid leaking OS usernames."""
     s = str(value or "")
     if not s:
         return ""
     try:
-        home_str = str(Path.home())
-        if home_str and (s == home_str or s.lower().startswith(home_str.lower() + os.sep) or s.lower().startswith(home_str.lower() + "/")):
-            return "~" + s[len(home_str):]
+        if _home is None:
+            home_str = str(Path.home())
+            home_low = home_str.lower()
+        else:
+            home_str, home_low = _home
+        if home_str:
+            hlen = len(home_str)
+            if s == home_str:
+                return "~"
+            if len(s) > hlen and (s[hlen] == os.sep or s[hlen] == "/") and s[:hlen].lower() == home_low:
+                return "~" + s[hlen:]
     except Exception:
         pass
     return s
@@ -90,6 +112,8 @@ def render_report(session: dict) -> str:
     """Render a session dict into the plain-text report."""
     L: list[str] = []
     bar = "=" * 78
+    home_str = str(Path.home())
+    home_pair = (home_str, home_str.lower())
     L.append(bar)
     L.append("ClickShift CONVERSION DEBUG REPORT")
     L.append(bar)
@@ -102,22 +126,26 @@ def render_report(session: dict) -> str:
     L.append("")
     L.append("[ENVIRONMENT]")
     L.append(f"  ClickShift version : {session.get('version', '?')}")
-    L.append(f"  OS             : {platform.platform()}")
+    L.append(f"  OS             : {_get_platform()}")
     L.append(f"  Python         : {sys.version.split()[0]} ({'frozen EXE' if getattr(sys, 'frozen', False) else 'source'})")
-    L.append(f"  Data dir       : {_redact_home_path(session.get('data_dir', ''))}")
+    L.append(f"  Data dir       : {_redact_home_path(session.get('data_dir', ''), home_pair)}")
     L.append("")
     src = Path(session.get("src", ""))
     L.append("[INPUT / OUTPUT]")
-    L.append(f"  Source         : {_redact_home_path(src)}")
+    L.append(f"  Source         : {_redact_home_path(src, home_pair)}")
     L.append(f"  Source size    : {session.get('bytes_in', 0):,} bytes")
     L.append(f"  Target ext     : {session.get('dst_ext', '')}")
-    L.append(f"  Planned output : {_redact_home_path(session.get('planned_out', ''))}")
-    L.append(f"  Actual output  : {_redact_home_path(session.get('out_path', ''))}")
+    L.append(f"  Planned output : {_redact_home_path(session.get('planned_out', ''), home_pair)}")
+    L.append(f"  Actual output  : {_redact_home_path(session.get('out_path', ''), home_pair)}")
     if session.get("bytes_out"):
         L.append(f"  Output size    : {session['bytes_out']:,} bytes")
     L.append("")
     L.append("[BACKEND AVAILABILITY]")
-    for k, v in (session.get("backends") or {}).items():
+    backends = session.get("backends")
+    if backends is None:
+        backends = _backend_snapshot()
+        session["backends"] = backends
+    for k, v in (backends or {}).items():
         L.append(f"  {k:<14}: {v}")
     L.append("")
     ml = session.get("ml") or {}
@@ -139,7 +167,7 @@ def render_report(session: dict) -> str:
         att_by_name.setdefault(a["backend"], []).append(a)
     L.append("[CANDIDATE CHAIN & ATTEMPTS]")
     for i, r in enumerate(routes):
-        mark = ">" if any(a["backend"] == r["name"] for a in attempts) else " "
+        mark = ">" if r["name"] in att_by_name else " "
         L.append(f"  {mark} [{i}] {r['name']} (static weight {r.get('weight', 0)})")
         for a in att_by_name.get(r["name"], []):
             if a["ok"]:
@@ -148,7 +176,7 @@ def render_report(session: dict) -> str:
                 L.append(f"      x FAILED after {a['ms']:.1f} ms")
                 err = a.get("error", "")
                 L.append(f"        error: {err[:500]}")
-                tb = a.get("traceback", "")
+                tb = a.get("traceback") or _fmt_exc(a.get("exc"))
                 if tb:
                     for line in tb.rstrip().splitlines():
                         L.append(f"        | {line}")
@@ -188,15 +216,25 @@ def render_report(session: dict) -> str:
 
 def _prune(data_dir: Path, keep: int) -> None:
     try:
-        files = sorted(data_dir.glob("*.clickshift-debug.txt"),
-                       key=lambda p: p.stat().st_mtime, reverse=True)[keep:]
-        for old in files:
+        entries: list[tuple[float, str]] = []
+        with os.scandir(data_dir) as it:
+            for entry in it:
+                if entry.name.endswith(".clickshift-debug.txt") and entry.is_file(follow_symlinks=False):
+                    try:
+                        entries.append((entry.stat(follow_symlinks=False).st_mtime, entry.path))
+                    except OSError:
+                        pass
+        excess = len(entries) - keep
+        if excess <= 0:
+            return
+        for _mt, old_path in heapq.nsmallest(excess, entries, key=lambda item: item[0]):
             try:
-                old.unlink()
+                os.unlink(old_path)
             except OSError:
                 pass
     except Exception:
         pass
+
 
 def new_session(src, dst_ext: str) -> dict:
     """Create a fresh debug session record (called at convert() entry)."""
@@ -204,7 +242,7 @@ def new_session(src, dst_ext: str) -> dict:
     version = "?"
     try:
         from . import monitor
-        data_dir = str(monitor.DATA_DIR)
+        data_dir = str(monitor.data_dir())
     except Exception:
         data_dir = str(Path.home() / ".clickshift")
     try:
@@ -222,7 +260,7 @@ def new_session(src, dst_ext: str) -> dict:
         "bytes_out": 0,
         "version": version,
         "data_dir": data_dir,
-        "backends": _backend_snapshot(),
+        "backends": None,
         "ml": {"enabled": False},
         "routes_static": [],
         "routes": [],

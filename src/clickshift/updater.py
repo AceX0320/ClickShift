@@ -10,7 +10,6 @@ import os
 import queue
 import re
 import shutil
-import ssl
 import struct
 import subprocess
 import sys
@@ -21,10 +20,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence
+
+if TYPE_CHECKING:
+    import ssl as _ssl_t
 
 from clickshift import APP_NAME, __version__
 
@@ -90,21 +91,31 @@ class ReleaseInfo:
     expected_sha256: str = ""
 
 
+_STORE_IDENTITY_CACHE: Optional[bool] = None
+
+
 def is_packaged_store_app() -> bool:
     """Return True only when running inside ClickShift's own MSIX / Store package identity."""
+    global _STORE_IDENTITY_CACHE
     if sys.platform != "win32" or os.environ.get("CLICKSHIFT_ALLOW_SELF_UPDATE") == "1":
         return False
+    if _STORE_IDENTITY_CACHE is not None:
+        return _STORE_IDENTITY_CACHE
     try:
         length = ctypes.c_uint32(0)
         rc = ctypes.windll.kernel32.GetCurrentPackageFullName(ctypes.byref(length), None)
         if rc != 122 or not length.value:
+            _STORE_IDENTITY_CACHE = False
             return False
         buf = ctypes.create_unicode_buffer(length.value)
         rc2 = ctypes.windll.kernel32.GetCurrentPackageFullName(ctypes.byref(length), buf)
         if rc2 != 0:
+            _STORE_IDENTITY_CACHE = False
             return False
-        return buf.value.lower().startswith(("clickshift", "confas"))
+        _STORE_IDENTITY_CACHE = buf.value.lower().startswith(("clickshift", "confas"))
+        return _STORE_IDENTITY_CACHE
     except Exception:
+        _STORE_IDENTITY_CACHE = False
         return False
 
 
@@ -172,6 +183,22 @@ class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+_SSL_CTX_LOCK = threading.Lock()
+_SSL_CTX: Optional["_ssl_t.SSLContext"] = None
+
+
+def _get_ssl_context() -> "_ssl_t.SSLContext":
+    global _SSL_CTX
+    if _SSL_CTX is None:
+        with _SSL_CTX_LOCK:
+            if _SSL_CTX is None:
+                import ssl
+
+                _SSL_CTX = ssl.create_default_context()
+    assert _SSL_CTX is not None
+    return _SSL_CTX
+
+
 def _fetch_json(url: str, timeout: float = 8.0) -> object:
     if not _is_allowed_api_url(url):
         raise ValueError(f"Blocked API URL: {url}")
@@ -179,19 +206,26 @@ def _fetch_json(url: str, timeout: float = 8.0) -> object:
         url,
         headers={
             "Accept": "application/vnd.github+json",
+            "Accept-Encoding": "gzip",
             "User-Agent": f"{APP_NAME}/{__version__}",
         },
         method="GET",
     )
-    ctx = ssl.create_default_context()
     opener = urllib.request.build_opener(
-        urllib.request.HTTPSHandler(context=ctx),
+        urllib.request.HTTPSHandler(context=_get_ssl_context()),
         _SafeRedirectHandler(),
     )
     with opener.open(req, timeout=timeout) as resp:
         data = resp.read(MAX_JSON_BYTES + 1)
+        resp_headers = getattr(resp, "headers", None)
     if len(data) > MAX_JSON_BYTES:
         raise ValueError("GitHub API response exceeded safety size limit")
+    if resp_headers and str(resp_headers.get("Content-Encoding", "")).lower() == "gzip":
+        import gzip
+
+        data = gzip.decompress(data)
+        if len(data) > MAX_JSON_BYTES:
+            raise ValueError("GitHub API response exceeded safety size limit")
     return json.loads(data.decode("utf-8"))
 
 
@@ -202,8 +236,10 @@ def parse_release_payload(data: object) -> Optional[ReleaseInfo]:
     if data.get("draft") or data.get("prerelease"):
         return None
     tag = str(data.get("tag_name") or "").strip()
-    if not parse_version(tag):
+    tag_ver = parse_version(tag)
+    if not tag_ver:
         return None
+    ver_str = ".".join(str(p) for p in tag_ver)
 
     download_url = ""
     matched_asset_name = ""
@@ -212,45 +248,39 @@ def parse_release_payload(data: object) -> Optional[ReleaseInfo]:
     sig_url = ""
     assets = data.get("assets")
     if isinstance(assets, list):
-        # Strictly require official ClickShift/ConFas executable naming (prefer tag-exact match)
-        preferred = (f"clickshift-{tag}.exe".lower(), f"clickshift-v{'.'.join(str(p) for p in parse_version(tag))}.exe".lower(), "clickshift.exe")
-        for target_name in preferred:
-            for asset in assets:
-                if not isinstance(asset, dict):
-                    continue
-                name = str(asset.get("name") or "")
-                url = str(asset.get("browser_download_url") or "")
-                if name.lower() == target_name and is_allowed_download_url(url):
-                    download_url = url
-                    matched_asset_name = name
-                    asset_size = int(asset.get("size") or 0)
-                    break
-            if download_url:
-                break
-        if not download_url:
-            for asset in assets:
-                if not isinstance(asset, dict):
-                    continue
-                name = str(asset.get("name") or "")
-                url = str(asset.get("browser_download_url") or "")
-                if name.lower().startswith(("clickshift", "confas")) and name.lower().endswith(".exe") and is_allowed_download_url(url):
-                    download_url = url
-                    matched_asset_name = name
-                    asset_size = int(asset.get("size") or 0)
-                    break
-
+        # Single pass over assets while preserving strict priority ordering
+        preferred = (
+            f"clickshift-{tag}.exe".lower(),
+            f"clickshift-v{ver_str}.exe".lower(),
+            "clickshift.exe",
+        )
+        pref_rank = {n: i for i, n in enumerate(preferred)}
+        best_rank = len(preferred) + 1
+        sig_by_lower: dict[str, str] = {}
         for asset in assets:
             if not isinstance(asset, dict):
                 continue
             name = str(asset.get("name") or "")
             url = str(asset.get("browser_download_url") or "")
-            if not is_allowed_download_url(url):
-                continue
             nl = name.lower()
             if nl == "sha256sums.txt":
-                sha256_url = url
-            elif matched_asset_name and nl == f"{matched_asset_name.lower()}.sig":
-                sig_url = url
+                if is_allowed_download_url(url):
+                    sha256_url = url
+                continue
+            if nl.endswith(".sig"):
+                if is_allowed_download_url(url):
+                    sig_by_lower[nl] = url
+                continue
+            rank = pref_rank.get(nl)
+            if rank is None and nl.startswith(("clickshift", "confas")) and nl.endswith(".exe"):
+                rank = len(preferred)
+            if rank is not None and rank < best_rank and is_allowed_download_url(url):
+                best_rank = rank
+                download_url = url
+                matched_asset_name = name
+                asset_size = int(asset.get("size") or 0)
+        if matched_asset_name:
+            sig_url = sig_by_lower.get(f"{matched_asset_name.lower()}.sig", "")
 
     if not download_url:
         return None
@@ -261,7 +291,7 @@ def parse_release_payload(data: object) -> Optional[ReleaseInfo]:
 
     return ReleaseInfo(
         tag_name=tag,
-        version=".".join(str(p) for p in parse_version(tag)),
+        version=ver_str,
         download_url=download_url,
         release_notes=str(data.get("body") or "").strip(),
         html_url=html_url,
@@ -279,9 +309,8 @@ def _fetch_text_asset(url: str, max_bytes: int = 65536, timeout: float = 15.0) -
         headers={"User-Agent": f"{APP_NAME}/{__version__}"},
         method="GET",
     )
-    ctx = ssl.create_default_context()
     opener = urllib.request.build_opener(
-        urllib.request.HTTPSHandler(context=ctx),
+        urllib.request.HTTPSHandler(context=_get_ssl_context()),
         _SafeRedirectHandler(),
     )
     with opener.open(req, timeout=timeout) as resp:
@@ -325,7 +354,7 @@ def _decode_ecdsa_sig_raw64(sig_bytes: bytes) -> bytes:
     data = sig_bytes.strip()
     if len(data) == 64:
         return data
-    if data and all(chr(b).isascii() for b in data):
+    if data and data.isascii():
         try:
             decoded = base64.b64decode(data, validate=True)
             if len(decoded) == 64:
@@ -350,6 +379,38 @@ def _decode_ecdsa_sig_raw64(sig_bytes: bytes) -> bytes:
     raise ValueError("Invalid ECDSA P-256 signature encoding")
 
 
+_BCRYPT_LOCK = threading.Lock()
+_BCRYPT_DLL: Any = None
+
+
+def _get_bcrypt_dll() -> Any:
+    global _BCRYPT_DLL
+    if _BCRYPT_DLL is None:
+        with _BCRYPT_LOCK:
+            if _BCRYPT_DLL is None:
+                dll: Any = ctypes.WinDLL("bcrypt")
+                dll.BCryptOpenAlgorithmProvider.argtypes = [
+                    ctypes.POINTER(ctypes.c_void_p), ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32
+                ]
+                dll.BCryptOpenAlgorithmProvider.restype = ctypes.c_uint32
+                dll.BCryptCloseAlgorithmProvider.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+                dll.BCryptCloseAlgorithmProvider.restype = ctypes.c_uint32
+                dll.BCryptImportKeyPair.argtypes = [
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_void_p),
+                    ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
+                ]
+                dll.BCryptImportKeyPair.restype = ctypes.c_uint32
+                dll.BCryptDestroyKey.argtypes = [ctypes.c_void_p]
+                dll.BCryptDestroyKey.restype = ctypes.c_uint32
+                dll.BCryptVerifySignature.argtypes = [
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32,
+                    ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
+                ]
+                dll.BCryptVerifySignature.restype = ctypes.c_uint32
+                _BCRYPT_DLL = dll
+    return _BCRYPT_DLL
+
+
 def verify_ecdsa_p256_sha256(
     sha256_digest: bytes,
     sig_bytes: bytes,
@@ -365,17 +426,7 @@ def verify_ecdsa_p256_sha256(
 
     if sys.platform == "win32":
         try:
-            bcrypt = ctypes.WinDLL("bcrypt")
-            bcrypt.BCryptOpenAlgorithmProvider.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
-            bcrypt.BCryptOpenAlgorithmProvider.restype = ctypes.c_uint32
-            bcrypt.BCryptCloseAlgorithmProvider.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-            bcrypt.BCryptCloseAlgorithmProvider.restype = ctypes.c_uint32
-            bcrypt.BCryptImportKeyPair.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32]
-            bcrypt.BCryptImportKeyPair.restype = ctypes.c_uint32
-            bcrypt.BCryptDestroyKey.argtypes = [ctypes.c_void_p]
-            bcrypt.BCryptDestroyKey.restype = ctypes.c_uint32
-            bcrypt.BCryptVerifySignature.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32]
-            bcrypt.BCryptVerifySignature.restype = ctypes.c_uint32
+            bcrypt = _get_bcrypt_dll()
 
             h_alg = ctypes.c_void_p()
             if bcrypt.BCryptOpenAlgorithmProvider(ctypes.byref(h_alg), "ECDSA_P256", None, 0) != 0:
@@ -502,13 +553,15 @@ def download_update(
         headers={"User-Agent": f"{APP_NAME}/{__version__}"},
         method="GET",
     )
-    ctx = ssl.create_default_context()
     opener = urllib.request.build_opener(
-        urllib.request.HTTPSHandler(context=ctx),
+        urllib.request.HTTPSHandler(context=_get_ssl_context()),
         _SafeRedirectHandler(),
     )
 
     downloaded = 0
+    magic = b""
+    last_cb_bytes = -1
+    last_cb_ts = 0.0
     sha = hashlib.sha256()
     try:
         with opener.open(req, timeout=timeout) as resp:
@@ -519,22 +572,29 @@ def download_update(
                 raise ValueError(f"Update asset too large ({total} bytes)")
             with open(part, "wb") as fh:
                 while True:
-                    chunk = resp.read(65536)
+                    chunk = resp.read(524_288)
                     if not chunk:
                         break
+                    if downloaded == 0:
+                        magic = chunk[:2]
+                    elif len(magic) < 2:
+                        magic += chunk[: 2 - len(magic)]
                     downloaded += len(chunk)
                     if downloaded > MAX_EXE_BYTES:
                         raise ValueError("Download exceeded maximum allowed size")
                     sha.update(chunk)
                     fh.write(chunk)
                     if progress_cb is not None:
-                        progress_cb(downloaded, total)
+                        now = time.monotonic()
+                        if downloaded - last_cb_bytes >= 262_144 or (now - last_cb_ts) >= 0.05:
+                            last_cb_bytes = downloaded
+                            last_cb_ts = now
+                            progress_cb(downloaded, total)
+        if progress_cb is not None and downloaded != last_cb_bytes:
+            progress_cb(downloaded, total)
 
-        size = part.stat().st_size
-        if size < min_bytes:
-            raise ValueError(f"Downloaded binary too small ({size} bytes)")
-        with open(part, "rb") as fh:
-            magic = fh.read(2)
+        if downloaded < min_bytes:
+            raise ValueError(f"Downloaded binary too small ({downloaded} bytes)")
         if magic != b"MZ":
             raise ValueError("Downloaded file is not a valid Windows executable")
 
@@ -964,10 +1024,10 @@ def peek_update_notice(data_dir: Optional[Path] = None) -> Optional[dict]:
     """Read pending update notice without removing it."""
     p = update_notice_file(data_dir)
     try:
-        if not p.exists():
-            return None
         data = json.loads(p.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else None
+    except FileNotFoundError:
+        return None
     except Exception:
         return None
 
@@ -975,12 +1035,25 @@ def peek_update_notice(data_dir: Optional[Path] = None) -> Optional[dict]:
 def consume_update_notice(data_dir: Optional[Path] = None) -> Optional[dict]:
     """Read and clear the pending post-update notification marker."""
     p = update_notice_file(data_dir)
-    data = peek_update_notice(data_dir)
+    try:
+        raw = p.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except Exception:
+        try:
+            p.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return None
     try:
         p.unlink(missing_ok=True)
     except Exception:
         pass
-    return data
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
 
 
 def format_update_notification(notice: dict) -> tuple[str, str]:
@@ -1177,6 +1250,8 @@ def run_interactive_update(
 
     frozen = getattr(sys, "frozen", False) if is_frozen is None else is_frozen
     if not frozen or sys.platform != "win32":
+        import webbrowser
+
         webbrowser.open(info.html_url or RELEASES_PAGE_URL)
         return "opened_browser"
 

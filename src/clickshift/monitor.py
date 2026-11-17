@@ -128,7 +128,7 @@ def menu_targets(ext: str) -> list[str]:
     if ext_clean in _FAMILY_TARGETS:
         return list(_FAMILY_TARGETS[ext_clean])
     try:
-        from .engine import all_targets_for
+        from .formats import all_targets_for
         targets = all_targets_for(ext_clean)
         if targets:
             return targets
@@ -275,28 +275,65 @@ def validate_watch_folder(path: Path) -> Path:
     return resolved
 
 
+_INITIAL_DATA_DIR = DATA_DIR
+_CONFIG_CACHE_LOCK = threading.Lock()
+_CONFIG_CACHE: Optional[tuple[str, int, int, dict]] = None
+
+
+def _active_data_dir() -> Path:
+    if DATA_DIR != _INITIAL_DATA_DIR:
+        return DATA_DIR
+    return data_dir()
+
+
 def config_file() -> Path:
     """Resolve the config file path at call time (honours CLICKSHIFT_HOME changes/tests)."""
-    return data_dir() / "config.json"
+    return _active_data_dir() / "config.json"
 
 
 def load_config() -> dict:
+    global _CONFIG_CACHE
+    cfile = config_file()
     cfg = dict(DEFAULT_CONFIG)
     try:
-        cfg.update(json.loads(config_file().read_text(encoding="utf-8")))
+        st = cfile.stat()
     except FileNotFoundError:
-        pass
+        return cfg
+    except OSError:
+        return cfg
+    key_path = str(cfile)
+    with _CONFIG_CACHE_LOCK:
+        if (_CONFIG_CACHE is not None
+                and _CONFIG_CACHE[0] == key_path
+                and _CONFIG_CACHE[1] == st.st_mtime_ns
+                and _CONFIG_CACHE[2] == st.st_size):
+            cfg.update(_CONFIG_CACHE[3])
+            return cfg
+    try:
+        loaded = json.loads(cfile.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            with _CONFIG_CACHE_LOCK:
+                _CONFIG_CACHE = (key_path, st.st_mtime_ns, st.st_size, dict(loaded))
+            cfg.update(loaded)
     except Exception:
         pass
     return cfg
 
 
 def save_config(cfg: dict) -> None:
+    global _CONFIG_CACHE
     cfile = config_file()
     cfile.parent.mkdir(parents=True, exist_ok=True)
     tmp = cfile.with_suffix(".tmp")
     tmp.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
     tmp.replace(cfile)
+    try:
+        st = cfile.stat()
+        with _CONFIG_CACHE_LOCK:
+            _CONFIG_CACHE = (str(cfile), st.st_mtime_ns, st.st_size, dict(cfg))
+    except OSError:
+        with _CONFIG_CACHE_LOCK:
+            _CONFIG_CACHE = None
 
 
 def exe_path() -> str:
@@ -531,6 +568,15 @@ def _key_exists(root, path: str) -> bool:
         return False
 
 
+def _verb_names_for(ext: str) -> list[str]:
+    """Verb key names for one extension (fast: skips command string construction)."""
+    targets = menu_targets(ext)
+    out = [VERB_AUTO]
+    out.extend(f"ClickShift.To{t.capitalize()}" for t in targets)
+    out.append(VERB_CHOOSE)
+    return out
+
+
 def _verbs_for(ext: str) -> list[tuple[str, str, str]]:
     """(verb key name, menu label, command) tuples for one extension."""
     targets = menu_targets(ext)
@@ -567,8 +613,11 @@ def _delete_key_tree(root, path: str) -> None:
         pass
 
 
-def _register_openwith(ext: str) -> None:
-    """Make ClickShift appear in Explorer's 'Open with' (Windows 11 first menu) with all choices."""
+_OPENWITH_APP_LOCAL = threading.local()
+
+
+def _register_openwith_app() -> None:
+    """Register HKCU\\Software\\Classes\\Applications\\ClickShift.exe once per batch."""
     assert winreg is not None
     app = OPENWITH_APP
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER,
@@ -579,10 +628,16 @@ def _register_openwith(ext: str) -> None:
                           "Ultra-fast local document converter")
         with winreg.CreateKey(k, "DefaultIcon") as ki:
             winreg.SetValue(ki, "", winreg.REG_SZ, exe_path() + ",0")
-        # Launching via 'Open with' on Win11's 1st menu opens the native cursor popup
-        # listing every available conversion target for the clicked file!
         with winreg.CreateKey(k, r"shell\open\command") as kc:
             winreg.SetValue(kc, "", winreg.REG_SZ, _verb_cmd(None, choose=True))
+
+
+def _register_openwith(ext: str) -> None:
+    """Make ClickShift appear in Explorer's 'Open with' (Windows 11 first menu) with all choices."""
+    assert winreg is not None
+    app = OPENWITH_APP
+    if not getattr(_OPENWITH_APP_LOCAL, "registered", False):
+        _register_openwith_app()
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER,
                           rf"Software\Classes\.{ext}\OpenWithList") as kol:
         winreg.SetValueEx(kol, app, 0, winreg.REG_SZ, "")
@@ -673,6 +728,53 @@ def _ps_encoded(script_text: str) -> str:
     return base64.b64encode(script_text.encode("utf-16le")).decode("ascii")
 
 
+def _files_identical(src: Path, dst: Path) -> bool:
+    try:
+        if not dst.exists():
+            return False
+        s_st, d_st = src.stat(), dst.stat()
+        if s_st.st_size != d_st.st_size:
+            return False
+        if s_st.st_mtime_ns == d_st.st_mtime_ns:
+            return True
+        return src.read_bytes() == dst.read_bytes()
+    except OSError:
+        return False
+
+
+def _shell_ext_pkg_registered() -> bool:
+    if winreg is None:
+        return False
+    pkg_reg = r"Software\Classes\PackagedCom\Package"
+    has_clickshift = False
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, pkg_reg) as k:
+            i = 0
+            while True:
+                try:
+                    name = winreg.EnumKey(k, i)
+                    i += 1
+                    if name.startswith("ConFas.ShellExtension_"):
+                        return False
+                    if name.startswith("ClickShift.ShellExtension_"):
+                        has_clickshift = True
+                except OSError:
+                    break
+    except OSError:
+        return False
+    return has_clickshift
+
+
+def _shell_assets_digest(shell_dir: Path) -> str:
+    h = hashlib.sha256()
+    for fname in ("ClickShiftShell.msix", "ClickShiftShell.dll", "AppxManifest.xml"):
+        p = shell_dir / fname
+        if p.exists():
+            h.update(fname.encode("ascii"))
+            h.update(p.read_bytes())
+    return h.hexdigest()
+
+
 def _install_win11_shell_extension() -> bool:
     """Install the packaged IExplorerCommand shell extension (ClickShiftShell.dll) so
     the expandable 'Convert with ClickShift >' submenu appears in the Windows 11 main menu.
@@ -695,9 +797,10 @@ def _install_win11_shell_extension() -> bool:
         for fname in ("ClickShiftShell.dll", "ClickShiftStub.exe", "AppxManifest.xml",
                       "clickshift.png", "clickshift.ico", "ClickShiftShell.msix", "ClickShiftShell.cer"):
             s = src_assets / fname
-            if s.exists():
+            d = shell_dir / fname
+            if s.exists() and not _files_identical(s, d):
                 try:
-                    shutil.copy2(s, shell_dir / fname)
+                    shutil.copy2(s, d)
                 except Exception:
                     pass
 
@@ -705,6 +808,18 @@ def _install_win11_shell_extension() -> bool:
         cer_path = shell_dir / "ClickShiftShell.cer"
         manifest_path = shell_dir / "AppxManifest.xml"
         thumb_file = shell_dir / "installed_cert.thumbprint"
+        stamp_file = shell_dir / ".installed_sha256"
+        cur_digest = _shell_assets_digest(shell_dir)
+
+        try:
+            if (
+                stamp_file.exists()
+                and stamp_file.read_text(encoding="utf-8", errors="ignore").strip() == cur_digest
+                and _shell_ext_pkg_registered()
+            ):
+                return True
+        except Exception:
+            pass
 
         # 1. Remove any stale version (or legacy ConFas extension) and try direct registration
         msix_lit = str(msix_path).replace("'", "''")
@@ -724,6 +839,10 @@ def _install_win11_shell_extension() -> bool:
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         if r.returncode == 0:
+            try:
+                stamp_file.write_text(cur_digest, encoding="utf-8")
+            except Exception:
+                pass
             _log("Win11 IExplorerCommand shell extension registered directly")
             return True
 
@@ -780,6 +899,10 @@ def _install_win11_shell_extension() -> bool:
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         if r2.returncode == 0:
+            try:
+                stamp_file.write_text(cur_digest, encoding="utf-8")
+            except Exception:
+                pass
             _log("Win11 IExplorerCommand shell extension registered after one-time trust setup")
             return True
         _log(f"Win11 shell extension registration stderr: {r2.stderr.strip() or r.stderr.strip()}")
@@ -800,25 +923,34 @@ def _remove_win11_shell_extension() -> None:
             tp = thumb_file.read_text(encoding="utf-8", errors="ignore").strip()
             if not all(c in "0123456789ABCDEFabcdef" for c in tp):
                 tp = ""
-        cmd = (
-            "Get-AppxPackage -Name 'ClickShift.ShellExtension' -ErrorAction SilentlyContinue | Remove-AppxPackage -ErrorAction SilentlyContinue; "
-            "Get-AppxPackage -Name 'ConFas.ShellExtension' -ErrorAction SilentlyContinue | Remove-AppxPackage -ErrorAction SilentlyContinue"
-        )
-        if tp:
-            cmd += (
-                f"; Remove-Item 'Cert:\\LocalMachine\\TrustedPeople\\{tp}' -ErrorAction SilentlyContinue"
-                f"; Remove-Item 'Cert:\\LocalMachine\\Root\\{tp}' -ErrorAction SilentlyContinue"
+        if shell_dir.exists() or tp or _shell_ext_pkg_registered():
+            cmd = (
+                "Get-AppxPackage -Name 'ClickShift.ShellExtension' -ErrorAction SilentlyContinue | Remove-AppxPackage -ErrorAction SilentlyContinue; "
+                "Get-AppxPackage -Name 'ConFas.ShellExtension' -ErrorAction SilentlyContinue | Remove-AppxPackage -ErrorAction SilentlyContinue"
             )
-        subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", _ps_encoded(cmd)],
-            capture_output=True, text=True, timeout=20,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
+            if tp:
+                cmd += (
+                    f"; Remove-Item 'Cert:\\LocalMachine\\TrustedPeople\\{tp}' -ErrorAction SilentlyContinue"
+                    f"; Remove-Item 'Cert:\\LocalMachine\\Root\\{tp}' -ErrorAction SilentlyContinue"
+                )
+            subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", _ps_encoded(cmd)],
+                capture_output=True, text=True, timeout=20,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
         import shutil
         if shell_dir.exists():
             shutil.rmtree(shell_dir, ignore_errors=True)
     except Exception:
         pass
+
+
+_SKIP_CLASS_KEYS = frozenset({
+    "systemfileassociations", "clsid", "interface", "typelib", "appid",
+    "directshow", "media type", "mediafoundation", "packagedcom",
+    "installer", "local settings", "wow6432node", "activatableclasses",
+    "extensions", "component categories", "mime",
+})
 
 
 def _purge_duplicate_class_verbs() -> None:
@@ -838,7 +970,8 @@ def _purge_duplicate_class_verbs() -> None:
                 except OSError:
                     break
         for sub in subs:
-            if sub.lower() == "systemfileassociations":
+            sl = sub.lower()
+            if sl in _SKIP_CLASS_KEYS or sub.startswith("{"):
                 continue
             sh_path = rf"Software\Classes\{sub}\shell"
             try:
@@ -902,35 +1035,45 @@ def install_context_menu(
     exts = extensions or MENU_EXTENSIONS
     total_exts = max(1, len(exts))
     n = 0
-    for idx, ext in enumerate(exts):
-        if idx % 6 == 0 or idx == total_exts - 1:
-            pct = 55.0 + (idx / total_exts) * 30.0
-            _report(f"Configuring right-click actions (.{ext})...", pct)
-        locations = _verb_locations(ext)
-        primary_loc = rf"Software\Classes\SystemFileAssociations\.{ext}"
-        targets = menu_targets(ext)
-        default_t = targets[0] if targets else None
-        ok = False
-        for loc in locations:
-            # Remove any legacy flat top-level verbs and any duplicate ProgID cascading menus
-            for verb, _label, _cmd in _verbs_for(ext):
-                _delete_verb(loc, verb)
-            if shell_ext_ok or loc != primary_loc:
-                _delete_verb(loc, VERB_MENU)
-        if shell_ext_ok:
-            ok = True
-        else:
-            try:
-                _write_cascading_menu(primary_loc, targets, default_t)
-                ok = True
-            except Exception as exc:
-                _log(f"cascading menu .{ext} failed at {primary_loc}: {exc}")
+    if winreg is not None:
         try:
-            _register_openwith(ext)
-        except Exception as exc:
-            _log(f"open-with registration for .{ext} failed: {exc}")
-        if ok:
-            n += 1
+            _register_openwith_app()
+        except Exception:
+            pass
+    _OPENWITH_APP_LOCAL.registered = True
+    try:
+        for idx, ext in enumerate(exts):
+            if idx % 6 == 0 or idx == total_exts - 1:
+                pct = 55.0 + (idx / total_exts) * 30.0
+                _report(f"Configuring right-click actions (.{ext})...", pct)
+            locations = _verb_locations(ext)
+            primary_loc = rf"Software\Classes\SystemFileAssociations\.{ext}"
+            targets = menu_targets(ext)
+            default_t = targets[0] if targets else None
+            verb_names = [f"ClickShift.To{t.capitalize()}" for t in targets]
+            all_verbs = [VERB_AUTO, *verb_names, VERB_CHOOSE]
+            ok = False
+            for loc in locations:
+                for verb in all_verbs:
+                    _delete_verb(loc, verb)
+                if shell_ext_ok or loc != primary_loc:
+                    _delete_verb(loc, VERB_MENU)
+            if shell_ext_ok:
+                ok = True
+            else:
+                try:
+                    _write_cascading_menu(primary_loc, targets, default_t)
+                    ok = True
+                except Exception as exc:
+                    _log(f"cascading menu .{ext} failed at {primary_loc}: {exc}")
+            try:
+                _register_openwith(ext)
+            except Exception as exc:
+                _log(f"open-with registration for .{ext} failed: {exc}")
+            if ok:
+                n += 1
+    finally:
+        _OPENWITH_APP_LOCAL.registered = False
     # Clean up universal '*' verbs so they don't duplicate or override per-extension target lists
     if winreg is not None:
         _delete_verb(r"Software\Classes\*", VERB_MENU)
@@ -955,10 +1098,11 @@ def remove_context_menu(extensions: Optional[list[str]] = None) -> int:
     exts = extensions or MENU_EXTENSIONS
     n = 0
     for ext in exts:
+        verb_names = _verb_names_for(ext)
         for base in _verb_locations(ext):
             if _delete_verb(base, VERB_MENU):
                 n += 1
-            for verb, _label, _cmd in _verbs_for(ext):
+            for verb in verb_names:
                 if _delete_verb(base, verb):
                     n += 1
         _unregister_openwith(ext)
@@ -987,11 +1131,15 @@ def refresh_explorer() -> None:
             return
         HWND_BROADCAST = 0xFFFF
         WM_SETTINGCHANGE = 0x1A
+        SMTO_ABORTIFHUNG = 0x0002
         SHChangeNotify = windll.shell32.SHChangeNotify
         SHCNE_ASSOCCHANGED = 0x08000000
         SHCNF_IDLIST = 0x0000
         SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None)
-        windll.user32.SendMessageW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, "Environment")
+        windll.user32.SendMessageTimeoutW(
+            HWND_BROADCAST, WM_SETTINGCHANGE, 0, "Environment",
+            SMTO_ABORTIFHUNG, 250, ctypes.byref(ctypes.c_size_t()),
+        )
     except Exception:
         pass
 
@@ -1003,7 +1151,7 @@ def refresh_explorer() -> None:
 class WatchFolder(threading.Thread):
     """Poll-based watcher (dependency-free, works from frozen EXE reliably)."""
 
-    POLL_SECONDS = 1.0
+    POLL_SECONDS = 0.5
     STABLE_CHECKS = 2   # file size must be unchanged N polls before we convert
 
     def __init__(self, folder: Path, cfg: dict, on_done=None) -> None:
@@ -1012,52 +1160,86 @@ class WatchFolder(threading.Thread):
         self.cfg = cfg
         self.on_done = on_done
         self.stop_event = threading.Event()
-        self._seen: dict[str, tuple[int, int]] = {}   # path -> (size, stable_count)
-        self._produced: set[str] = set()              # outputs created by watcher itself
+        self._seen: dict[str, tuple[int, int]] = {}          # path -> (size, stable_count)
+        self._done: dict[str, tuple[int, int]] = {}          # path -> (mtime_ns, size) already processed
+        self._produced: set[str] = set()                     # outputs created by watcher itself
+        self._inflight: set[str] = set()
+        self._state_lock = threading.Lock()
 
     def run(self) -> None:
-        from .engine import newest_target_for, get_engine
+        from concurrent.futures import ThreadPoolExecutor
+        from .formats import newest_target_for
+        from .engine import get_engine
+
         self.folder.mkdir(parents=True, exist_ok=True)
         _log(f"watching {self.folder} (auto target: {self.cfg.get('auto_target')})")
-        while not self.stop_event.is_set():
-            try:
-                now = {}
-                for p in self.folder.iterdir():
-                    if (p.is_file() and not p.name.startswith("~$")
-                            and not p.name.endswith((".clickshift-debug.txt", ".confas-debug.txt"))):
-                        try:
-                            now[str(p)] = p.stat().st_size
-                        except OSError:
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="clickshift-drop") as pool:
+            while not self.stop_event.is_set():
+                try:
+                    now: dict[str, tuple[int, int]] = {}
+                    with os.scandir(self.folder) as it:
+                        for entry in it:
+                            nm = entry.name
+                            if nm.startswith("~$") or nm.endswith((".clickshift-debug.txt", ".confas-debug.txt")):
+                                continue
+                            try:
+                                if not entry.is_file(follow_symlinks=False):
+                                    continue
+                                st = entry.stat(follow_symlinks=False)
+                                now[entry.path] = (st.st_mtime_ns, st.st_size)
+                            except OSError:
+                                continue
+                    with self._state_lock:
+                        produced = set(self._produced)
+                        inflight = set(self._inflight)
+                        done_map = dict(self._done)
+                    for path_str, (mtime_ns, size) in now.items():
+                        if path_str in produced or path_str in inflight:
                             continue
-                for path_str, size in now.items():
-                    if path_str in self._produced:
-                        continue
-                    prev = self._seen.get(path_str)
-                    if prev is None:
-                        self._seen[path_str] = (size, 0)
-                        continue
-                    old_size, stable = prev
-                    if size != old_size:
-                        self._seen[path_str] = (size, 0)      # still being written
-                        continue
-                    if stable < self.STABLE_CHECKS:
-                        self._seen[path_str] = (size, stable + 1)
-                        continue
-                    # file is complete -> convert once (skip our own outputs)
-                    del self._seen[path_str]
-                    src = Path(path_str)
-                    out_ext = (self.cfg.get("auto_target") or "").lower()
-                    if out_ext and src.stem.lower().endswith("_" + out_ext):
-                        continue
-                    self._convert(src, newest_target_for, get_engine)
-                # forget vanished files
-                for gone in set(self._seen) - set(now):
-                    del self._seen[gone]
-                for gone in set(self._produced) - set(now):
-                    self._produced.discard(gone)
-            except Exception as exc:
-                _log(f"watch loop error: {exc}")
-            self.stop_event.wait(self.POLL_SECONDS)
+                        if done_map.get(path_str) == (mtime_ns, size):
+                            continue
+                        prev = self._seen.get(path_str)
+                        if prev is None:
+                            self._seen[path_str] = (size, 0)
+                            continue
+                        old_size, stable = prev
+                        if size != old_size:
+                            self._seen[path_str] = (size, 0)      # still being written
+                            continue
+                        if stable < self.STABLE_CHECKS:
+                            self._seen[path_str] = (size, stable + 1)
+                            continue
+                        # file is complete -> dispatch once (skip our own outputs)
+                        del self._seen[path_str]
+                        src = Path(path_str)
+                        out_ext = (self.cfg.get("auto_target") or "").lower()
+                        if out_ext and src.stem.lower().endswith("_" + out_ext):
+                            with self._state_lock:
+                                self._done[path_str] = (mtime_ns, size)
+                            continue
+                        with self._state_lock:
+                            self._inflight.add(path_str)
+                        pool.submit(self._run_job, path_str, (mtime_ns, size), newest_target_for, get_engine)
+                    # forget vanished files
+                    now_keys = set(now)
+                    for gone in set(self._seen) - now_keys:
+                        del self._seen[gone]
+                    with self._state_lock:
+                        for gone in self._produced - now_keys:
+                            self._produced.discard(gone)
+                        for gone in set(self._done) - now_keys:
+                            del self._done[gone]
+                except Exception as exc:
+                    _log(f"watch loop error: {exc}")
+                self.stop_event.wait(self.POLL_SECONDS)
+
+    def _run_job(self, path_str: str, stamp: tuple[int, int], newest_fn, engine_getter) -> None:
+        try:
+            self._convert(Path(path_str), newest_fn, engine_getter)
+        finally:
+            with self._state_lock:
+                self._inflight.discard(path_str)
+                self._done[path_str] = stamp
 
     def _convert(self, src: Path, newest_fn, engine_getter) -> None:
         target = (self.cfg.get("auto_target") or "pdf").lower().lstrip(".")
@@ -1072,7 +1254,8 @@ class WatchFolder(threading.Thread):
         eng = engine_getter(enable_ml=bool(self.cfg.get("ml_enabled", True)))
         res = eng.convert(src, target)
         if res.ok and res.target:
-            self._produced.add(str(Path(res.target)))
+            with self._state_lock:
+                self._produced.add(str(Path(res.target)))
         _log(f"watch-converted {src.name} -> {res.target} via {res.backend} "
              f"({res.elapsed_ms:.0f} ms, ok={res.ok}{', err=' + res.error if res.error else ''})")
         if self.on_done:
@@ -1264,18 +1447,29 @@ def _ipc_request(payload_fields: dict, progress=None) -> Optional[list]:
     if os.environ.get("CLICKSHIFT_NO_IPC") == "1":
         return None
     f = ipc_file()
-    if not f.exists():
+    try:
+        raw_meta = f.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except Exception:
         return None
     try:
-        from .engine import ConversionResult
-        meta = json.loads(f.read_text(encoding="utf-8"))
+        from .formats import ConversionResult
+        meta = json.loads(raw_meta)
         pid = int(meta.get("pid", 0))
         if pid == os.getpid() or (pid and not _pid_alive(pid)):
             return None
         port = int(meta["port"])
         token = str(meta["token"])
         results = []
-        with socket.create_connection(("127.0.0.1", port), timeout=1.5) as sock:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(0.4)
+        with sock:
+            sock.connect(("127.0.0.1", port))
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
             sock.settimeout(300.0)
             rfile = sock.makefile("r", encoding="utf-8")
             wfile = sock.makefile("w", encoding="utf-8")
@@ -1382,6 +1576,9 @@ def perform_background_update_check(
         return "disabled"
     if updater_mod is None:
         from . import updater as updater_mod
+    is_store_fn = getattr(updater_mod, "is_packaged_store_app", None)
+    if callable(is_store_fn) and is_store_fn():
+        return "store_managed"
     cfg["last_update_check_ts"] = float(time.time() if now is None else now)
     save_config(cfg)
     try:

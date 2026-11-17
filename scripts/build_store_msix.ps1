@@ -11,7 +11,7 @@
 param(
     [string]$IdentityName = "ClickShift.Converter",
     [string]$Publisher = "CN=ClickShift",
-    [string]$Version = "1.0.19.0",
+    [string]$Version = "1.0.20.0",
     [string]$ExePath = ""
 )
 

@@ -54,6 +54,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import ipaddress
+import itertools
 import json
 import logging
 import os
@@ -200,6 +201,7 @@ def _request(url: str, method: str = "GET", body: Optional[dict[str, Any]] = Non
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("User-Agent", "ClickShift/CloudSync")
     req.add_header("Content-Type", "application/json")
+    req.add_header("Accept-Encoding", "gzip")
     for k, v in (headers or {}).items():
         req.add_header(k, v)
     try:
@@ -209,6 +211,14 @@ def _request(url: str, method: str = "GET", body: Optional[dict[str, Any]] = Non
             if len(raw) > MAX_RESPONSE_BYTES:
                 log.warning("response from %s exceeds size cap - discarded", url[:100])
                 return None
+            resp_headers = getattr(resp, "headers", None)
+            if resp_headers and str(resp_headers.get("Content-Encoding", "")).lower() == "gzip":
+                import gzip
+
+                raw = gzip.decompress(raw)
+                if len(raw) > MAX_RESPONSE_BYTES:
+                    log.warning("decompressed response from %s exceeds size cap - discarded", url[:100])
+                    return None
             text = raw.decode("utf-8")
             return json.loads(text) if text.strip() else {}
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError,
@@ -233,6 +243,16 @@ def _clean_reward(v: Any, n: int = 1) -> Any:
     return np.clip(arr, -bound, bound)
 
 
+class _ArmAccum:
+    __slots__ = ("A_sum", "b_sum", "nA", "n")
+
+    def __init__(self) -> None:
+        self.A_sum: Any = None
+        self.b_sum: Any = None
+        self.nA: int = 0
+        self.n: int = 0
+
+
 def merge_states(states: list[Any]) -> dict[str, Any]:
     """Merge contributor states into one pooled state.
 
@@ -246,7 +266,7 @@ def merge_states(states: list[Any]) -> dict[str, Any]:
     negative counts, absurd latencies, >24h timings, oversized payloads) is
     dropped arm-by-arm instead of poisoning the pool.
     """
-    bandit: dict[str, dict[str, Any]] = {}
+    bandit: dict[str, _ArmAccum] = {}
     medians: dict[str, float] = {}
     clock = 0
     for st in states:
@@ -259,7 +279,7 @@ def merge_states(states: list[Any]) -> dict[str, Any]:
         arms = st.get("bandit") or {}
         if not isinstance(arms, dict):
             continue
-        for arm, s in list(arms.items())[:512]:
+        for arm, s in itertools.islice(arms.items(), 512):
             if not isinstance(arm, str) or len(arm) > 128 or not isinstance(s, dict):
                 continue
             try:
@@ -268,22 +288,29 @@ def merge_states(states: list[Any]) -> dict[str, Any]:
                     continue
                 A = np.array(s["A"], dtype=float)
                 b = _clean_reward(s["b"], n=max(n, 1))
+                if b is None or not np.all(np.isfinite(A)):
+                    continue
+                acc = bandit.get(arm)
+                if acc is None:
+                    acc = _ArmAccum()
+                    bandit[arm] = acc
+                acc.n += n
+                if n > 0:                       # only real learners vote on the prior
+                    if acc.A_sum is None or acc.b_sum is None:
+                        acc.A_sum = A.copy()
+                        acc.b_sum = b.copy()
+                    else:
+                        if A.shape != acc.A_sum.shape or b.shape != acc.b_sum.shape:
+                            continue
+                        acc.A_sum += A
+                        acc.b_sum += b
+                    acc.nA += 1
             except Exception:
                 continue
-            if b is None or not np.all(np.isfinite(A)):
-                continue
-            d: dict[str, Any] = bandit.setdefault(
-                arm, {"A_sum": None, "nA": 0, "b_sum": None, "n": 0}
-            )
-            d["n"] = int(d["n"]) + n
-            if n > 0:                       # only real learners vote on the prior
-                d["nA"] = int(d["nA"]) + 1
-                d["A_sum"] = A if d["A_sum"] is None else d["A_sum"] + A
-                d["b_sum"] = b if d["b_sum"] is None else d["b_sum"] + b
         pairs = st.get("median_ms") or {}
         if not isinstance(pairs, dict):
             continue
-        for pair, ms in list(pairs.items())[:2048]:
+        for pair, ms in itertools.islice(pairs.items(), 2048):
             try:
                 ms_val = float(ms)
             except (TypeError, ValueError):
@@ -293,14 +320,14 @@ def merge_states(states: list[Any]) -> dict[str, Any]:
             if pair not in medians or ms_val < medians[pair]:
                 medians[pair] = ms_val
     out_bandit: dict[str, Any] = {}
-    for arm, d in bandit.items():
-        if d["A_sum"] is None or d["b_sum"] is None:
+    for arm, acc in bandit.items():
+        if acc.A_sum is None or acc.b_sum is None:
             continue
-        denom = max(int(d["nA"]), 1)
+        denom = max(acc.nA, 1)
         out_bandit[arm] = {
-            "A": (d["A_sum"] / denom).tolist(),
-            "b": (d["b_sum"] / denom).tolist(),
-            "n": min(int(d["n"]), 1_000_000),
+            "A": (acc.A_sum / denom).tolist(),
+            "b": (acc.b_sum / denom).tolist(),
+            "n": min(acc.n, 1_000_000),
         }
     return {"version": 1, "clock": clock + 1, "updated": time.time(),
             "bandit": out_bandit, "median_ms": medians}
@@ -335,12 +362,23 @@ class CloudSync:
         self.mode = str(cfg.get("cloud_mode") or "url").lower()
         self.url = str(cfg.get("cloud_url") or "").strip()
         self.gist_id = str(cfg.get("cloud_gist_id") or DEFAULT_GIST_ID).strip()
-        self.token = token()
+        self._token: Optional[str] = token() if cfg.get("cloud_enabled") else None
         self.interval = float(cfg.get("cloud_interval_s", 900))
         self.pull_on_start = bool(cfg.get("cloud_pull_on_start", True))
         self._timer: Optional[threading.Timer] = None
         self._next_at: float = 0.0
         self._lock = threading.Lock()
+        self._timer_lock = threading.Lock()
+
+    @property
+    def token(self) -> str:
+        if self._token is None:
+            self._token = token()
+        return self._token
+
+    @token.setter
+    def token(self, value: str) -> None:
+        self._token = value
 
     # -- enabled? ----------------------------------------------------------- #
     def enabled(self) -> bool:
@@ -377,7 +415,7 @@ class CloudSync:
                 digest = hashlib.sha256(
                     json.dumps(state, sort_keys=True).encode("utf-8")).hexdigest()[:16]
                 self.selector.bandit.import_state(state["bandit"])
-                for pair, ms in list((state.get("median_ms") or {}).items())[:2048]:
+                for pair, ms in itertools.islice((state.get("median_ms") or {}).items(), 2048):
                     try:
                         ms_val = float(ms)
                     except (TypeError, ValueError):
@@ -388,9 +426,11 @@ class CloudSync:
                     if cur is None or ms_val < cur:
                         self.selector.median_ms[pair] = ms_val
                 self.selector._save_state()
-                self._set_meta("cloud_last_pull", time.time())
-                self._set_meta("cloud_clock", int(state.get("clock", 0)))
-                self._set_meta("cloud_last_sha256", digest)
+                self._set_meta_many({
+                    "cloud_last_pull": time.time(),
+                    "cloud_clock": int(state.get("clock", 0)),
+                    "cloud_last_sha256": digest,
+                })
                 log.info("pulled cloud state %s (%d arms)", digest,
                          len(state["bandit"]))
                 return True
@@ -437,8 +477,10 @@ class CloudSync:
                 ok = _request(f"{self.url.rstrip('/')}/state", "PUT",
                               payload) is not None
             if ok:
-                self._set_meta("cloud_last_push", time.time())
-                self._set_meta("cloud_clock", payload["clock"])
+                self._set_meta_many({
+                    "cloud_last_push": time.time(),
+                    "cloud_clock": payload["clock"],
+                })
             return ok
 
     def _gh_headers(self) -> dict[str, str]:
@@ -457,38 +499,36 @@ class CloudSync:
         if not isinstance(files, dict):
             return False
         mine = f"contrib-{_contributor_id(self.cfg)}.json"
-        keep: dict[str, dict[str, str]] = {}
+        contribs: list[Any] = []
         for k, v in files.items():
-            if not isinstance(v, dict):
+            if not isinstance(v, dict) or k == mine or k in ("merged.json", "state.json"):
                 continue
             content = v.get("content")
-            if (isinstance(k, str) and k.endswith(".json") and isinstance(content, str)
-                    and len(content) <= MAX_CONTRIB_BYTES):
-                keep[k] = {"content": content}
-        # strip our own stale copy, merge everything, re-add merged + contribution
-        keep.pop(mine, None)
-        keep.pop("merged.json", None)
-        contribs: list[Any] = []
-        for _name, f in keep.items():
-            try:
-                contribs.append(json.loads(f["content"]))
-            except Exception:
-                continue
+            if isinstance(k, str) and k.startswith("contrib-") and k.endswith(".json") and isinstance(content, str) and len(content) <= MAX_CONTRIB_BYTES:
+                try:
+                    contribs.append(json.loads(content))
+                except Exception:
+                    continue
         contribs.append(payload)
-        keep[mine] = {"content": json.dumps(payload)}
-        keep["merged.json"] = {"content": json.dumps(merge_states(contribs))}
+        patch_files = {
+            mine: {"content": json.dumps(payload)},
+            "merged.json": {"content": json.dumps(merge_states(contribs))},
+        }
         resp = _request(f"{API_ROOT}/gists/{self.gist_id}", "PATCH",
-                        {"files": keep}, headers=self._gh_headers())
+                        {"files": patch_files}, headers=self._gh_headers())
         return resp is not None
 
     # -- meta --------------------------------------------------------------- #
     def _set_meta(self, key: str, value: Any) -> None:
+        self._set_meta_many({key: value})
+
+    def _set_meta_many(self, updates: dict[str, Any]) -> None:
         try:
             from .monitor import load_config, save_config
             cfg = load_config()
-            cfg[key] = value
+            cfg.update(updates)
             save_config(cfg)
-            self.cfg[key] = value
+            self.cfg.update(updates)
         except Exception:
             pass
 
@@ -507,16 +547,17 @@ class CloudSync:
         in exactly one upload."""
         debounce = float(self.cfg.get("cloud_debounce_s", 60))
         actual_delay = max(delay if delay is not None else self.interval, debounce)
-        now = time.time()
-        if self._timer is not None and self._next_at - debounce < now:
-            return                      # one already pending soon enough
-        if self._timer is not None:
-            self._timer.cancel()
-        self._next_at = now + actual_delay
-        timer = threading.Timer(actual_delay, self._tick)
-        timer.daemon = True
-        timer.start()
-        self._timer = timer
+        with self._timer_lock:
+            now = time.time()
+            if self._timer is not None and self._next_at - debounce < now:
+                return                      # one already pending soon enough
+            if self._timer is not None:
+                self._timer.cancel()
+            self._next_at = now + actual_delay
+            timer = threading.Timer(actual_delay, self._tick)
+            timer.daemon = True
+            timer.start()
+            self._timer = timer
 
     def _schedule_now(self) -> None:
         """Called by the selector after every recorded conversion."""
@@ -530,9 +571,10 @@ class CloudSync:
             self._schedule(self.interval)
 
     def stop(self) -> None:
-        if self._timer is not None:
-            self._timer.cancel()
-            self._timer = None
+        with self._timer_lock:
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
 
     def status(self) -> dict[str, Any]:
         return {"enabled": self.enabled(), "mode": self.mode,
@@ -586,8 +628,7 @@ def merge_gist_worker(gist_id: Optional[str] = None, token_: Optional[str] = Non
             continue
     merged = merge_states(contribs)
     if not dry_run and tok:
-        keep["merged.json"] = {"content": json.dumps(merged)}
-        _request(f"{API_ROOT}/gists/{gid}", "PATCH", {"files": keep},
+        _request(f"{API_ROOT}/gists/{gid}", "PATCH", {"files": {"merged.json": {"content": json.dumps(merged)}}},
                  headers=headers)
     return merged
 

@@ -20,6 +20,10 @@ static LONG g_cDllRef = 0;
 static CRITICAL_SECTION g_cs;
 static bool g_csInit = false;
 static std::wstring g_lastExt;
+static std::wstring g_cachedExe;
+static std::wstring g_cachedIcon;
+static ULONGLONG g_pathsTick = 0;
+static const ULONGLONG kPathCacheTtlMs = 30000;
 
 // {A7C2D814-3E5F-4B9C-9A12-8D4E6F0C3A5E}
 static const CLSID CLSID_ClickShiftExplorerCommand = {
@@ -222,8 +226,51 @@ static std::wstring WriteFilelistFallback(const std::vector<std::wstring>& files
     return path;
 }
 
-static std::wstring GetClickShiftExePath() {
-    wchar_t modPath[MAX_PATH] = {0};
+static std::wstring ReadRegString(HKEY root, const wchar_t* subkey, const wchar_t* valueName) {
+    wchar_t buf[1024];
+    buf[0] = 0;
+    DWORD cb = sizeof(buf);
+    LONG rc = RegGetValueW(root, subkey, valueName, RRF_RT_REG_SZ, nullptr, buf, &cb);
+    if (rc == ERROR_SUCCESS && buf[0]) {
+        return std::wstring(buf);
+    }
+    if (rc == ERROR_MORE_DATA && cb > sizeof(buf)) {
+        std::vector<wchar_t> large(cb / sizeof(wchar_t) + 1, 0);
+        if (RegGetValueW(root, subkey, valueName, RRF_RT_REG_SZ, nullptr, large.data(), &cb) == ERROR_SUCCESS && large[0]) {
+            return std::wstring(large.data());
+        }
+    }
+    return L"";
+}
+
+static std::wstring ExtractExeFromCommand(const std::wstring& raw) {
+    size_t start = raw.find_first_not_of(L" \t");
+    if (start == std::wstring::npos) return L"";
+    std::wstring cmd = raw.substr(start);
+    if (cmd[0] == L'"') {
+        size_t endQ = cmd.find(L'"', 1);
+        if (endQ != std::wstring::npos) {
+            std::wstring exe = cmd.substr(1, endQ - 1);
+            if (IsValidExeFile(exe)) return exe;
+        }
+        return L"";
+    }
+    std::wstring low = ToLower(cmd);
+    size_t pos = 0;
+    while ((pos = low.find(L".exe", pos)) != std::wstring::npos) {
+        size_t endExe = pos + 4;
+        if (endExe == cmd.size() || cmd[endExe] == L' ' || cmd[endExe] == L'\t') {
+            std::wstring exe = cmd.substr(0, endExe);
+            if (IsValidExeFile(exe)) return exe;
+        }
+        pos = endExe;
+    }
+    return IsValidExeFile(cmd) ? cmd : L"";
+}
+
+static std::wstring ResolveClickShiftExeUncached() {
+    wchar_t modPath[MAX_PATH];
+    modPath[0] = 0;
     if (GetModuleFileNameW(g_hModule, modPath, MAX_PATH) > 0) {
         PathRemoveFileSpecW(modPath);
         std::wstring packagedExe = std::wstring(modPath) + L"\\ClickShift.exe";
@@ -231,41 +278,29 @@ static std::wstring GetClickShiftExePath() {
             return packagedExe;
         }
     }
-    wchar_t buf[32768] = {0};
-    DWORD cb = sizeof(buf);
-    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\ClickShift", L"ExePath",
-                     RRF_RT_REG_SZ, nullptr, buf, &cb) == ERROR_SUCCESS && buf[0]) {
-        std::wstring candidate(buf);
-        if (IsValidExeFile(candidate)) {
-            return candidate;
-        }
+    std::wstring exeReg = ReadRegString(HKEY_CURRENT_USER, L"Software\\ClickShift", L"ExePath");
+    if (!exeReg.empty() && IsValidExeFile(exeReg)) {
+        return exeReg;
     }
-    wchar_t localApp[MAX_PATH] = {0};
+    wchar_t localApp[MAX_PATH];
+    localApp[0] = 0;
     if (GetEnvironmentVariableW(L"LOCALAPPDATA", localApp, MAX_PATH) > 0) {
         std::wstring candidate = std::wstring(localApp) + L"\\ClickShift\\ClickShift.exe";
         if (IsValidExeFile(candidate)) {
             return candidate;
         }
     }
-    cb = sizeof(buf);
-    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
-                     L"ClickShift", RRF_RT_REG_SZ, nullptr, buf, &cb) == ERROR_SUCCESS && buf[0]) {
-        std::wstring cmd(buf);
-        if (!cmd.empty() && cmd[0] == L'"') {
-            size_t endQ = cmd.find(L'"', 1);
-            if (endQ != std::wstring::npos) {
-                std::wstring exe = cmd.substr(1, endQ - 1);
-                if (IsValidExeFile(exe)) {
-                    return exe;
-                }
-            }
-        }
+    std::wstring runCmd = ReadRegString(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", L"ClickShift");
+    if (!runCmd.empty()) {
+        std::wstring exe = ExtractExeFromCommand(runCmd);
+        if (!exe.empty()) return exe;
     }
     return L"";
 }
 
-static std::wstring GetIconString() {
-    wchar_t modPath[MAX_PATH] = {0};
+static std::wstring ResolveIconStringUncached(const std::wstring& exe) {
+    wchar_t modPath[MAX_PATH];
+    modPath[0] = 0;
     if (GetModuleFileNameW(g_hModule, modPath, MAX_PATH) > 0) {
         PathRemoveFileSpecW(modPath);
         std::wstring ico = std::wstring(modPath) + L"\\clickshift.ico";
@@ -273,16 +308,67 @@ static std::wstring GetIconString() {
             return ico;
         }
     }
-    std::wstring exe = GetClickShiftExePath();
     if (!exe.empty()) {
         return exe + L",0";
     }
     return L"shell32.dll,-154";
 }
 
+static void InvalidatePathCache() {
+    if (g_csInit) {
+        EnterCriticalSection(&g_cs);
+        g_pathsTick = 0;
+        g_cachedExe.clear();
+        g_cachedIcon.clear();
+        LeaveCriticalSection(&g_cs);
+    }
+}
+
+static void EnsurePathsCached(std::wstring* outExe, std::wstring* outIcon) {
+    ULONGLONG now = GetTickCount64();
+    if (g_csInit) {
+        EnterCriticalSection(&g_cs);
+        bool fresh = (g_pathsTick != 0) && ((now - g_pathsTick) < kPathCacheTtlMs) && !g_cachedIcon.empty();
+        if (fresh) {
+            if (outExe) *outExe = g_cachedExe;
+            if (outIcon) *outIcon = g_cachedIcon;
+            LeaveCriticalSection(&g_cs);
+            return;
+        }
+        LeaveCriticalSection(&g_cs);
+    }
+    std::wstring exe = ResolveClickShiftExeUncached();
+    std::wstring ico = ResolveIconStringUncached(exe);
+    if (g_csInit) {
+        EnterCriticalSection(&g_cs);
+        g_cachedExe = exe;
+        g_cachedIcon = ico;
+        g_pathsTick = GetTickCount64();
+        LeaveCriticalSection(&g_cs);
+    }
+    if (outExe) *outExe = exe;
+    if (outIcon) *outIcon = ico;
+}
+
+static std::wstring GetClickShiftExePath() {
+    std::wstring exe;
+    EnsurePathsCached(&exe, nullptr);
+    return exe;
+}
+
+static std::wstring GetIconString() {
+    std::wstring ico;
+    EnsurePathsCached(nullptr, &ico);
+    return ico;
+}
+
 static void LaunchClickShift(IShellItemArray* psiArray, const std::wstring& target, bool chooseMode) {
     if (!psiArray) return;
     std::wstring exe = GetClickShiftExePath();
+    if (exe.empty()) {
+        InvalidatePathCache();
+        exe = GetClickShiftExePath();
+    }
     if (exe.empty()) {
         MessageBoxW(nullptr, L"ClickShift executable could not be found. Try running ClickShift setup again.",
                     L"ClickShift", MB_OK | MB_ICONWARNING);
@@ -340,6 +426,7 @@ static void LaunchClickShift(IShellItemArray* psiArray, const std::wstring& targ
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
     } else {
+        InvalidatePathCache();
         MessageBoxW(nullptr, L"ClickShift could not start the conversion process. Try reinstalling ClickShift.",
                     L"ClickShift", MB_OK | MB_ICONERROR);
     }
@@ -348,17 +435,39 @@ static void LaunchClickShift(IShellItemArray* psiArray, const std::wstring& targ
 // ---------------------------------------------------------------------------
 // Sub-command item (Auto, Convert to <EXT>, or Choose format...)
 // ---------------------------------------------------------------------------
-class ClickShiftSubCommand : public IExplorerCommand, public IObjectWithSite {
+class ClickShiftSubCommand final : public IExplorerCommand, public IObjectWithSite {
     LONG m_cRef;
     IUnknown* m_pSite;
     std::wstring m_title;
     std::wstring m_target;
     bool m_isAuto;
     bool m_isChoose;
+    const ExtRule* m_rule;
+    bool m_resolved;
+
+    void ResolveFallback(IShellItemArray* psiItemArray) {
+        if (m_resolved) return;
+        std::wstring ext = ExtractExtFromArray(psiItemArray);
+        if (!ext.empty()) {
+            SetCachedExt(ext);
+        } else {
+            ext = GetCachedExt();
+        }
+        if (!ext.empty()) {
+            m_rule = FindRule(ext);
+            if (m_isAuto && m_rule && m_rule->defaultTarget) {
+                m_title = L"Auto - Convert to " + ToUpper(m_rule->defaultTarget) + L" (latest format)";
+            }
+            m_resolved = true;
+        }
+    }
 
 public:
-    ClickShiftSubCommand(const std::wstring& title, const std::wstring& target, bool isAuto, bool isChoose)
-        : m_cRef(1), m_pSite(nullptr), m_title(title), m_target(target), m_isAuto(isAuto), m_isChoose(isChoose) {
+    ClickShiftSubCommand(const std::wstring& title, const std::wstring& target,
+                         bool isAuto, bool isChoose,
+                         const ExtRule* rule = nullptr, bool resolved = false)
+        : m_cRef(1), m_pSite(nullptr), m_title(title), m_target(target),
+          m_isAuto(isAuto), m_isChoose(isChoose), m_rule(rule), m_resolved(resolved) {
         InterlockedIncrement(&g_cDllRef);
     }
 
@@ -411,15 +520,8 @@ public:
     // IExplorerCommand
     IFACEMETHODIMP GetTitle(IShellItemArray* psiItemArray, LPWSTR* ppszName) override {
         if (!ppszName) return E_POINTER;
-        if (m_isAuto) {
-            std::wstring ext = ExtractExtFromArray(psiItemArray);
-            if (!ext.empty()) SetCachedExt(ext);
-            else ext = GetCachedExt();
-            const ExtRule* rule = FindRule(ext);
-            if (rule && rule->defaultTarget) {
-                std::wstring dyn = L"Auto - Convert to " + ToUpper(rule->defaultTarget) + L" (latest format)";
-                return SHStrDupW(dyn.c_str(), ppszName);
-            }
+        if (!m_resolved && m_isAuto) {
+            ResolveFallback(psiItemArray);
         }
         return SHStrDupW(m_title.c_str(), ppszName);
     }
@@ -442,15 +544,12 @@ public:
 
     IFACEMETHODIMP GetState(IShellItemArray* psiItemArray, BOOL, EXPCMDSTATE* pCmdState) override {
         if (!pCmdState) return E_POINTER;
-        std::wstring ext = ExtractExtFromArray(psiItemArray);
-        if (!ext.empty()) SetCachedExt(ext);
-        else ext = GetCachedExt();
-        if (!m_isAuto && !m_isChoose && !ext.empty()) {
-            const ExtRule* rule = FindRule(ext);
-            if (rule && !RuleHasTarget(rule, m_target)) {
-                *pCmdState = ECS_HIDDEN;
-                return S_OK;
-            }
+        if (!m_resolved) {
+            ResolveFallback(psiItemArray);
+        }
+        if (!m_isAuto && !m_isChoose && m_rule && !RuleHasTarget(m_rule, m_target)) {
+            *pCmdState = ECS_HIDDEN;
+            return S_OK;
         }
         *pCmdState = ECS_ENABLED;
         return S_OK;
@@ -476,7 +575,7 @@ public:
 // ---------------------------------------------------------------------------
 // Sub-command enumerator
 // ---------------------------------------------------------------------------
-class ClickShiftEnumCommands : public IEnumExplorerCommand {
+class ClickShiftEnumCommands final : public IEnumExplorerCommand {
     LONG m_cRef;
     std::vector<IExplorerCommand*> m_cmds;
     size_t m_idx;
@@ -485,26 +584,28 @@ public:
     ClickShiftEnumCommands(const std::wstring& ext) : m_cRef(1), m_idx(0) {
         InterlockedIncrement(&g_cDllRef);
         const ExtRule* rule = FindRule(ext);
+        bool resolved = !ext.empty();
+        m_cmds.reserve(rule ? 18 : 24);
         std::wstring autoTitle = L"Auto - Convert to latest format";
         if (rule && rule->defaultTarget) {
             autoTitle = L"Auto - Convert to " + ToUpper(rule->defaultTarget) + L" (latest format)";
         }
-        m_cmds.push_back(new ClickShiftSubCommand(autoTitle, L"", true, false));
+        m_cmds.push_back(new ClickShiftSubCommand(autoTitle, L"", true, false, rule, resolved));
 
         if (rule) {
             for (int i = 0; rule->targets[i] != nullptr; ++i) {
                 std::wstring t = rule->targets[i];
                 std::wstring label = L"Convert to " + ToUpper(t);
-                m_cmds.push_back(new ClickShiftSubCommand(label, t, false, false));
+                m_cmds.push_back(new ClickShiftSubCommand(label, t, false, false, rule, resolved));
             }
         } else {
             for (int i = 0; kAllTargets[i] != nullptr; ++i) {
                 std::wstring t = kAllTargets[i];
                 std::wstring label = L"Convert to " + ToUpper(t);
-                m_cmds.push_back(new ClickShiftSubCommand(label, t, false, false));
+                m_cmds.push_back(new ClickShiftSubCommand(label, t, false, false, nullptr, resolved));
             }
         }
-        m_cmds.push_back(new ClickShiftSubCommand(L"Choose format...", L"", false, true));
+        m_cmds.push_back(new ClickShiftSubCommand(L"Choose format...", L"", false, true, rule, resolved));
     }
 
     ~ClickShiftEnumCommands() {
@@ -566,13 +667,27 @@ public:
 // ---------------------------------------------------------------------------
 // Root "Convert with ClickShift >" command
 // ---------------------------------------------------------------------------
-class ClickShiftRootCommand : public IExplorerCommand, public IObjectWithSite {
+class ClickShiftRootCommand final : public IExplorerCommand, public IObjectWithSite {
     LONG m_cRef;
     IUnknown* m_pSite;
     std::wstring m_ext;
+    IShellItemArray* m_lastArray;
+    bool m_hasRule;
+
+    void RefreshExtIfNeeded(IShellItemArray* psiItemArray) {
+        if (!psiItemArray) return;
+        if (psiItemArray == m_lastArray && !m_ext.empty()) return;
+        m_lastArray = psiItemArray;
+        std::wstring ext = ExtractExtFromArray(psiItemArray);
+        if (!ext.empty()) {
+            m_ext = ext;
+            m_hasRule = (FindRule(ext) != nullptr);
+            SetCachedExt(ext);
+        }
+    }
 
 public:
-    ClickShiftRootCommand() : m_cRef(1), m_pSite(nullptr) {
+    ClickShiftRootCommand() : m_cRef(1), m_pSite(nullptr), m_lastArray(nullptr), m_hasRule(true) {
         InterlockedIncrement(&g_cDllRef);
     }
 
@@ -625,21 +740,13 @@ public:
     // IExplorerCommand
     IFACEMETHODIMP GetTitle(IShellItemArray* psiItemArray, LPWSTR* ppszName) override {
         if (!ppszName) return E_POINTER;
-        std::wstring ext = ExtractExtFromArray(psiItemArray);
-        if (!ext.empty()) {
-            m_ext = ext;
-            SetCachedExt(ext);
-        }
+        RefreshExtIfNeeded(psiItemArray);
         return SHStrDupW(L"Convert with ClickShift", ppszName);
     }
 
     IFACEMETHODIMP GetIcon(IShellItemArray* psiItemArray, LPWSTR* ppszIcon) override {
         if (!ppszIcon) return E_POINTER;
-        std::wstring ext = ExtractExtFromArray(psiItemArray);
-        if (!ext.empty()) {
-            m_ext = ext;
-            SetCachedExt(ext);
-        }
+        RefreshExtIfNeeded(psiItemArray);
         std::wstring ico = GetIconString();
         return SHStrDupW(ico.c_str(), ppszIcon);
     }
@@ -657,14 +764,10 @@ public:
 
     IFACEMETHODIMP GetState(IShellItemArray* psiItemArray, BOOL, EXPCMDSTATE* pCmdState) override {
         if (!pCmdState) return E_POINTER;
-        std::wstring ext = ExtractExtFromArray(psiItemArray);
-        if (!ext.empty()) {
-            m_ext = ext;
-            SetCachedExt(ext);
-            if (!FindRule(ext)) {
-                *pCmdState = ECS_HIDDEN;
-                return S_OK;
-            }
+        RefreshExtIfNeeded(psiItemArray);
+        if (!m_ext.empty() && !m_hasRule) {
+            *pCmdState = ECS_HIDDEN;
+            return S_OK;
         }
         *pCmdState = ECS_ENABLED;
         return S_OK;
@@ -692,7 +795,7 @@ public:
 // ---------------------------------------------------------------------------
 // ClassFactory & DLL exports
 // ---------------------------------------------------------------------------
-class ClickShiftClassFactory : public IClassFactory {
+class ClickShiftClassFactory final : public IClassFactory {
     LONG m_cRef;
 public:
     ClickShiftClassFactory() : m_cRef(1) {

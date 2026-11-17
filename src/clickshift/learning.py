@@ -39,14 +39,16 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import itertools
 import json
 import math
 import os
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -71,6 +73,7 @@ DIM = 10  # [bias, norm_log_bytes, is_large, depth, sin_h, cos_h,
           #  structure_density, media_ratio, complexity_proxy, interaction]
 
 _HEADER_READ_BYTES = 32_768
+_ASCII_BYTES = bytes(range(128))
 
 
 def _probe_content_features(src: Path, ext: str, size: int, lb: float) -> tuple[float, float, float]:
@@ -122,18 +125,22 @@ def _probe_content_features(src: Path, ext: str, size: int, lb: float) -> tuple[
         lines = head.count(b"\n")
         md_or_tags = head.count(b"<table") + head.count(b"```") + head.count(b"|") + head.count(b"# ")
         struct_density = min(lines / 500.0, 1.0)
-        non_ascii = sum(1 for b in head[:4096] if b > 127)
-        media_ratio = min(non_ascii / max(len(head[:4096]), 1), 1.0)
+        head4k = head[:4096]
+        non_ascii = len(head4k.translate(None, _ASCII_BYTES))
+        media_ratio = min(non_ascii / max(len(head4k), 1), 1.0)
         complexity = min(md_or_tags / 40.0, 1.0)
 
     return float(struct_density), float(media_ratio), float(complexity)
 
 
-def _features(src: Path, dst_ext: str) -> list[float]:
-    try:
-        size = src.stat().st_size
-    except OSError:
-        size = 0
+def _features(src: Path, dst_ext: str, src_size: Optional[int] = None) -> list[float]:
+    if src_size is None:
+        try:
+            size = src.stat().st_size
+        except OSError:
+            size = 0
+    else:
+        size = src_size
     lb = math.log1p(max(size, 0))
     norm_lb = min(lb / 20.0, 1.5)
     is_large = 1.0 if size > 5 * 1024 * 1024 else 0.0
@@ -175,25 +182,54 @@ class _LinearBandit:
         self.A_inv: dict[str, Any] = {}  # arm -> cached inverse of A
         self.b: dict[str, Any] = {}      # arm -> reward vector
         self.n: dict[str, int] = {}
+        self._total_samples = 0
+        self._ridge_I = np.eye(self.dim) * self.ridge
+        self._inv_ridge_I = np.eye(self.dim) * (1.0 / self.ridge)
+        self._mature_prior_I = (1.0 - self.gamma) * self._ridge_I
         self._lock = threading.Lock()
 
     def _ensure(self, arm: str) -> None:
         if arm not in self.A:
-            self.A[arm] = np.eye(self.dim) * self.ridge
-            self.A_inv[arm] = np.eye(self.dim) * (1.0 / self.ridge)
+            self.A[arm] = self._ridge_I.copy()
+            self.A_inv[arm] = self._inv_ridge_I.copy()
             self.b[arm] = np.zeros(self.dim)
             self.n[arm] = 0
         elif arm not in self.A_inv:
             self.A_inv[arm] = np.linalg.inv(self.A[arm])
 
+    def _score_unlocked(self, arm: str, x: Any) -> float:
+        self._ensure(arm)
+        A_inv = self.A_inv[arm]
+        theta = A_inv @ self.b[arm]
+        mean = float(theta @ x)
+        ucb = self.alpha * float(math.sqrt(max(float(x @ A_inv @ x), 0.0)))
+        return mean + ucb
+
     def score(self, arm: str, x: Any) -> float:
         with self._lock:
-            self._ensure(arm)
-            A_inv = self.A_inv[arm]
-            theta = A_inv @ self.b[arm]
-            mean = float(theta @ x)
-            ucb = self.alpha * float(math.sqrt(max(float(x @ A_inv @ x), 0.0)))
-            return mean + ucb
+            return self._score_unlocked(arm, x)
+
+    def total_samples(self) -> int:
+        with self._lock:
+            return self._total_samples
+
+    def rank_routes(self, pair_key: str, x: Any, routes: list, min_trust: int) -> tuple[list, dict[str, float], int]:
+        scored = []
+        scores: dict[str, float] = {}
+        with self._lock:
+            total = self._total_samples
+            for pos, r in enumerate(routes):
+                arm = f"{pair_key}|{r.name}"
+                n = self.n.get(arm, 0)
+                if n >= min_trust:
+                    s = self._score_unlocked(arm, x)
+                else:
+                    s = (r.weight / 100.0) * 0.35 + (self._score_unlocked(arm, x) if n else 0.0)
+                    s += 0.05 * (min_trust - n) / min_trust
+                scores[r.name] = s
+                scored.append((-s, -r.weight, pos, r))
+        scored.sort(key=lambda t: (t[0], t[1], t[2]))
+        return [t[3] for t in scored], scores, total
 
     def update(self, arm: str, x: Any, reward: float) -> None:
         with self._lock:
@@ -202,7 +238,7 @@ class _LinearBandit:
             # adapts if the user installs Office or updates LibreOffice later.
             if self.n[arm] >= 50 and 0.9 < self.gamma < 1.0:
                 g = self.gamma
-                self.A[arm] = g * self.A[arm] + (1.0 - g) * (np.eye(self.dim) * self.ridge) + np.outer(x, x)
+                self.A[arm] = g * self.A[arm] + self._mature_prior_I + np.outer(x, x)
                 self.b[arm] = g * self.b[arm] + reward * x
                 self.A_inv[arm] = np.linalg.inv(self.A[arm])
             else:
@@ -217,6 +253,7 @@ class _LinearBandit:
                 else:
                     self.A_inv[arm] = np.linalg.inv(self.A[arm])
             self.n[arm] += 1
+            self._total_samples += 1
 
     def export(self) -> dict:
         with self._lock:
@@ -235,7 +272,7 @@ class _LinearBandit:
         if not isinstance(state, dict):
             return
         with self._lock:
-            for a, s in list(state.items())[:512]:          # bound #arms from remote
+            for a, s in itertools.islice(state.items(), 512):          # bound #arms from remote
                 try:
                     if not isinstance(a, str) or len(a) > 128 or not isinstance(s, dict):
                         continue
@@ -259,6 +296,7 @@ class _LinearBandit:
                     self.n[a] = min(n, self.MAX_SAMPLES_PER_ARM)
                 except Exception:
                     continue                                # skip garbage arms
+            self._total_samples = sum(self.n.values())
 
 
 # --------------------------------------------------------------------------- #
@@ -281,7 +319,25 @@ class BanditSelector:
         self.bandit = _LinearBandit()
         self.cloud: Any = None                      # optional CloudSync (see cloud.py)
         self._io_lock = threading.Lock()
+        self._defer_save_depth = 0
+        self._dirty = False
         self._load_state()
+
+    @contextmanager
+    def batch_persistence(self) -> Iterator[None]:
+        """Coalesce bandit.json writes across a multi-file batch, flushing on exit."""
+        with self._io_lock:
+            self._defer_save_depth += 1
+        try:
+            yield
+        finally:
+            should_save = False
+            with self._io_lock:
+                self._defer_save_depth = max(0, self._defer_save_depth - 1)
+                if self._defer_save_depth == 0 and self._dirty:
+                    should_save = True
+            if should_save:
+                self._save_state()
 
     def attach_cloud(self, cloud: Any) -> None:
         """Wire a clickshift.cloud.CloudSync instance into this selector."""
@@ -306,6 +362,7 @@ class BanditSelector:
                                            "median_ms": dict(self.median_ms)}),
                                encoding="utf-8")
                 tmp.replace(self.state_file)
+                self._dirty = False
             except Exception:
                 try:
                     tmp.unlink(missing_ok=True)
@@ -313,44 +370,58 @@ class BanditSelector:
                     pass
 
     # -- API used by engine -------------------------------------------------- #
-    def rank(self, src: Path, dst_ext: str, routes: list) -> list:
-        ranked, _ = self.rank_debug(src, dst_ext, routes)
+    def extract_features(self, src: Path, dst_ext: str, src_size: Optional[int] = None) -> Any:
+        return np.array(_features(src, dst_ext, src_size=src_size), dtype=float)
+
+    def rank(self, src: Path, dst_ext: str, routes: list,
+             features: Optional[Any] = None, src_size: Optional[int] = None) -> list:
+        ranked, _ = self.rank_debug(src, dst_ext, routes, features=features, src_size=src_size)
         return ranked
 
-    def rank_debug(self, src: Path, dst_ext: str, routes: list) -> tuple[list, dict]:
+    def rank_debug(self, src: Path, dst_ext: str, routes: list,
+                   features: Optional[Any] = None, src_size: Optional[int] = None) -> tuple[list, dict]:
         """Return (routes sorted best-first, debug info). Stable, never drops fallbacks."""
         if len(routes) <= 1:
             return routes, {"enabled": True, "scores": {},
                             "order_after": [r.name for r in routes],
-                            "history_samples": sum(self.bandit.n.values())}
-        x = np.array(_features(src, dst_ext), dtype=float)
+                            "history_samples": self.bandit.total_samples()}
+        x = features if features is not None else self.extract_features(src, dst_ext, src_size=src_size)
         pair_key = f"{src.suffix.lstrip('.').lower()}>{dst_ext.lstrip('.').lower()}"
-
-        scored = []
-        scores: dict[str, float] = {}
-        for pos, r in enumerate(routes):
-            arm = f"{pair_key}|{r.name}"
-            n = self.bandit.n.get(arm, 0)
-            if n >= self.MIN_SAMPLES_TO_TRUST:
-                s = self.bandit.score(arm, x)
-            else:
-                # cold start: blend static weight into a neutral prior so that
-                # exploration still happens but sensible defaults are respected
-                s = (r.weight / 100.0) * 0.35 + (self.bandit.score(arm, x) if n else 0.0)
-                s += 0.05 * (self.MIN_SAMPLES_TO_TRUST - n) / self.MIN_SAMPLES_TO_TRUST  # explore bonus
-            scores[r.name] = s
-            scored.append((-s, -r.weight, pos, r))
-        scored.sort(key=lambda t: (t[0], t[1], t[2]))
-        ranked = [t[3] for t in scored]
+        ranked, scores, total_samples = self.bandit.rank_routes(
+            pair_key, x, routes, self.MIN_SAMPLES_TO_TRUST
+        )
         info = {"enabled": True, "scores": scores,
                 "order_after": [r.name for r in ranked],
-                "history_samples": sum(self.bandit.n.values())}
+                "history_samples": total_samples}
         return ranked, info
 
-    def record(self, src: Path, dst_ext: str, backend: str, elapsed_ms: float, ok: bool) -> None:
+    def _compact_history_unlocked(self) -> None:
+        tmp = self.history_file.with_suffix(f".hist.{threading.get_ident()}.tmp")
+        try:
+            with open(self.history_file, "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                end_pos = fh.tell()
+                tail_bytes = min(end_pos, 600_000)
+                fh.seek(end_pos - tail_bytes)
+                raw = fh.read(tail_bytes)
+            if end_pos > tail_bytes:
+                nl = raw.find(b"\n")
+                if nl != -1:
+                    raw = raw[nl + 1:]
+            lines = raw.decode("utf-8", errors="replace").splitlines()[-3000:]
+            tmp.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+            tmp.replace(self.history_file)
+        except Exception:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    def record(self, src: Path, dst_ext: str, backend: str, elapsed_ms: float, ok: bool,
+               features: Optional[Any] = None, src_size: Optional[int] = None) -> None:
         pair_key = f"{src.suffix.lstrip('.').lower()}>{dst_ext.lstrip('.').lower()}"
         arm = f"{pair_key}|{backend}"
-        x = np.array(_features(src, dst_ext), dtype=float)
+        x = features if features is not None else self.extract_features(src, dst_ext, src_size=src_size)
 
         key = pair_key
         med = self.median_ms.get(key)
@@ -377,17 +448,19 @@ class BanditSelector:
             "pair": pair_key, "arm": arm, "ms": round(elapsed_ms, 1),
             "ok": ok, "reward": round(reward, 3), "file": file_tag, "t": time.time(),
         }
+        defer = False
         with self._io_lock:
+            self._dirty = True
+            defer = self._defer_save_depth > 0
             try:
                 with open(self.history_file, "a", encoding="utf-8") as fh:
                     fh.write(json.dumps(entry) + "\n")
-                # Keep history bounded on disk so it never grows without limit
                 if self.history_file.stat().st_size > 1_000_000:
-                    recent = self.history_file.read_text(encoding="utf-8", errors="ignore").splitlines()[-5000:]
-                    self.history_file.write_text("\n".join(recent) + ("\n" if recent else ""), encoding="utf-8")
+                    self._compact_history_unlocked()
             except Exception:
                 pass
-        self._save_state()
+        if not defer:
+            self._save_state()
 
     # -- introspection ------------------------------------------------------- #
     def stats(self) -> dict[str, Any]:

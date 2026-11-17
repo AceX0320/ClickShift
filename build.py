@@ -65,6 +65,7 @@ def build() -> int:
         "--hidden-import", "pywintypes",
         "--hidden-import", "pystray",
         "--hidden-import", "pystray._win32",
+        "--hidden-import", "clickshift.formats",
         "--hidden-import", "clickshift.engine",
         "--hidden-import", "clickshift.learning",
         "--hidden-import", "clickshift.monitor",

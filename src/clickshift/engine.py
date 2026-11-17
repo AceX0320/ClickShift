@@ -30,6 +30,7 @@ simply unavailable there) which makes development/testing possible anywhere.
 # pyright: reportMissingImports=false, reportMissingModuleSource=false
 from __future__ import annotations
 
+import contextlib
 import html as _html_mod
 import importlib
 import io
@@ -47,8 +48,9 @@ import traceback
 import uuid
 import zipfile
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 from xml.etree import ElementTree as ET
@@ -56,6 +58,24 @@ from xml.etree import ElementTree as ET
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     __package__ = "clickshift"
+
+from .formats import (
+    IMAGE_EXTS,
+    NEWEST_GENERATION,
+    OFFICE_DOC_IN,
+    OFFICE_SHEET_IN,
+    OFFICE_SLIDE_IN,
+    PAGED_IN,
+    PAGE_IMAGE_EXTS,
+    PDF_CAPABLE_IN,
+    SUPPORTED_INPUT_EXTS,
+    TEXT_EXTS,
+    ConversionResult,
+    _norm_ext,
+    all_targets_for,
+    is_pages_to_images,
+    newest_target_for,
+)
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -65,6 +85,14 @@ def _opt_import(name: str) -> Any:
         return importlib.import_module(name)
     except Exception:  # pragma: no cover
         return None
+
+
+def _import_fitz() -> Any:
+    """Import PyMuPDF via modern ``pymupdf`` first to avoid deprecation warnings."""
+    try:
+        return importlib.import_module("pymupdf")
+    except Exception:
+        return importlib.import_module("fitz")
 
 
 winreg: Any = _opt_import("winreg") if IS_WINDOWS else None
@@ -85,185 +113,103 @@ _ensure_stdio()
 
 
 # --------------------------------------------------------------------------- #
-#  Registry helpers / public API surface
+#  Backend discovery (lazy per-attribute probing; zero cold import overhead)
 # --------------------------------------------------------------------------- #
 
-def _norm_ext(ext: str) -> str:
-    ext = (ext or "").strip().lower()
-    if ext and not ext.startswith("."):
-        ext = "." + ext
-    return ext
-
-
-@dataclass
-class ConversionResult:
-    source: str
-    target: str
-    backend: str
-    elapsed_ms: float
-    ok: bool
-    error: str = ""
-    bytes_in: int = 0
-    bytes_out: int = 0
-
-    def as_dict(self) -> dict:
-        return {
-            "source": self.source,
-            "target": self.target,
-            "backend": self.backend,
-            "elapsed_ms": round(self.elapsed_ms, 1),
-            "ok": self.ok,
-            "error": self.error,
-            "bytes_in": self.bytes_in,
-            "bytes_out": self.bytes_out,
-            "t": time.time(),
-        }
-
-
-# --------------------------------------------------------------------------- #
-#  Format knowledge base
-# --------------------------------------------------------------------------- #
-
-OFFICE_DOC_IN = {"doc", "docx", "odt", "rtf", "mht", "html", "htm", "txt", "wpd"}
-OFFICE_SHEET_IN = {"xls", "xlsx", "ods", "csv", "txt"}
-OFFICE_SLIDE_IN = {"ppt", "pptx", "odp"}
-PDF_CAPABLE_IN = OFFICE_DOC_IN | OFFICE_SLIDE_IN | OFFICE_SHEET_IN | {"png", "jpg", "jpeg", "tif", "tiff", "epub", "xps"}
-IMAGE_EXTS = {"png", "jpg", "jpeg", "gif", "bmp", "tiff", "tif", "webp",
-              "avif", "heic", "heif", "jxl", "ico", "ppm", "pgm", "pbm", "jp2"}
-TEXT_EXTS = {"txt", "md", "markdown", "csv", "tsv", "json", "xml", "html", "htm",
-             "log", "ini", "py", "js", "c", "cpp", "h", "java", "yml", "yaml", "srt"}
-SUPPORTED_INPUT_EXTS = (
-    OFFICE_DOC_IN
-    | OFFICE_SHEET_IN
-    | OFFICE_SLIDE_IN
-    | PDF_CAPABLE_IN
-    | IMAGE_EXTS
-    | TEXT_EXTS
-    | {"pdf", "epub", "xps", "wmf", "emf"}
+_BACKEND_ATTRS = (
+    "libreoffice",
+    "office_app",
+    "pillow",
+    "pdf2docx",
+    "pymupdf",
+    "pypdf",
+    "python_docx",
+    "python_pptx",
+    "chardet",
 )
-
-# "newest generation" mapping used by the right-click menu builder.
-NEWEST_GENERATION = {
-    "pdf": "docx",       # PDF -> editable OOXML Word document by default
-    "doc": "docx",       # OOXML (Word 2007+) - never emit legacy .doc
-    "xls": "xlsx",       # OOXML (Excel 2007+)
-    "ppt": "pptx",       # OOXML (PowerPoint 2007+)
-    "odt": "docx",
-    "ods": "xlsx",
-    "odp": "pptx",
-    "rtf": "docx",
-    "htm": "docx",
-    "html": "docx",
-    "wmf": "png",
-    "emf": "png",
+_MOD_PROBES = {
+    "pillow": ("PIL",),
+    "pymupdf": ("pymupdf", "fitz"),
+    "pypdf": ("pypdf",),
+    "python_docx": ("docx",),
+    "python_pptx": ("pptx",),
+    "chardet": ("chardet",),
 }
+_PDF2DOCX_PATCH_LOCK = threading.Lock()
+_PDF2DOCX_PATCHED = False
 
-
-def all_targets_for(src_ext: str) -> list[str]:
-    """Return ALL supported conversion target extensions for ``src_ext`` (ordered best-first)."""
-    src_ext = src_ext.lower().lstrip(".")
-    out: list[str] = []
-    g = NEWEST_GENERATION.get(src_ext)
-    if g:
-        out.append(g)
-    if src_ext == "pdf":
-        out += ["docx", "pptx", "txt", "md", "html", "csv", "png", "jpg", "webp", "odt", "rtf"]
-    if src_ext in OFFICE_DOC_IN:
-        out += ["pdf", "docx", "pptx", "txt", "md", "html", "rtf", "odt", "png", "jpg", "webp"]
-    if src_ext in OFFICE_SHEET_IN or src_ext == "tsv":
-        out += ["xlsx", "pdf", "csv", "ods", "txt", "html", "png", "jpg", "webp"]
-    if src_ext in OFFICE_SLIDE_IN:
-        out += ["pptx", "pdf", "docx", "odp", "png", "jpg", "webp"]
-    if src_ext in IMAGE_EXTS or src_ext in ("wmf", "emf"):
-        out += ["webp", "png", "jpg", "pdf", "docx", "pptx", "avif", "jxl", "tiff", "bmp", "ico", "gif"]
-    if src_ext in TEXT_EXTS:
-        out += ["docx", "pdf", "txt", "md", "html", "rtf", "odt"]
-    if src_ext == "epub":
-        out += ["txt", "docx", "html", "md", "pdf", "png", "jpg", "webp"]
-    if src_ext == "xps":
-        out += ["pdf", "docx", "png", "jpg"]
-    # de-duplicate, keep order, drop self and legacy formats
-    seen, res = set(), []
-    for e in out:
-        if e != src_ext and e not in seen:
-            seen.add(e)
-            res.append(e)
-    return res
-
-
-def newest_target_for(src_ext: str) -> list[str]:
-    """Suggested 'latest version' targets for a given source extension."""
-    return all_targets_for(src_ext)
-
-
-# --------------------------------------------------------------------------- #
-#  Backend discovery
-# --------------------------------------------------------------------------- #
 
 class Backends:
     def __init__(self) -> None:
-        self.libreoffice: Optional[str] = None
-        self.office_app: dict[str, str] = {}      # word|excel|powerpoint -> ProgId
-        self.pillow = False
-        self.pdf2docx = False
-        self.pymupdf = False
-        self.pypdf = False
-        self.python_docx = False
-        self.python_pptx = False
-        self.chardet = False
-        self.detect()
+        self._probe_lock = threading.Lock()
 
-    # -- detection ---------------------------------------------------------- #
-    def detect(self) -> None:
+    def _probe_libreoffice(self) -> Optional[str]:
         if IS_WINDOWS:
-            candidates = [
+            candidates = (
                 r"C:\Program Files\LibreOffice\program\soffice.exe",
                 r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
                 os.path.expandvars(r"%LOCALAPPDATA%\Programs\LibreOffice\program\soffice.exe"),
-            ]
+            )
             for c in candidates:
                 if Path(c).exists():
-                    self.libreoffice = c
-                    break
-            if not self.libreoffice:
-                self.libreoffice = shutil.which("soffice")
-            if winreg is not None:  # only meaningful inside a Windows session
-                try:
-                    for app, progid in (
-                        ("word", "Word.Application"),
-                        ("excel", "Excel.Application"),
-                        ("powerpoint", "PowerPoint.Application"),
-                    ):
-                        for hive in (winreg.HKEY_CLASSES_ROOT,):
-                            try:
-                                winreg.OpenKey(hive, progid)
-                                self.office_app[app] = progid
-                                break
-                            except OSError:
-                                continue
-                except Exception:
-                    pass
-        else:
-            self.libreoffice = shutil.which("soffice") or shutil.which("libreoffice")
-        for attr, mod_name in (
-            ("pillow", "PIL"),
-            ("pymupdf", "fitz"),
-            ("pypdf", "pypdf"),
-            ("python_docx", "docx"),
-            ("python_pptx", "pptx"),
-            ("chardet", "chardet"),
-        ):
+                    return c
+            return shutil.which("soffice")
+        return shutil.which("soffice") or shutil.which("libreoffice")
+
+    def _probe_office_app(self) -> dict[str, str]:
+        apps: dict[str, str] = {}
+        if IS_WINDOWS and winreg is not None:
             try:
-                importlib.import_module(mod_name)
-                setattr(self, attr, True)
+                for app, progid in (
+                    ("word", "Word.Application"),
+                    ("excel", "Excel.Application"),
+                    ("powerpoint", "PowerPoint.Application"),
+                ):
+                    try:
+                        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, progid):
+                            apps[app] = progid
+                    except OSError:
+                        continue
             except Exception:
                 pass
-        try:
-            _patch_pdf2docx_compat()
-            importlib.import_module("pdf2docx")
-            self.pdf2docx = True
-        except Exception:
-            pass
+        return apps
+
+    def _probe_attr(self, name: str) -> Any:
+        if name == "libreoffice":
+            return self._probe_libreoffice()
+        if name == "office_app":
+            return self._probe_office_app()
+        if name in _MOD_PROBES:
+            for mod_name in _MOD_PROBES[name]:
+                try:
+                    importlib.import_module(mod_name)
+                    return True
+                except Exception:
+                    continue
+            return False
+        if name == "pdf2docx":
+            try:
+                _patch_pdf2docx_compat()
+                importlib.import_module("pdf2docx")
+                return True
+            except Exception:
+                return False
+        raise AttributeError(name)
+
+    def __getattr__(self, name: str) -> Any:
+        if name not in _BACKEND_ATTRS:
+            raise AttributeError(f"{type(self).__name__!s} has no attribute {name!r}")
+        with self._probe_lock:
+            if name in self.__dict__:
+                return self.__dict__[name]
+            val = self._probe_attr(name)
+            self.__dict__[name] = val
+            return val
+
+    def detect(self) -> None:
+        with self._probe_lock:
+            for name in _BACKEND_ATTRS:
+                self.__dict__[name] = self._probe_attr(name)
 
     def summary(self) -> dict:
         return {
@@ -281,30 +227,37 @@ class Backends:
 
 def _patch_pdf2docx_compat() -> None:
     """Fix upstream PyMuPDF >= 1.24.3 and NumPy >= 2.0 breaking changes in pdf2docx 0.5.8."""
-    try:
-        np: Any = importlib.import_module("numpy")
-        for alias, target in (
-            ("float_", np.float64),
-            ("int_", np.int64),
-            ("int0", np.intp),
-            ("bool8", np.bool_),
-            ("Inf", np.inf),
-            ("NaN", np.nan),
-        ):
-            if not hasattr(np, alias):
-                setattr(np, alias, target)
-    except Exception:
-        pass
-    try:
-        fitz: Any = importlib.import_module("fitz")
-        # PyMuPDF 1.24.3+ removed Rect.get_area() / IRect.get_area() which pdf2docx calls
-        for cls_name in ("Rect", "IRect"):
-            cls = getattr(fitz, cls_name, None)
-            if cls is not None and not hasattr(cls, "get_area"):
-                setattr(cls, "get_area", lambda self: abs(self))
-    except Exception:
-        pass
-    _patch_pdf2docx_opacity()
+    global _PDF2DOCX_PATCHED
+    if _PDF2DOCX_PATCHED:
+        return
+    with _PDF2DOCX_PATCH_LOCK:
+        if _PDF2DOCX_PATCHED:
+            return
+        try:
+            np: Any = importlib.import_module("numpy")
+            for alias, target in (
+                ("float_", np.float64),
+                ("int_", np.int64),
+                ("int0", np.intp),
+                ("bool8", np.bool_),
+                ("Inf", np.inf),
+                ("NaN", np.nan),
+            ):
+                if not hasattr(np, alias):
+                    setattr(np, alias, target)
+        except Exception:
+            pass
+        try:
+            fitz: Any = _import_fitz()
+            # PyMuPDF 1.24.3+ removed Rect.get_area() / IRect.get_area() which pdf2docx calls
+            for cls_name in ("Rect", "IRect"):
+                cls = getattr(fitz, cls_name, None)
+                if cls is not None and not hasattr(cls, "get_area"):
+                    setattr(cls, "get_area", lambda self: abs(self))
+        except Exception:
+            pass
+        _patch_pdf2docx_opacity()
+        _PDF2DOCX_PATCHED = True
 
 
 def _blend_on_white(color: Any, opacity: Any) -> Any:
@@ -330,17 +283,23 @@ def _flatten_path_opacity(raw_paths: Any) -> Any:
         if not isinstance(p, dict):
             out.append(p)
             continue
+        has_fill = p.get("fill") is not None
+        has_color = p.get("color") is not None
         fop = p.get("fill_opacity")
         sop = p.get("stroke_opacity")
-        fill_visible = p.get("fill") is not None and (fop is None or fop > 0.01)
-        stroke_visible = p.get("color") is not None and (sop is None or sop > 0.01)
-        if (p.get("fill") is not None or p.get("color") is not None) and not (fill_visible or stroke_visible):
+        fill_visible = has_fill and (fop is None or fop > 0.01)
+        stroke_visible = has_color and (sop is None or sop > 0.01)
+        if (has_fill or has_color) and not (fill_visible or stroke_visible):
             continue  # fully transparent path: nothing to render
+        needs_blend = (has_fill and fop is not None and fop < 0.999) or (has_color and sop is not None and sop < 0.999)
+        if not needs_blend:
+            out.append(p)
+            continue
         p = dict(p)
-        if p.get("fill") is not None:
+        if has_fill:
             p["fill"] = _blend_on_white(p["fill"], fop) if fill_visible else None
             p["fill_opacity"] = 1.0
-        if p.get("color") is not None:
+        if has_color:
             p["color"] = _blend_on_white(p["color"], sop) if stroke_visible else None
             p["stroke_opacity"] = 1.0
         out.append(p)
@@ -369,11 +328,8 @@ _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _MAX_MERGE_GAP_TWIPS = 300  # spacer paragraphs up to 15pt are part of one box
 
 
-def _merge_shaded_line_tables(xml: bytes) -> tuple[bytes, int]:
-    """pdf2docx emits one single-cell table per text line when text sits on a
-    shaded panel, which Word renders as ragged per-line "highlight" strips.
-    Merge runs of such tables (same fill, separated only by small empty spacer
-    paragraphs) into one full-width shaded cell. Returns (xml, merged_count)."""
+def _merge_shaded_line_tables_with_check(xml: bytes) -> tuple[bytes, int, bool]:
+    """Merge runs of per-line shaded tables and check document non-emptiness in one parse."""
     etree: Any = importlib.import_module("lxml.etree")
     w = "{%s}" % _W_NS
     parser = etree.XMLParser(resolve_entities=False, no_network=True, huge_tree=False)
@@ -477,11 +433,22 @@ def _merge_shaded_line_tables(xml: bytes) -> tuple[bytes, int]:
             for trh in first.iter(w + "trHeight"):
                 trh.getparent().remove(trh)
             merged += len(group) - 1
-            children = list(body)
-            i = children.index(first) + 1
+            i = j
+    has_content = (
+        root.find(f".//{w}tbl") is not None
+        or root.find(f".//{w}drawing") is not None
+        or root.find(f".//{w}pict") is not None
+        or any((t.text or "").strip() for t in root.iter(w + "t"))
+    )
     if not merged:
-        return xml, 0
-    return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True), merged
+        return xml, 0, has_content
+    return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True), merged, has_content
+
+
+def _merge_shaded_line_tables(xml: bytes) -> tuple[bytes, int]:
+    """Merge runs of per-line shaded tables; return (xml, merged_count)."""
+    out_xml, merged, _ = _merge_shaded_line_tables_with_check(xml)
+    return out_xml, merged
 
 
 _MAX_ZIP_ENTRY_BYTES = 50 * 1024 * 1024
@@ -515,15 +482,15 @@ def _safe_xml_fromstring(data: bytes) -> ET.Element:
     return ET.fromstring(data)
 
 
-def _postprocess_pdf2docx(dst: Path) -> None:
-    """Rewrite word/document.xml in-place with layout clean-ups (best effort)."""
+def _postprocess_pdf2docx(dst: Path) -> Optional[bool]:
+    """Rewrite word/document.xml with layout clean-ups; return has_content if checked."""
     tmp_name: Optional[str] = None
     try:
         with zipfile.ZipFile(dst) as zin:
             xml = _zip_read_bounded(zin, "word/document.xml", _MAX_ZIP_ENTRY_BYTES)
-            new_xml, merged = _merge_shaded_line_tables(xml)
+            new_xml, merged, has_content = _merge_shaded_line_tables_with_check(xml)
             if not merged:
-                return
+                return has_content
             fd, tmp_name = tempfile.mkstemp(suffix=".docx", dir=str(dst.parent))
             os.close(fd)
             with zipfile.ZipFile(tmp_name, "w", zipfile.ZIP_DEFLATED) as zout:
@@ -536,8 +503,9 @@ def _postprocess_pdf2docx(dst: Path) -> None:
                     zout.writestr(item, data)
         os.replace(tmp_name, str(dst))
         tmp_name = None
+        return has_content
     except Exception:  # never fail a conversion because of cosmetics
-        pass
+        return None
     finally:
         if tmp_name:
             try:
@@ -606,6 +574,34 @@ _LO_XCU_HARDENED = (
 )
 
 
+_LO_SEM = threading.Semaphore(max(2, min(4, (os.cpu_count() or 4) // 2 or 2)))
+
+
+def _lo_infilter_for(src_ext: str, dst_ext: str) -> Optional[str]:
+    # Crucial for PDF -> DOCX/ODT/RTF/TXT/HTML: force LibreOffice Writer import
+    # instead of Draw (which rejects MS Word 2007 XML export with error 207).
+    if src_ext == "pdf" and dst_ext in ("docx", "doc", "odt", "rtf", "txt", "html", "htm"):
+        return "--infilter=writer_pdf_import"
+    if src_ext == "pdf" and dst_ext in ("pptx", "ppt", "odp"):
+        return "--infilter=impress_pdf_import"
+    return None
+
+
+def _lo_build_base_args(prof_uri: str, dst_ext: str, infilter: Optional[str], extra: Optional[list[str]]) -> list[str]:
+    filt = _LO_FILTERS.get(dst_ext)
+    args = [
+        BACKENDS.libreoffice, "--headless", "--norestore", "--nologo", "--nofirststartwizard",
+        f"-env:UserInstallation={prof_uri}",
+    ]
+    if infilter:
+        args.append(infilter)
+    conv_spec = f"{dst_ext}:{filt}" if filt else dst_ext
+    if extra:
+        conv_spec += ": " + ", ".join(extra)
+    args += ["--convert-to", conv_spec]
+    return args
+
+
 def lo_convert(src: Path, dst: Path, extra: Optional[list[str]] = None) -> None:
     if not BACKENDS.libreoffice:
         raise RuntimeError("LibreOffice not found")
@@ -613,28 +609,14 @@ def lo_convert(src: Path, dst: Path, extra: Optional[list[str]] = None) -> None:
     src_resolved = Path(src).resolve()
     dst_ext = dst.suffix.lstrip(".").lower()
     src_ext = src_resolved.suffix.lstrip(".").lower()
-    filt = _LO_FILTERS.get(dst_ext)
-    with tempfile.TemporaryDirectory(prefix="clickshift_lo_") as prof_tmp:
+    infilter = _lo_infilter_for(src_ext, dst_ext)
+    with _LO_SEM, tempfile.TemporaryDirectory(prefix="clickshift_lo_") as prof_tmp:
         prof_dir = Path(prof_tmp)
         user_dir = prof_dir / "user"
         user_dir.mkdir(parents=True, exist_ok=True)
         (user_dir / "registrymodifications.xcu").write_text(_LO_XCU_HARDENED, encoding="utf-8")
         prof_uri = prof_dir.resolve().as_uri()
-        args = [
-            BACKENDS.libreoffice, "--headless", "--norestore", "--nologo", "--nofirststartwizard",
-            f"-env:UserInstallation={prof_uri}",
-        ]
-        # Crucial for PDF -> DOCX/ODT/RTF/TXT/HTML: force LibreOffice Writer import
-        # instead of Draw (which rejects MS Word 2007 XML export with error 207).
-        if src_ext == "pdf" and dst_ext in ("docx", "doc", "odt", "rtf", "txt", "html", "htm"):
-            args.append("--infilter=writer_pdf_import")
-        elif src_ext == "pdf" and dst_ext in ("pptx", "ppt", "odp"):
-            args.append("--infilter=impress_pdf_import")
-        args += [
-            "--convert-to", (f"{dst_ext}:{filt}" if filt else dst_ext),
-        ]
-        if extra:
-            args[-1] += ": " + ", ".join(extra)
+        args = _lo_build_base_args(prof_uri, dst_ext, infilter, extra)
         args += ["--outdir", str(outdir), str(src_resolved)]
         proc = subprocess.run(args, capture_output=True, timeout=300)
     produced = outdir / (src_resolved.stem + dst.suffix)
@@ -643,6 +625,45 @@ def lo_convert(src: Path, dst: Path, extra: Optional[list[str]] = None) -> None:
     if not dst.exists():
         raise RuntimeError(f"LibreOffice produced no output ({proc.returncode}): "
                            f"{proc.stderr.decode(errors='replace')[:400]}")
+
+
+def _lo_convert_batch(
+    pairs: list[tuple[Path, Path]],
+    dst_ext: str,
+    infilter: Optional[str] = None,
+) -> tuple[dict[Path, bool], str]:
+    """Convert multiple distinct-stem files in one soffice invocation into a staging dir.
+
+    Returns ``(succeeded_map, err_msg)`` keyed by source ``Path``.
+    """
+    if not BACKENDS.libreoffice or not pairs:
+        return {s: False for s, _ in pairs}, "LibreOffice not found"
+    ext_dot = "." + dst_ext.lstrip(".")
+    ok_map: dict[Path, bool] = {s: False for s, _ in pairs}
+    err_msg = ""
+    with _LO_SEM, tempfile.TemporaryDirectory(prefix="clickshift_lobatch_") as prof_tmp:
+        root_tmp = Path(prof_tmp)
+        user_dir = root_tmp / "user"
+        stage_out = root_tmp / "out"
+        user_dir.mkdir(parents=True, exist_ok=True)
+        stage_out.mkdir(parents=True, exist_ok=True)
+        (user_dir / "registrymodifications.xcu").write_text(_LO_XCU_HARDENED, encoding="utf-8")
+        prof_uri = (root_tmp / "prof").resolve().as_uri()
+        args = _lo_build_base_args(prof_uri, dst_ext, infilter, None)
+        args += ["--outdir", str(stage_out)] + [str(s.resolve()) for s, _ in pairs]
+        try:
+            proc = subprocess.run(args, capture_output=True, timeout=max(300, 60 * len(pairs)))
+            if proc.returncode != 0:
+                err_msg = proc.stderr.decode(errors="replace")[:400]
+        except Exception as exc:
+            return ok_map, str(exc)
+        for src_p, dst_p in pairs:
+            produced = stage_out / (src_p.stem + ext_dot)
+            if produced.exists() and produced.stat().st_size > 0:
+                dst_p.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(produced), str(dst_p))
+                ok_map[src_p] = dst_p.exists()
+    return ok_map, err_msg
 
 
 def conv_libreoffice(src: Path, dst: Path) -> None:
@@ -700,14 +721,11 @@ class _OfficeStaWorker:
     def _spawn_app(self) -> Any:
         win32_client: Any = importlib.import_module("win32com.client")
         app = win32_client.DispatchEx(self.progid)
-        try:
-            app.Visible = False
-        except Exception:
-            pass
-        try:
-            app.DisplayAlerts = False
-        except Exception:
-            pass
+        for attr, val in (("Visible", False), ("DisplayAlerts", 0), ("ScreenUpdating", False)):
+            try:
+                setattr(app, attr, val)
+            except Exception:
+                pass
         if _office_disable_macros_enabled():
             try:
                 app.AutomationSecurity = 3  # msoAutomationSecurityForceDisable
@@ -721,6 +739,14 @@ class _OfficeStaWorker:
                 app.Quit()
             except Exception:
                 pass
+
+    @staticmethod
+    def _is_rpc_disconnect(exc: BaseException) -> bool:
+        hr = getattr(exc, "hresult", None)
+        if hr in (-2147023174, -2147417848, -2147418111, -2147220995, -2147023170):
+            return True
+        msg = str(exc).upper()
+        return "RPC" in msg or "SERVER_UNAVAILABLE" in msg or "DISCONNECTED" in msg
 
     def _loop(self) -> None:
         pythoncom: Any = importlib.import_module("pythoncom")
@@ -743,15 +769,18 @@ class _OfficeStaWorker:
                         app = self._spawn_app()
                     try:
                         fn(app)
-                    except Exception:
-                        # Retry once with a fresh COM process in case RPC died
+                    except Exception as first_exc:
+                        if not self._is_rpc_disconnect(first_exc):
+                            raise
+                        # Retry once with a fresh COM process only if RPC server died
                         self._quit_app(app)
                         app = self._spawn_app()
                         fn(app)
                     res_q.put((True, None))
                 except Exception as exc:
-                    self._quit_app(app)
-                    app = None
+                    if self._is_rpc_disconnect(exc):
+                        self._quit_app(app)
+                        app = None
                     res_q.put((False, exc))
         finally:
             self._quit_app(app)
@@ -805,12 +834,16 @@ def _is_unsafe_external_rel(rel_type: str, target: str) -> bool:
     return not rel_type.lower().endswith("/hyperlink")
 
 
-def _sanitize_ooxml_for_com(src: Path, tmp_dir: Path) -> Path:
+def _sanitize_ooxml_for_com(src: Path, tmp_dir: Any) -> Path:
     """Strip external templates/links from OOXML `.rels` before opening in Office COM."""
-    if src.suffix.lower() not in (".docx", ".xlsx", ".pptx") or not zipfile.is_zipfile(src):
+    if src.suffix.lower() not in (".docx", ".xlsx", ".pptx"):
         return src
     rewrites: dict[str, bytes] = {}
-    with zipfile.ZipFile(src, "r") as zin:
+    try:
+        zin = zipfile.ZipFile(src, "r")
+    except (zipfile.BadZipFile, OSError):
+        return src
+    with zin:
         infos = zin.infolist()
         if len(infos) > _MAX_ZIP_ENTRIES:
             raise ValueError("OOXML archive exceeds maximum entry count")
@@ -831,7 +864,8 @@ def _sanitize_ooxml_for_com(src: Path, tmp_dir: Path) -> Path:
                 rewrites[info.filename] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
         if not rewrites:
             return src
-        sanitized = tmp_dir / src.name
+        out_dir = tmp_dir() if callable(tmp_dir) else Path(tmp_dir)
+        sanitized = out_dir / src.name
         with zipfile.ZipFile(sanitized, "w", zipfile.ZIP_DEFLATED) as zout:
             for info in infos:
                 data = rewrites[info.filename] if info.filename in rewrites else _zip_read_bounded(zin, info.filename, _MAX_ZIP_ENTRY_BYTES * 2)
@@ -843,12 +877,24 @@ def _check_rtf_for_com(src: Path) -> None:
     if src.suffix.lower() != ".rtf":
         return
     try:
+        max_bytes = 16 * 1024 * 1024
+        chunk_bytes = 256 * 1024
+        overlap = b""
+        seen = 0
         with open(src, "rb") as fh:
-            head = fh.read(16 * 1024 * 1024)
+            while seen < max_bytes:
+                chunk = fh.read(min(chunk_bytes, max_bytes - seen))
+                if not chunk:
+                    break
+                seen += len(chunk)
+                buf = overlap + chunk
+                if _RTF_UNSAFE_RE.search(buf):
+                    raise RuntimeError("Refusing unsafe external template/DDE reference in RTF via Office COM")
+                overlap = buf[-64:]
+    except RuntimeError:
+        raise
     except OSError:
         return
-    if _RTF_UNSAFE_RE.search(head):
-        raise RuntimeError("Refusing unsafe external template/DDE reference in RTF via Office COM")
 
 
 def conv_office_com(src: Path, dst: Path) -> None:
@@ -871,17 +917,22 @@ def conv_office_com(src: Path, dst: Path) -> None:
     if target.exists():
         target = _unique(target)
     dst_abs = str(target.resolve())
+    disable_macros = _office_disable_macros_enabled()
 
-    with tempfile.TemporaryDirectory(prefix="clickshift_com_") as tmp_dir:
-        safe_src = _sanitize_ooxml_for_com(src.resolve(), Path(tmp_dir))
+    tmp_obj: Optional[tempfile.TemporaryDirectory] = None
+
+    def _lazy_tmp_dir() -> Path:
+        nonlocal tmp_obj
+        if tmp_obj is None:
+            tmp_obj = tempfile.TemporaryDirectory(prefix="clickshift_com_")
+        return Path(tmp_obj.name)
+
+    try:
+        safe_src = _sanitize_ooxml_for_com(src.resolve(), _lazy_tmp_dir)
         src_abs = str(safe_src.resolve())
 
         def _do_convert(app: Any) -> None:
-            try:
-                app.DisplayAlerts = 0  # wdAlertsNone
-            except Exception:
-                pass
-            if _office_disable_macros_enabled():
+            if disable_macros:
                 try:
                     app.AutomationSecurity = 3  # msoAutomationSecurityForceDisable
                 except Exception:
@@ -925,6 +976,9 @@ def conv_office_com(src: Path, dst: Path) -> None:
                     pres.Close()
 
         _OFFICE_POOL.run(app_name, progid, _do_convert)
+    finally:
+        if tmp_obj is not None:
+            tmp_obj.cleanup()
     out_file = Path(dst_abs)
     if not out_file.exists():
         raise RuntimeError("Office COM produced no output")
@@ -946,22 +1000,35 @@ def conv_pdf2docx(src: Path, dst: Path) -> None:
         cv.close()
     if not dst.exists() or dst.stat().st_size == 0:
         raise RuntimeError("pdf2docx produced no output file")
-    _postprocess_pdf2docx(dst)
-    # Check if pdf2docx produced a blank document (e.g. scanned/complex PDF)
-    if BACKENDS.python_docx:
+    has_content = _postprocess_pdf2docx(dst)
+    if has_content is False:
+        dst.unlink(missing_ok=True)
+        raise RuntimeError("pdf2docx produced an empty DOCX (likely scanned PDF)")
+    # Fallback emptiness check only if XML postprocess could not inspect word/document.xml
+    if has_content is None and BACKENDS.python_docx:
         try:
             docx: Any = importlib.import_module("docx")
             d = docx.Document(str(dst))
-            has_text = any(p.text.strip() for p in d.paragraphs)
-            has_tables = bool(d.tables)
-            has_shapes = bool(d.inline_shapes)
-            if not (has_text or has_tables or has_shapes):
+            if not (any(p.text.strip() for p in d.paragraphs) or d.tables or d.inline_shapes):
                 dst.unlink(missing_ok=True)
                 raise RuntimeError("pdf2docx produced an empty DOCX (likely scanned PDF)")
         except RuntimeError:
             raise
         except Exception:
             pass
+
+
+_PYPDF_PARA_RE = re.compile(r"\n\s*\n")
+_WR_HEAD_RE = re.compile(r"^(#{1,6})\s+(.*)$")
+_WR_BULLET_RE = re.compile(r"^\s*[-*+]\s+")
+_WR_NUM_RE = re.compile(r"^\s*\d+[.)]\s+")
+_WR_QUOTE_RE = re.compile(r"^>\s?")
+_RICH_MD_RE = re.compile(r"(\*\*.+?\*\*|`.+?`)")
+_EPUB_SCRIPT_RE = re.compile(r"(?is)<(script|style).+?</\1>")
+_EPUB_BREAK_RE = re.compile(r"(?i)</(p|div|h[1-6]|li|br)>")
+_EPUB_TAG_RE = re.compile(r"(?s)<[^>]+>")
+_EPUB_WS_RE = re.compile(r"[ \t]+")
+_EPUB_NL_RE = re.compile(r"\n\s*\n+")
 
 
 def conv_pdf_to_docx_pymupdf(src: Path, dst: Path) -> None:
@@ -971,7 +1038,7 @@ def conv_pdf_to_docx_pymupdf(src: Path, dst: Path) -> None:
     is scanned (image-only with no text), renders the page at 200 DPI into the
     Word document so scanned PDFs convert cleanly.
     """
-    fitz: Any = importlib.import_module("fitz")
+    fitz: Any = _import_fitz()
     docx: Any = importlib.import_module("docx")
     docx_shared: Any = importlib.import_module("docx.shared")
     Inches = docx_shared.Inches
@@ -985,12 +1052,13 @@ def conv_pdf_to_docx_pymupdf(src: Path, dst: Path) -> None:
     style = doc.styles["Normal"]
     style.font.name = "Calibri"
     style.font.size = Pt(11)
+    text_flags = getattr(fitz, "TEXTFLAGS_DICT", 0) & ~getattr(fitz, "TEXT_PRESERVE_IMAGES", 0)
 
     try:
         for page_idx, page in enumerate(pdf):
             if page_idx > 0:
                 doc.add_page_break()
-            pdict = page.get_text("dict")
+            pdict = page.get_text("dict", flags=text_flags) if text_flags else page.get_text("dict")
             blocks = pdict.get("blocks", []) if isinstance(pdict, dict) else []
             wrote_any_text = False
             for b in blocks:
@@ -1010,22 +1078,31 @@ def conv_pdf_to_docx_pymupdf(src: Path, dst: Path) -> None:
                             doc.add_heading(line_text, level=2)
                         else:
                             p = doc.add_paragraph()
+                            runs_buf: list[tuple[bool, bool, list[str]]] = []
                             for s in spans:
                                 txt = s.get("text", "")
                                 if not txt:
                                     continue
-                                r = p.add_run(txt)
                                 flags = int(s.get("flags", 0))
                                 font_name = (s.get("font") or "").lower()
-                                if (flags & 16) or "bold" in font_name:
+                                is_b = bool((flags & 16) or "bold" in font_name)
+                                is_i = bool((flags & 2) or "italic" in font_name or "oblique" in font_name)
+                                if runs_buf and runs_buf[-1][0] == is_b and runs_buf[-1][1] == is_i:
+                                    runs_buf[-1][2].append(txt)
+                                else:
+                                    runs_buf.append((is_b, is_i, [txt]))
+                            for is_b, is_i, parts in runs_buf:
+                                r = p.add_run("".join(parts))
+                                if is_b:
                                     r.bold = True
-                                if (flags & 2) or "italic" in font_name or "oblique" in font_name:
+                                if is_i:
                                     r.italic = True
             # If the page had no extractable text (e.g. scanned page), embed rendered page image
             if not wrote_any_text:
-                pix = page.get_pixmap(dpi=200)
+                pix = page.get_pixmap(dpi=200, alpha=False)
                 img_bytes = pix.tobytes("png")
-                doc.add_picture(io.BytesIO(img_bytes), width=Inches(6.2))
+                with io.BytesIO(img_bytes) as bio:
+                    doc.add_picture(bio, width=Inches(6.2))
     finally:
         pdf.close()
     doc.save(str(dst))
@@ -1053,7 +1130,7 @@ def conv_pdf_to_docx_pypdf(src: Path, dst: Path) -> None:
         txt = (page.extract_text() or "").strip()
         if txt:
             wrote_any = True
-            for para in re.split(r"\n\s*\n", txt):
+            for para in _PYPDF_PARA_RE.split(txt):
                 clean = para.strip()
                 if clean:
                     doc.add_paragraph(clean)
@@ -1068,18 +1145,29 @@ _IMG_QUALITY = {"jpg": 95, "jpeg": 95, "webp": 95, "avif": 60, "heic": 60,
                 "jxl": 90, "tiff": 90, "png": None}
 
 
+def _exif_orientation(im: Any) -> int:
+    try:
+        exif = im.getexif()
+        return int(exif.get(274, 1)) if exif else 1
+    except Exception:
+        return 1
+
+
 def conv_pillow(src: Path, dst: Path) -> None:
     Image: Any = importlib.import_module("PIL.Image")
-    ImageOps: Any = importlib.import_module("PIL.ImageOps")
     ext = dst.suffix.lstrip(".").lower()
     if ext == "jpg":
         ext = "jpeg"
     with Image.open(src) as im_orig:
-        im = ImageOps.exif_transpose(im_orig) or im_orig
+        if _exif_orientation(im_orig) != 1:
+            ImageOps: Any = importlib.import_module("PIL.ImageOps")
+            im = ImageOps.exif_transpose(im_orig) or im_orig
+        else:
+            im = im_orig
         if ext in ("jpeg", "bmp", "ico") and im.mode in ("RGBA", "LA", "P"):
             bg = Image.new("RGB", im.size, (255, 255, 255))
-            rgba = im.convert("RGBA")
-            bg.paste(rgba, mask=rgba.split()[-1])
+            rgba = im.convert("RGBA") if im.mode != "RGBA" else im
+            bg.paste(rgba, mask=rgba.getchannel("A"))
             im = bg
         elif ext in ("jpeg", "bmp") and im.mode not in ("RGB", "L"):
             im = im.convert("RGB")
@@ -1105,6 +1193,14 @@ def _read_text_auto(path: Path) -> tuple[str, str]:
     raw = path.read_bytes()
     if not raw:
         return "", "utf-8"
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw.decode("utf-8-sig", errors="replace"), "utf-8-sig"
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return raw.decode("utf-16", errors="replace"), "utf-16"
+    try:
+        return raw.decode("utf-8"), "utf-8"
+    except UnicodeDecodeError:
+        pass
     enc = "utf-8"
     sample = raw[:65_536]
     if BACKENDS.chardet:
@@ -1160,18 +1256,25 @@ def _write_text_to_docx(text: str, dst: Path, md: bool) -> None:
         if in_code:
             code_buf.append(line)
             continue
-        m = re.match(r"^(#{1,6})\s+(.*)$", line) if md else None
+        m = _WR_HEAD_RE.match(line) if md else None
         if m:
             d.add_heading(m.group(2).strip(), level=min(len(m.group(1)), 4))
-        elif md and re.match(r"^\s*[-*+]\s+", line):
-            d.add_paragraph(re.sub(r"^\s*[-*+]\s+", "", line), style="List Bullet")
-        elif md and re.match(r"^\s*\d+[.)]\s+", line):
-            d.add_paragraph(re.sub(r"^\s*\d+[.)]\s+", "", line), style="List Number")
-        elif md and re.match(r"^>\s?", line):
-            p = d.add_paragraph(re.sub(r"^>\s?", "", line))
-            p.paragraph_format.left_indent = Pt(18)
-        else:
-            _add_rich_md_paragraph(d, line, md)
+            continue
+        if md:
+            mb = _WR_BULLET_RE.match(line)
+            if mb:
+                d.add_paragraph(line[mb.end():], style="List Bullet")
+                continue
+            mn = _WR_NUM_RE.match(line)
+            if mn:
+                d.add_paragraph(line[mn.end():], style="List Number")
+                continue
+            mq = _WR_QUOTE_RE.match(line)
+            if mq:
+                p = d.add_paragraph(line[mq.end():])
+                p.paragraph_format.left_indent = Pt(18)
+                continue
+        _add_rich_md_paragraph(d, line, md)
     if code_buf:
         d.add_paragraph("\n".join(code_buf))
     d.save(dst)
@@ -1188,7 +1291,7 @@ def _add_rich_md_paragraph(doc, line: str, md: bool) -> None:
     if not md or ("**" not in line and "`" not in line):
         p.add_run(line)
         return
-    parts = re.split(r"(\*\*.+?\*\*|`.+?`)", line)
+    parts = _RICH_MD_RE.split(line)
     for part in parts:
         if part.startswith("**") and part.endswith("**"):
             p.add_run(part[2:-2]).bold = True
@@ -1253,12 +1356,12 @@ def conv_epub_extract(src: Path, dst: Path) -> None:
                 html = raw_entry.decode("utf-8", errors="replace")
             except KeyError:
                 continue
-            html = re.sub(r"(?is)<(script|style).+?</\1>", " ", html)
+            html = _EPUB_SCRIPT_RE.sub(" ", html)
             # crude but robust text extraction w/ paragraph breaks
-            html = re.sub(r"(?i)</(p|div|h[1-6]|li|br)>", "\n", html)
-            text = re.sub(r"(?s)<[^>]+>", " ", html)
-            text = re.sub(r"[ \t]+", " ", text)
-            text = re.sub(r"\n\s*\n+", "\n\n", text).strip()
+            html = _EPUB_BREAK_RE.sub("\n", html)
+            text = _EPUB_TAG_RE.sub(" ", html)
+            text = _EPUB_WS_RE.sub(" ", text)
+            text = _EPUB_NL_RE.sub("\n\n", text).strip()
             if text:
                 texts.append(text)
     joined = "\n\n\n".join(texts) + "\n"
@@ -1286,25 +1389,54 @@ def conv_docx_to_text(src: Path, dst: Path) -> None:
 def _load_transposed_rgb(src: Path) -> Any:
     """Open an image with EXIF orientation applied and alpha composited onto white."""
     Image: Any = importlib.import_module("PIL.Image")
-    ImageOps: Any = importlib.import_module("PIL.ImageOps")
     with Image.open(src) as raw:
-        im = ImageOps.exif_transpose(raw)
+        if _exif_orientation(raw) != 1:
+            ImageOps: Any = importlib.import_module("PIL.ImageOps")
+            im = ImageOps.exif_transpose(raw)
+        else:
+            im = raw
         if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
-            rgba = im.convert("RGBA")
+            rgba = im.convert("RGBA") if im.mode != "RGBA" else im
             bg = Image.new("RGB", rgba.size, (255, 255, 255))
-            bg.paste(rgba, mask=rgba.split()[-1])
+            bg.paste(rgba, mask=rgba.getchannel("A"))
             return bg
+        if im.mode == "RGB":
+            if im is raw:
+                raw.load()
+                return raw.copy()
+            return im
         return im.convert("RGB")
 
 
-def _image_to_png_stream(src: Path) -> tuple[io.BytesIO, int, int]:
-    """Return (PNG BytesIO, width_px, height_px) for embedding into DOCX/PPTX."""
-    im = _load_transposed_rgb(src)
-    w, h = im.size
-    buf = io.BytesIO()
-    im.save(buf, format="PNG")
-    buf.seek(0)
-    return buf, w, h
+def _image_to_embed_stream(src: Path) -> tuple[io.BytesIO, int, int]:
+    """Return (JPEG/PNG BytesIO, width_px, height_px) for embedding into DOCX/PPTX."""
+    Image: Any = importlib.import_module("PIL.Image")
+    with Image.open(src) as raw:
+        fmt = (raw.format or "").upper()
+        orient = _exif_orientation(raw)
+        if fmt == "JPEG" and orient == 1 and raw.mode in ("RGB", "L"):
+            w, h = raw.size
+            return io.BytesIO(src.read_bytes()), w, h
+        if orient != 1:
+            ImageOps: Any = importlib.import_module("PIL.ImageOps")
+            im = ImageOps.exif_transpose(raw)
+        else:
+            im = raw
+        if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
+            rgba = im.convert("RGBA") if im.mode != "RGBA" else im
+            bg = Image.new("RGB", rgba.size, (255, 255, 255))
+            bg.paste(rgba, mask=rgba.getchannel("A"))
+            im = bg
+        elif im.mode not in ("RGB", "L"):
+            im = im.convert("RGB")
+        w, h = im.size
+        buf = io.BytesIO()
+        if fmt == "JPEG":
+            im.save(buf, format="JPEG", quality=95, subsampling=0)
+        else:
+            im.save(buf, format="PNG")
+        buf.seek(0)
+        return buf, w, h
 
 
 def conv_images_to_pdf(srcs: list[Path], dst: Path) -> None:
@@ -1317,26 +1449,43 @@ def conv_images_to_pdf(srcs: list[Path], dst: Path) -> None:
             return
         raise RuntimeError("Pillow is required to combine images into PDF")
     if BACKENDS.pymupdf:
-        fitz: Any = importlib.import_module("fitz")
+        fitz: Any = _import_fitz()
+        Image: Any = importlib.import_module("PIL.Image")
         doc = fitz.open()
         try:
             for p in srcs:
-                im = _load_transposed_rgb(p)
-                buf = io.BytesIO()
-                try:
-                    w_px, h_px = im.size
+                raw_inserted = False
+                with Image.open(p) as hdr:
+                    fmt = (hdr.format or "").upper()
+                    orient = _exif_orientation(hdr)
+                    w_px, h_px = hdr.size
+                    mode = hdr.mode
+                if orient == 1 and (
+                    (fmt == "JPEG" and mode in ("RGB", "L"))
+                    or (fmt == "PNG" and mode in ("RGB", "RGBA", "L", "LA"))
+                ):
                     w_pt = max(1.0, float(w_px) * 72.0 / 200.0)
                     h_pt = max(1.0, float(h_px) * 72.0 / 200.0)
-                    if p.suffix.lower() in (".jpg", ".jpeg"):
-                        im.save(buf, format="JPEG", quality=95, subsampling=0)
-                    else:
-                        im.save(buf, format="PNG")
                     page = doc.new_page(width=w_pt, height=h_pt)
-                    page.insert_image(page.rect, stream=buf.getvalue())
-                finally:
-                    buf.close()
-                    im.close()
-            doc.save(str(dst), deflate=True, garbage=3)
+                    page.insert_image(page.rect, stream=p.read_bytes())
+                    raw_inserted = True
+                if not raw_inserted:
+                    im = _load_transposed_rgb(p)
+                    buf = io.BytesIO()
+                    try:
+                        w_px, h_px = im.size
+                        w_pt = max(1.0, float(w_px) * 72.0 / 200.0)
+                        h_pt = max(1.0, float(h_px) * 72.0 / 200.0)
+                        if p.suffix.lower() in (".jpg", ".jpeg"):
+                            im.save(buf, format="JPEG", quality=95, subsampling=0)
+                        else:
+                            im.save(buf, format="PNG")
+                        page = doc.new_page(width=w_pt, height=h_pt)
+                        page.insert_image(page.rect, stream=buf.getvalue())
+                    finally:
+                        buf.close()
+                        im.close()
+            doc.save(str(dst), deflate=True, garbage=1)
         finally:
             doc.close()
         return
@@ -1389,13 +1538,16 @@ def conv_images_to_docx(srcs: list[Path], dst: Path) -> None:
         p.paragraph_format.line_spacing = 1.0
         if idx > 0:
             p.paragraph_format.page_break_before = True
-        stream, w_px, h_px = _image_to_png_stream(src)
+        stream, w_px, h_px = _image_to_embed_stream(src)
         scale = min(max_w_in / max(1, w_px), max_h_in / max(1, h_px))
-        p.add_run().add_picture(
-            stream,
-            width=Inches(max(0.5, w_px * scale)),
-            height=Inches(max(0.5, h_px * scale)),
-        )
+        try:
+            p.add_run().add_picture(
+                stream,
+                width=Inches(max(0.5, w_px * scale)),
+                height=Inches(max(0.5, h_px * scale)),
+            )
+        finally:
+            stream.close()
 
     doc.save(str(dst))
 
@@ -1419,77 +1571,93 @@ def conv_images_to_pptx(srcs: list[Path], dst: Path) -> None:
 
     for src in srcs:
         slide = prs.slides.add_slide(blank_layout)
-        stream, w_px, h_px = _image_to_png_stream(src)
+        stream, w_px, h_px = _image_to_embed_stream(src)
         scale = min(avail_w / max(1, w_px), avail_h / max(1, h_px))
         w_in = w_px * scale
         h_in = h_px * scale
         left = (SLIDE_W - w_in) / 2.0
         top = (SLIDE_H - h_in) / 2.0
-        slide.shapes.add_picture(
-            stream, Inches(left), Inches(top), width=Inches(w_in), height=Inches(h_in)
-        )
+        try:
+            slide.shapes.add_picture(
+                stream, Inches(left), Inches(top), width=Inches(w_in), height=Inches(h_in)
+            )
+        finally:
+            stream.close()
 
     prs.save(str(dst))
+
+
+_SVG_HDR_RE = re.compile(r"^\s*(?:<\?xml[^>]*\?>\s*)?(?:<!DOCTYPE[^>]*>\s*)?", re.I)
+_SVG_ID_REF_RE = re.compile(r'(\bid=")([^"]+)"|(url\(#)([^)]+)\)|((?:xlink:)?href="#)([^"]+)"')
 
 
 def conv_pdf_to_html_fidelity(src: Path, dst: Path) -> None:
     """Pixel-faithful PDF -> HTML: every page becomes an inline SVG produced by
     MuPDF with exact embedded font glyph paths, vector shapes, gradients, masks,
     and raster images, laid out like a PDF viewer."""
-    fitz: Any = importlib.import_module("fitz")
+    fitz: Any = _import_fitz()
     doc = fitz.open(str(src))
     try:
         if doc.needs_pass:
             raise RuntimeError("PDF is password protected")
-        pages: list[str] = []
-        for i, page in enumerate(doc, start=1):
-            svg = page.get_svg_image(matrix=fitz.Identity, text_as_path=True)
-            svg = re.sub(r"^\s*<\?xml[^>]*\?>\s*", "", svg)
-            svg = re.sub(r"^\s*<!DOCTYPE[^>]*>\s*", "", svg)
-            # Prefix MuPDF's per-page SVG ids (clip_1, mask_2, ...) so pages never collide
-            prefix = f"p{i}_"
-            svg = re.sub(r'\bid="([^"]+)"', rf'id="{prefix}\1"', svg)
-            svg = re.sub(r"url\(#([^)]+)\)", rf"url(#{prefix}\1)", svg)
-            svg = re.sub(r'((?:xlink:)?href="#)([^"]+)"', rf'\1{prefix}\2"', svg)
-            w, h = page.rect.width, page.rect.height
-            pages.append(
-                f'<section class="page" id="page-{i}" style="aspect-ratio:{w:.2f}/{h:.2f};'
-                f'max-width:{w * 4 / 3:.0f}px">{svg}</section>'
-            )
         title = _html_mod.escape((doc.metadata or {}).get("title") or src.stem)
+        with open(dst, "w", encoding="utf-8") as out_fh:
+            out_fh.write(
+                "<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">"
+                "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+                f"<title>{title}</title><style>"
+                "html,body{margin:0;background:#525659}"
+                "body{padding:24px 12px;display:flex;flex-direction:column;align-items:center;gap:24px}"
+                ".page{width:100%;background:#fff;box-shadow:0 2px 10px rgba(0,0,0,.45);overflow:hidden}"
+                ".page>svg{display:block;width:100%;height:100%}"
+                "@media print{html,body{background:#fff;padding:0;gap:0}"
+                ".page{box-shadow:none;max-width:none!important;page-break-after:always}}"
+                "</style></head><body>\n"
+            )
+            for i, page in enumerate(doc, start=1):
+                svg = page.get_svg_image(matrix=fitz.Identity, text_as_path=True)
+                head = _SVG_HDR_RE.sub("", svg[:512], count=1)
+                svg = head + svg[512:] if len(svg) > 512 else head
+                prefix = f"p{i}_"
+
+                def _prefix_svg_id(m: re.Match) -> str:
+                    if m.group(1) is not None:
+                        return f'{m.group(1)}{prefix}{m.group(2)}"'
+                    if m.group(3) is not None:
+                        return f"{m.group(3)}{prefix}{m.group(4)})"
+                    return f'{m.group(5)}{prefix}{m.group(6)}"'
+
+                svg = _SVG_ID_REF_RE.sub(_prefix_svg_id, svg)
+                w, h = page.rect.width, page.rect.height
+                out_fh.write(
+                    f'<section class="page" id="page-{i}" style="aspect-ratio:{w:.2f}/{h:.2f};'
+                    f'max-width:{w * 4 / 3:.0f}px">{svg}</section>\n'
+                )
+            out_fh.write("</body></html>\n")
     finally:
         doc.close()
-    dst.write_text(
-        "<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">"
-        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-        f"<title>{title}</title><style>"
-        "html,body{margin:0;background:#525659}"
-        "body{padding:24px 12px;display:flex;flex-direction:column;align-items:center;gap:24px}"
-        ".page{width:100%;background:#fff;box-shadow:0 2px 10px rgba(0,0,0,.45);overflow:hidden}"
-        ".page>svg{display:block;width:100%;height:100%}"
-        "@media print{html,body{background:#fff;padding:0;gap:0}"
-        ".page{box-shadow:none;max-width:none!important;page-break-after:always}}"
-        "</style></head><body>\n" + "\n".join(pages) + "\n</body></html>\n",
-        encoding="utf-8",
-    )
 
 
 def conv_pdf_to_text(src: Path, dst: Path) -> None:
     ext = dst.suffix.lstrip(".").lower()
     if BACKENDS.pymupdf:
-        fitz: Any = importlib.import_module("fitz")
+        fitz: Any = _import_fitz()
         doc = fitz.open(str(src))
         try:
             if ext in ("html", "htm"):
-                parts = [page.get_text("html") for page in doc]
-                dst.write_text(
-                    "<!DOCTYPE html><html><head><meta charset='utf-8'></head><body>\n"
-                    + "\n<hr/>\n".join(parts) + "\n</body></html>",
-                    encoding="utf-8",
-                )
+                with open(dst, "w", encoding="utf-8") as out_fh:
+                    out_fh.write("<!DOCTYPE html><html><head><meta charset='utf-8'></head><body>\n")
+                    for idx, page in enumerate(doc):
+                        if idx > 0:
+                            out_fh.write("\n<hr/>\n")
+                        out_fh.write(page.get_text("html"))
+                    out_fh.write("\n</body></html>")
                 return
-            text = "\n\n".join((page.get_text("text") or "").strip() for page in doc)
-            dst.write_text(text, encoding="utf-8-sig")
+            with open(dst, "w", encoding="utf-8-sig") as out_fh:
+                for idx, page in enumerate(doc):
+                    if idx > 0:
+                        out_fh.write("\n\n")
+                    out_fh.write((page.get_text("text") or "").strip())
             return
         finally:
             doc.close()
@@ -1528,11 +1696,23 @@ _MD_NUM_RE = re.compile(r"^(\d{1,3})[.)]\s+(.*)$")
 _MD_SOLO_NUM_RE = re.compile(r"^(\d{1,3})\)$")
 _MD_REF_RE = re.compile(r"^(\[\d{1,4}\])\s+(.*)$")
 _MD_SOLO_REF_RE = re.compile(r"^(\[\d{1,4}\])$")
+_MD_SPACES_RE = re.compile(r" {2,}")
+_MD_WORD_RE = re.compile(r"[A-Za-z]{4,}")
+_MD_MATH_OR_OP_RE = re.compile(r"[={}<>≤≥∑⋅]|^\w\s*=")
+_MD_TRAILING_COMMA_RE = re.compile(r"[,;]$")
+_MD_TRAILING_PUNCT_RE = re.compile(r"[,;:!?]$")
+_MD_NUM_PREFIX_RE = re.compile(r"^\d+(\.\d+)*\.")
+_MD_WS_COLLAPSE_RE = re.compile(r"\s+")
+_MD_TRAILING_WORD_RE = re.compile(r"[A-Za-z]+$")
+_MD_LEADING_WORD_RE = re.compile(r"^[A-Za-z]+")
+_MD_STAR_SPACE_RE = re.compile(r"\* \*")
+_MD_DBL_STAR_SPACE_RE = re.compile(r"\*\* \*\*")
+_MD_PAGE_NUM_RE = re.compile(r"(?:page\s*)?\d{1,4}|[-–—]\s*\d{1,4}\s*[-–—]", re.I)
 
 
 def _md_clean_text(s: str) -> str:
     s = s.translate(_PDF_PUA_MAP).replace("\u00a0", " ").replace("\ufeff", "")
-    return re.sub(r" {2,}", " ", s)
+    return _MD_SPACES_RE.sub(" ", s)
 
 
 def _md_is_mono(font: str) -> bool:
@@ -1553,14 +1733,17 @@ def _md_is_italic(font: str, flags: int) -> bool:
     return bool(flags & 2) or "italic" in fl or "oblique" in fl
 
 
-def _md_analyze_typography(doc: Any) -> tuple[float, list[float], set[str]]:
-    """Return (body_size, heading_tiers_desc, doc_words_lower) from document spans."""
+def _md_analyze_typography(doc: Any, text_flags: int = 0) -> tuple[float, list[float], set[str], dict[int, list]]:
+    """Return (body_size, heading_tiers_desc, doc_words_lower, cached_page_blocks)."""
     size_counts: Counter[float] = Counter()
     words: set[str] = set()
+    cached_blocks: dict[int, list] = {}
     for i in range(min(len(doc), 60)):
-        for b in doc[i].get_text("dict")["blocks"]:
-            if b["type"] != 0:
-                continue
+        page = doc[i]
+        pdict = page.get_text("dict", flags=text_flags) if text_flags else page.get_text("dict")
+        text_blocks = [b for b in pdict.get("blocks", ()) if b.get("type") == 0]
+        cached_blocks[i] = text_blocks
+        for b in text_blocks:
             for ln in b["lines"]:
                 line_txt: list[str] = []
                 for sp in ln["spans"]:
@@ -1571,7 +1754,7 @@ def _md_analyze_typography(doc: Any) -> tuple[float, list[float], set[str]]:
                     line_txt.append(txt)
                     if not _md_is_mono(sp["font"]) and not _md_is_sym(sp["font"]):
                         size_counts[round(sp["size"], 1)] += len(stripped)
-                for w in re.findall(r"[A-Za-z]{4,}", "".join(line_txt)):
+                for w in _MD_WORD_RE.findall("".join(line_txt)):
                     words.add(w.lower())
 
     body_size = size_counts.most_common(1)[0][0] if size_counts else 11.0
@@ -1580,29 +1763,29 @@ def _md_analyze_typography(doc: Any) -> tuple[float, list[float], set[str]]:
     for sz in large:
         if not tiers or abs(tiers[-1] - sz) > 1.2:
             tiers.append(sz)
-    return body_size, tiers[:4], words
+    return body_size, tiers[:4], words, cached_blocks
 
 
 def _md_heading_level(size: float, body_size: float, tiers: list[float],
                       is_bold: bool, has_sym: bool, text: str, line_count: int) -> int:
     if not text or has_sym or len(text) <= 1 or len(text) > 160 or line_count > 3:
         return 0
-    if re.search(r"[={}<>≤≥∑⋅]|^\w\s*=", text):
+    if _MD_MATH_OR_OP_RE.search(text):
         return 0
     for idx, tier_sz in enumerate(tiers):
         if abs(size - tier_sz) <= 1.2 or size >= tier_sz - 0.5:
             return min(idx + 1, 4)
-    if size >= body_size * 1.11 and not re.search(r"[,;]$", text):
+    if size >= body_size * 1.11 and not _MD_TRAILING_COMMA_RE.search(text):
         return 2 if size < body_size * 1.35 else 1
     if is_bold and line_count == 1 and len(text) <= 72:
-        if not re.search(r"[,;:!?]$", text) and (not text.endswith(".") or re.match(r"^\d+(\.\d+)*\.", text)):
+        if not _MD_TRAILING_PUNCT_RE.search(text) and (not text.endswith(".") or _MD_NUM_PREFIX_RE.match(text)):
             if not _MD_REF_RE.match(text) and not text.startswith("©") and len(text.split()) <= 10:
                 return min(len(tiers) + 1, 4) if tiers else 3
     return 0
 
 
 def _md_diagram_boxes(page: Any) -> list[tuple[float, float, float, float]]:
-    """Cluster dense non-frame vector drawings into diagram regions."""
+    """Cluster dense non-frame vector drawings into diagram regions via sweep-line."""
     pw, ph = page.rect.width, page.rect.height
     rects = []
     for d in page.get_drawings():
@@ -1613,23 +1796,40 @@ def _md_diagram_boxes(page: Any) -> list[tuple[float, float, float, float]]:
     if len(rects) < 4:
         return []
     pad = 14.0
-    clusters: list[list[Any]] = []
+    active: list[list[Any]] = []
+    retired: list[list[Any]] = []
     for x0, y0, x1, y1 in sorted(rects, key=lambda r: (r[1], r[0])):
-        hit = next(
-            (c for c in clusters if not (x1 + pad < c[0][0] or x0 - pad > c[0][2] or y1 + pad < c[0][1] or y0 - pad > c[0][3])),
-            None,
-        )
+        still_active: list[list[Any]] = []
+        hit = None
+        for c in active:
+            cb = c[0]
+            if cb[3] + pad < y0:
+                retired.append(c)
+                continue
+            still_active.append(c)
+            if not (x1 + pad < cb[0] or x0 - pad > cb[2] or y1 + pad < cb[1]):
+                if hit is None:
+                    hit = c
+                else:
+                    # Merge overlapping active cluster directly
+                    hb = hit[0]
+                    hb[0], hb[1] = min(hb[0], cb[0]), min(hb[1], cb[1])
+                    hb[2], hb[3] = max(hb[2], cb[2]), max(hb[3], cb[3])
+                    hit[1] += c[1]
+                    still_active.pop()
+        active = still_active
         if hit is not None:
             cb = hit[0]
             cb[0], cb[1], cb[2], cb[3] = min(cb[0], x0), min(cb[1], y0), max(cb[2], x1), max(cb[3], y1)
             hit[1] += 1
         else:
-            clusters.append([[x0, y0, x1, y1], 1])
+            active.append([[x0, y0, x1, y1], 1])
+    clusters = retired + active
     changed = True
-    while changed:
+    while changed and len(clusters) > 1:
         changed = False
         nxt: list[list[Any]] = []
-        for b, cnt in clusters:
+        for b, cnt in sorted(clusters, key=lambda c: (c[0][1], c[0][0])):
             hit = next(
                 (o for o in nxt if not (b[2] + pad < o[0][0] or b[0] - pad > o[0][2] or b[3] + pad < o[0][1] or b[1] - pad > o[0][3])),
                 None,
@@ -1672,7 +1872,7 @@ def _md_real_tables(page: Any) -> list[tuple[tuple[float, float, float, float], 
             continue
         if max((len((c or "").splitlines()) for row in rows for c in row), default=1) > 4:
             continue
-        clean = [[re.sub(r"\s+", " ", (c or "")).strip().replace("|", "\\|") for c in row] for row in rows]
+        clean = [[_MD_WS_COLLAPSE_RE.sub(" ", (c or "")).strip().replace("|", "\\|") for c in row] for row in rows]
         hdr = "| " + " | ".join(clean[0]) + " |"
         sep = "| " + " | ".join("---" for _ in clean[0]) + " |"
         body = ["| " + " | ".join(r) + " |" for r in clean[1:]]
@@ -1721,12 +1921,12 @@ def _md_join_lines(lines: list[str], doc_words: set[str]) -> str:
             out = seg
             continue
         if out.endswith("-") and len(out) >= 2 and out[-2].isalpha() and seg[0].islower():
-            lw = re.findall(r"[A-Za-z]+$", out[:-1])
-            rw = re.findall(r"^[A-Za-z]+", seg)
+            lw = _MD_TRAILING_WORD_RE.findall(out[:-1])
+            rw = _MD_LEADING_WORD_RE.findall(seg)
             out = (out[:-1] + seg) if (lw and rw and (lw[0] + rw[0]).lower() in doc_words) else (out + seg)
         else:
             out = out + " " + seg
-    return re.sub(r"\* \*", " ", re.sub(r"\*\* \*\*", " ", out))
+    return _MD_STAR_SPACE_RE.sub(" ", _MD_DBL_STAR_SPACE_RE.sub(" ", out))
 
 
 def _md_merge_split_markers(raw_lines: list[str], styled_lines: list[str]) -> tuple[list[str], list[str]]:
@@ -1748,20 +1948,24 @@ def _md_merge_split_markers(raw_lines: list[str], styled_lines: list[str]) -> tu
 
 def conv_pdf_to_md_structured(src: Path, dst: Path) -> None:
     """Convert PDF to clean structured GitHub-Flavored Markdown via PyMuPDF."""
-    fitz: Any = importlib.import_module("fitz")
+    fitz: Any = _import_fitz()
     doc = fitz.open(str(src))
     try:
         if doc.needs_pass:
             raise RuntimeError("PDF is password protected")
-        body_size, tiers, doc_words = _md_analyze_typography(doc)
+        text_flags = getattr(fitz, "TEXTFLAGS_DICT", 0) & ~getattr(fitz, "TEXT_PRESERVE_IMAGES", 0)
+        body_size, tiers, doc_words, cached_blocks = _md_analyze_typography(doc, text_flags=text_flags)
         items_all: list[tuple[str, str]] = []
 
-        for page in doc:
+        for page_idx, page in enumerate(doc):
             ph = page.rect.height
             diag_boxes = _md_diagram_boxes(page)
             tables = _md_real_tables(page)
             tbl_boxes = [tb for tb, _ in tables]
-            blocks = [b for b in page.get_text("dict")["blocks"] if b["type"] == 0]
+            blocks = cached_blocks.pop(page_idx, None)
+            if blocks is None:
+                pdict = page.get_text("dict", flags=text_flags) if text_flags else page.get_text("dict")
+                blocks = [b for b in pdict.get("blocks", ()) if b.get("type") == 0]
             blocks.sort(key=lambda b: (round(b["bbox"][1] / 5.0), b["bbox"][0]))
 
             page_items: list[tuple[float, str, str]] = [(tb[1], "table", md) for tb, md in tables]
@@ -1778,14 +1982,13 @@ def conv_pdf_to_md_structured(src: Path, dst: Path) -> None:
                 plain = " ".join(raw_lines).strip()
                 if not plain:
                     continue
-                if (bbox[1] > ph * 0.87 or bbox[3] < ph * 0.08) and re.fullmatch(
-                    r"(?:page\s*)?\d{1,4}|[-–—]\s*\d{1,4}\s*[-–—]", plain, re.I
-                ):
+                if (bbox[1] > ph * 0.87 or bbox[3] < ph * 0.08) and _MD_PAGE_NUM_RE.fullmatch(plain):
                     continue
-                dom_size = max(
-                    Counter(round(sp["size"], 1) for sp in spans for _ in range(len(sp["text"].strip()))).items(),
-                    key=lambda kv: kv[1],
-                )[0]
+                size_hist: dict[float, int] = {}
+                for sp in spans:
+                    sz = round(sp["size"], 1)
+                    size_hist[sz] = size_hist.get(sz, 0) + len(sp["text"].strip())
+                dom_size = max(size_hist.items(), key=lambda kv: kv[1])[0]
                 dom_bold = all(_md_is_bold(sp["font"], sp["flags"]) for sp in spans)
                 has_sym = any(_md_is_sym(sp["font"]) for sp in spans)
                 all_mono = all(_md_is_mono(sp["font"]) for sp in spans)
@@ -1910,18 +2113,19 @@ def _normalize_image_stream(blob: bytes) -> Optional[io.BytesIO]:
     return io.BytesIO(blob)
 
 
-def _flatten_pptx_shapes(shapes: Any) -> list[tuple[int, int, Any]]:
+def _flatten_pptx_shapes(shapes: Any, _sort: bool = True) -> list[tuple[int, int, Any]]:
     """Collect leaf shapes recursively, sorted top-to-bottom then left-to-right."""
     items: list[tuple[int, int, Any]] = []
     for sh in shapes:
         sub_shapes = getattr(sh, "shapes", None)
         if sub_shapes is not None:
-            items.extend(_flatten_pptx_shapes(sub_shapes))
+            items.extend(_flatten_pptx_shapes(sub_shapes, _sort=False))
         else:
             top = int(getattr(sh, "top", 0) or 0)
             left = int(getattr(sh, "left", 0) or 0)
             items.append((top, left, sh))
-    items.sort(key=lambda t: (t[0], t[1]))
+    if _sort:
+        items.sort(key=lambda t: (t[0], t[1]))
     return items
 
 
@@ -1931,12 +2135,13 @@ def conv_pdf_to_pptx(src: Path, dst: Path) -> None:
     Text pages emit positioned editable textboxes and extracted images; scanned
     or textless pages fall back to a 200 DPI page image so nothing is dropped.
     """
-    fitz: Any = importlib.import_module("fitz")
+    fitz: Any = _import_fitz()
     pptx_mod: Any = importlib.import_module("pptx")
     pptx_util: Any = importlib.import_module("pptx.util")
     pptx_color: Any = importlib.import_module("pptx.dml.color")
     Pt = pptx_util.Pt
     RGBColor = pptx_color.RGBColor
+    text_flags = getattr(fitz, "TEXTFLAGS_DICT", 0) & ~getattr(fitz, "TEXT_PRESERVE_IMAGES", 0)
 
     pdf = fitz.open(str(src))
     try:
@@ -1950,6 +2155,7 @@ def conv_pdf_to_pptx(src: Path, dst: Path) -> None:
         prs.slide_width = Pt(sw)
         prs.slide_height = Pt(sh)
         blank_layout = prs.slide_layouts[min(6, len(prs.slide_layouts) - 1)]
+        xref_cache: dict[int, Optional[bytes]] = {}
 
         for page in pdf:
             slide = prs.slides.add_slide(blank_layout)
@@ -1959,7 +2165,7 @@ def conv_pdf_to_pptx(src: Path, dst: Path) -> None:
             ox = (sw - pw * scale) / 2.0
             oy = (sh - ph * scale) / 2.0
 
-            pdict = page.get_text("dict")
+            pdict = page.get_text("dict", flags=text_flags) if text_flags else page.get_text("dict")
             blocks = pdict.get("blocks", []) if isinstance(pdict, dict) else []
             text_blocks = [b for b in blocks if b.get("type") == 0]
             has_text = any(
@@ -1969,25 +2175,32 @@ def conv_pdf_to_pptx(src: Path, dst: Path) -> None:
             )
 
             if not has_text:
-                pix = page.get_pixmap(dpi=200)
-                stream = io.BytesIO(pix.tobytes("png"))
-                slide.shapes.add_picture(
-                    stream, Pt(ox), Pt(oy), Pt(pw * scale), Pt(ph * scale)
-                )
+                pix = page.get_pixmap(dpi=200, alpha=False)
+                with io.BytesIO(pix.tobytes("png")) as stream:
+                    slide.shapes.add_picture(
+                        stream, Pt(ox), Pt(oy), Pt(pw * scale), Pt(ph * scale)
+                    )
                 continue
 
             # Place extracted raster images first so text sits cleanly on top
             seen_img_rects: set[tuple[int, int, int, int]] = set()
             for img_info in page.get_images(full=True):
                 xref = img_info[0]
-                try:
-                    extracted = pdf.extract_image(xref)
-                except Exception:
-                    continue
-                if not extracted or not extracted.get("image"):
-                    continue
-                img_stream = _normalize_image_stream(extracted["image"])
-                if img_stream is None:
+                if xref in xref_cache:
+                    raw_norm = xref_cache[xref]
+                else:
+                    raw_norm = None
+                    try:
+                        extracted = pdf.extract_image(xref)
+                    except Exception:
+                        extracted = None
+                    if extracted and extracted.get("image"):
+                        s_norm = _normalize_image_stream(extracted["image"])
+                        if s_norm is not None:
+                            raw_norm = s_norm.getvalue()
+                            s_norm.close()
+                    xref_cache[xref] = raw_norm
+                if raw_norm is None:
                     continue
                 try:
                     rects = page.get_image_rects(xref)
@@ -2002,17 +2215,17 @@ def conv_pdf_to_pptx(src: Path, dst: Path) -> None:
                     if key in seen_img_rects:
                         continue
                     seen_img_rects.add(key)
-                    img_stream.seek(0)
-                    try:
-                        slide.shapes.add_picture(
-                            img_stream,
-                            Pt(ox + rect.x0 * scale),
-                            Pt(oy + rect.y0 * scale),
-                            Pt(rw * scale),
-                            Pt(rh * scale),
-                        )
-                    except Exception:
-                        pass
+                    with io.BytesIO(raw_norm) as img_stream:
+                        try:
+                            slide.shapes.add_picture(
+                                img_stream,
+                                Pt(ox + rect.x0 * scale),
+                                Pt(oy + rect.y0 * scale),
+                                Pt(rw * scale),
+                                Pt(rh * scale),
+                            )
+                        except Exception:
+                            pass
 
             for b in text_blocks:
                 lines = b.get("lines", [])
@@ -2100,6 +2313,32 @@ def _copy_docx_runs_to_pptx_para(src_p: Any, dst_p: Any, Pt: Any, RGBColor: Any,
         r.font.size = Pt(base_pt)
 
 
+_DRAWING_BLIP_TAG = "{http://schemas.openxmlformats.org/drawingml/2006/main}blip"
+_VML_IMAGE_TAG = "{urn:schemas-microsoft-com:vml}imagedata"
+_REL_EMBED_ATTR = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed"
+_REL_ID_ATTR = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+_W_BR_TAG = f"{{{_W_NS}}}br"
+_W_TYPE_ATTR = f"{{{_W_NS}}}type"
+
+
+def _scan_docx_paragraph(child: Any, check_break: bool = True) -> tuple[bool, list[str]]:
+    has_break = False
+    rids: list[str] = []
+    for node in child.iter():
+        t = node.tag
+        if check_break and not has_break and t == _W_BR_TAG and node.get(_W_TYPE_ATTR) == "page":
+            has_break = True
+        elif t == _DRAWING_BLIP_TAG:
+            rid = node.get(_REL_EMBED_ATTR)
+            if rid:
+                rids.append(rid)
+        elif t == _VML_IMAGE_TAG:
+            rid = node.get(_REL_ID_ATTR)
+            if rid:
+                rids.append(rid)
+    return has_break, rids
+
+
 def conv_docx_to_pptx(src: Path, dst: Path) -> None:
     """Convert Word (.docx) to widescreen PowerPoint (.pptx), splitting on headings/page breaks."""
     docx_mod: Any = importlib.import_module("docx")
@@ -2168,21 +2407,7 @@ def conv_docx_to_pptx(src: Path, dst: Path) -> None:
             current_tf.word_wrap = True
         return current_tf
 
-    def _extract_para_images(p: Any) -> list[bytes]:
-        blobs: list[bytes] = []
-        rids: list[str] = []
-        for attr in (".//a:blip/@r:embed", ".//v:imagedata/@r:id"):
-            try:
-                rids.extend(p._element.xpath(attr))
-            except Exception:
-                pass
-        for rid in rids:
-            part = doc.part.related_parts.get(str(rid))
-            blob = getattr(part, "blob", None)
-            if isinstance(blob, (bytes, bytearray)) and blob:
-                blobs.append(bytes(blob))
-        return blobs
-
+    related_parts = getattr(doc.part, "related_parts", {}) or {}
     children = list(doc.element.body)
     idx = 0
     while idx < len(children):
@@ -2195,16 +2420,21 @@ def conv_docx_to_pptx(src: Path, dst: Path) -> None:
             text = para.text.strip()
             style_name = (getattr(para.style, "name", "") or "").lower()
             has_break = bool(getattr(para.paragraph_format, "page_break_before", False))
-            if not has_break:
-                try:
-                    has_break = bool(child.xpath(".//w:br[@w:type='page']"))
-                except Exception:
-                    has_break = False
+            found_break, rids = _scan_docx_paragraph(child, check_break=not has_break)
+            if found_break:
+                has_break = True
 
             if has_break and current_slide is not None and (slide_has_content or current_title):
                 _new_slide()
 
-            img_blobs = _extract_para_images(para)
+            img_blobs: list[bytes] = []
+            if rids:
+                rel_parts = getattr(getattr(para, "part", None), "related_parts", related_parts) or {}
+                for rid in rids:
+                    part = rel_parts.get(rid)
+                    blob = getattr(part, "blob", None) if part is not None else None
+                    if blob:
+                        img_blobs.append(blob)
 
             if style_name == "title" and text:
                 title_slide = prs.slides.add_slide(blank_layout)
@@ -2464,10 +2694,11 @@ def conv_pptx_to_docx(src: Path, dst: Path) -> None:
     doc.save(str(dst))
 
 
-def _pptx_fill_rgb01(fill: Any) -> Optional[tuple[float, float, float]]:
+def _pptx_fill_rgb01(fill: Any, pptx_dml: Any = None) -> Optional[tuple[float, float, float]]:
     """Extract normalized (0..1) RGB fill color from a python-pptx FillFormat if solid."""
     try:
-        pptx_dml: Any = importlib.import_module("pptx.enum.dml")
+        if pptx_dml is None:
+            pptx_dml = importlib.import_module("pptx.enum.dml")
         if fill.type != pptx_dml.MSO_FILL.SOLID:
             return None
         fc = fill.fore_color
@@ -2485,12 +2716,15 @@ def conv_pptx_to_pdf(src: Path, dst: Path) -> None:
     pptx_shapes_enum: Any = importlib.import_module("pptx.enum.shapes")
     pptx_dml: Any = importlib.import_module("pptx.enum.dml")
     pptx_align: Any = importlib.import_module("pptx.enum.text")
-    fitz: Any = importlib.import_module("fitz")
+    fitz: Any = _import_fitz()
 
     prs = pptx_mod.Presentation(str(src))
     sw = float(prs.slide_width or 914400 * 10) / _PPTX_EMU_PER_PT
     sh = float(prs.slide_height or int(914400 * 5.625)) / _PPTX_EMU_PER_PT
     pdf = fitz.open()
+    probe_doc: Any = None
+    probe_page: Any = None
+    norm_cache: dict[int, Optional[bytes]] = {}
 
     align_map = {
         pptx_align.PP_ALIGN.CENTER: fitz.TEXT_ALIGN_CENTER,
@@ -2503,7 +2737,7 @@ def conv_pptx_to_pdf(src: Path, dst: Path) -> None:
             pdf.new_page(width=sw, height=sh)
         for slide in prs.slides:
             page = pdf.new_page(width=sw, height=sh)
-            bg_rgb = _pptx_fill_rgb01(slide.background.fill)
+            bg_rgb = _pptx_fill_rgb01(slide.background.fill, pptx_dml)
             if bg_rgb is not None:
                 page.draw_rect(page.rect, color=None, fill=bg_rgb)
 
@@ -2529,9 +2763,16 @@ def conv_pptx_to_pdf(src: Path, dst: Path) -> None:
 
                 if getattr(shape, "shape_type", None) == pptx_shapes_enum.MSO_SHAPE_TYPE.PICTURE or hasattr(shape, "image"):
                     try:
-                        stream = _normalize_image_stream(shape.image.blob)
-                        if stream is not None:
-                            page.insert_image(rect, stream=stream.getvalue())
+                        raw_blob = shape.image.blob
+                        bkey = hash(raw_blob)
+                        if bkey not in norm_cache:
+                            stream = _normalize_image_stream(raw_blob)
+                            norm_cache[bkey] = stream.getvalue() if stream is not None else None
+                            if stream is not None:
+                                stream.close()
+                        cached = norm_cache[bkey]
+                        if cached is not None:
+                            page.insert_image(rect, stream=cached)
                     except Exception:
                         pass
                     continue
@@ -2547,7 +2788,7 @@ def conv_pptx_to_pdf(src: Path, dst: Path) -> None:
                         for c_idx in range(len(tbl.columns)):
                             cw = col_ws[c_idx] if c_idx < len(col_ws) and col_ws[c_idx] > 0 else (w / max(1, len(tbl.columns)))
                             crect = fitz.Rect(cx, cy, cx + cw, cy + rh)
-                            cfill = _pptx_fill_rgb01(row.cells[c_idx].fill) or ((0.94, 0.96, 0.98) if r_idx == 0 else None)
+                            cfill = _pptx_fill_rgb01(row.cells[c_idx].fill, pptx_dml) or ((0.94, 0.96, 0.98) if r_idx == 0 else None)
                             page.draw_rect(crect, color=(0.72, 0.76, 0.82), width=0.6, fill=cfill)
                             ctext = row.cells[c_idx].text.strip()
                             if ctext:
@@ -2564,7 +2805,7 @@ def conv_pptx_to_pdf(src: Path, dst: Path) -> None:
                         cy += rh
                     continue
 
-                fill_rgb = _pptx_fill_rgb01(getattr(shape, "fill", None))
+                fill_rgb = _pptx_fill_rgb01(getattr(shape, "fill", None), pptx_dml)
                 if fill_rgb is not None:
                     page.draw_rect(rect, color=None, fill=fill_rgb)
 
@@ -2609,21 +2850,51 @@ def conv_pptx_to_pdf(src: Path, dst: Path) -> None:
                             box = fitz.Rect(x0 + 3.0, cur_y, x0 + w - 3.0, bottom)
                             if box.width <= 4 or box.height <= 4:
                                 break
-                            # Fit text inside remaining box height; shrink slightly if needed
+                            # Fit text inside remaining box height; binary search shrink on probe page if needed
                             used_fs = fs
-                            rc = -1.0
-                            while used_fs >= 7.0:
-                                rc = page.insert_textbox(
-                                    box, ptxt, fontsize=used_fs, fontname=fname, color=col_rgb, align=p_align
-                                )
-                                if rc >= 0:
-                                    break
-                                used_fs -= 2.0
+                            rc = page.insert_textbox(
+                                box, ptxt, fontsize=used_fs, fontname=fname, color=col_rgb, align=p_align
+                            )
+                            if rc < 0 and fs >= 9.0:
+                                max_k = int((fs - 7.0) // 2.0)
+                                if max_k > 0:
+                                    if probe_doc is None:
+                                        probe_doc = fitz.open()
+                                        probe_page = probe_doc.new_page(width=sw, height=sh)
+                                    pbox = fitz.Rect(0.0, 0.0, box.width, box.height)
+                                    lo, hi = 1, max_k
+                                    best_fs: Optional[float] = None
+                                    while lo <= hi:
+                                        mid = (lo + hi) // 2
+                                        cand = fs - 2.0 * mid
+                                        if probe_page.insert_textbox(
+                                            pbox, ptxt, fontsize=cand, fontname=fname, color=col_rgb, align=p_align
+                                        ) >= 0:
+                                            best_fs = cand
+                                            hi = mid - 1
+                                        else:
+                                            lo = mid + 1
+                                    if best_fs is not None:
+                                        used_fs = best_fs
+                                        page.insert_textbox(
+                                            box, ptxt, fontsize=used_fs, fontname=fname, color=col_rgb, align=p_align
+                                        )
+                                    else:
+                                        used_fs = max(5.0, fs - 2.0 * (max_k + 1))
+                                else:
+                                    used_fs = max(5.0, fs - 2.0)
+                            elif rc < 0:
+                                used_fs = max(5.0, fs - 2.0)
                             est_lines = max(1, int((len(ptxt) * used_fs * 0.52) // max(20.0, box.width)) + ptxt.count("\n") + 1)
                             cur_y += est_lines * used_fs * 1.28 + 3.0
 
-        pdf.save(str(dst), deflate=True, garbage=3)
+        pdf.save(str(dst), deflate=True, garbage=1)
     finally:
+        if probe_doc is not None:
+            try:
+                probe_doc.close()
+            except Exception:
+                pass
         pdf.close()
 
 
@@ -2686,13 +2957,9 @@ def conv_docx_to_pdf(src: Path, dst: Path) -> None:
             tag = child.tag.rsplit("}", 1)[-1]
             if tag == "p":
                 para = docx_para_mod.Paragraph(child, doc)
-                has_break = bool(getattr(para.paragraph_format, "page_break_before", False))
-                if not has_break:
-                    try:
-                        has_break = bool(child.xpath(".//w:br[@w:type='page']"))
-                    except Exception:
-                        has_break = False
-                if has_break and y > MARGIN_Y + 4.0:
+                p_break = bool(getattr(para.paragraph_format, "page_break_before", False))
+                xml_break, rids = _scan_docx_paragraph(child, check_break=not p_break)
+                if (p_break or xml_break) and y > MARGIN_Y + 4.0:
                     _next_page()
 
                 text = para.text.strip()
@@ -2716,12 +2983,6 @@ def conv_docx_to_pdf(src: Path, dst: Path) -> None:
                     page.insert_textbox(box, text, fontsize=fs, fontname=fname, color=(0.08, 0.09, 0.12))
                     y += needed
 
-                rids: list[str] = []
-                for attr in (".//a:blip/@r:embed", ".//v:imagedata/@r:id"):
-                    try:
-                        rids.extend(child.xpath(attr))
-                    except Exception:
-                        pass
                 for rid in rids:
                     part = doc.part.related_parts.get(str(rid))
                     blob = getattr(part, "blob", None)
@@ -2739,6 +3000,8 @@ def conv_docx_to_pdf(src: Path, dst: Path) -> None:
                         y += img_h + 8.0
                     except Exception:
                         pass
+                    finally:
+                        stream.close()
 
             elif tag == "tbl":
                 tbl = docx_tbl_mod.Table(child, doc)
@@ -2774,7 +3037,7 @@ def conv_docx_to_pdf(src: Path, dst: Path) -> None:
                     y += rh
                 y += 8.0
 
-        pdf.save(str(dst), deflate=True, garbage=3)
+        pdf.save(str(dst), deflate=True, garbage=1)
     finally:
         pdf.close()
 
@@ -2819,7 +3082,7 @@ def _dir_size(path: Path) -> int:
 
 def _render_pdf_pages(pdf_path: Path, out_dir: Path, ext: str) -> int:
     """Render every page of ``pdf_path`` into ``out_dir`` as page_001.<ext> ...; return page count."""
-    fitz: Any = importlib.import_module("fitz")
+    fitz: Any = _import_fitz()
     ext = ext.lstrip(".").lower()
     pil_fmt = {"jpg": "JPEG", "jpeg": "JPEG", "png": "PNG", "webp": "WEBP", "bmp": "BMP",
                "tif": "TIFF", "tiff": "TIFF", "gif": "GIF", "avif": "AVIF", "jxl": "JXL"}[ext]
@@ -2832,24 +3095,45 @@ def _render_pdf_pages(pdf_path: Path, out_dir: Path, ext: str) -> int:
             raise RuntimeError("Document has 0 pages")
         width = max(3, len(str(n)))
         out_dir.mkdir(parents=True, exist_ok=True)
-        for i, page in enumerate(doc, start=1):
-            pix = page.get_pixmap(dpi=PAGE_RENDER_DPI, alpha=False)
-            target = out_dir / f"page_{i:0{width}d}.{ext}"
-            if ext == "png":
-                pix.save(str(target))
-                continue
-            if not BACKENDS.pillow:
-                raise RuntimeError(f"Pillow is required to write .{ext} pages")
-            Image: Any = importlib.import_module("PIL.Image")
-            im = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-            kwargs: dict[str, Any] = {}
-            if pil_fmt == "JPEG":
-                kwargs = {"quality": 92, "optimize": True}
-            elif pil_fmt == "WEBP":
-                kwargs = {"quality": 90}
-            elif pil_fmt == "GIF":
-                im = im.convert("P", palette=Image.ADAPTIVE)
-            im.save(str(target), format=pil_fmt, **kwargs)
+        if ext == "png":
+            for i, page in enumerate(doc, start=1):
+                pix = page.get_pixmap(dpi=PAGE_RENDER_DPI, alpha=False)
+                pix.save(str(out_dir / f"page_{i:0{width}d}.{ext}"))
+            return n
+        if not BACKENDS.pillow:
+            raise RuntimeError(f"Pillow is required to write .{ext} pages")
+        Image: Any = importlib.import_module("PIL.Image")
+        kwargs: dict[str, Any] = {}
+        if pil_fmt == "JPEG":
+            kwargs = {"quality": 92, "optimize": True}
+        elif pil_fmt == "WEBP":
+            kwargs = {"quality": 90}
+
+        def _encode_one(pw: int, ph: int, samples: bytes, target_str: str) -> None:
+            im = Image.frombytes("RGB", (pw, ph), samples)
+            try:
+                if pil_fmt == "GIF":
+                    im = im.convert("P", palette=Image.ADAPTIVE)
+                im.save(target_str, format=pil_fmt, **kwargs)
+            finally:
+                im.close()
+
+        if n == 1:
+            pix = doc[0].get_pixmap(dpi=PAGE_RENDER_DPI, alpha=False)
+            _encode_one(pix.width, pix.height, pix.samples, str(out_dir / f"page_{1:0{width}d}.{ext}"))
+            return 1
+
+        max_workers = max(2, min(4, os.cpu_count() or 2))
+        pending: list[Any] = []
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="clickshift-imgenc") as pool:
+            for i, page in enumerate(doc, start=1):
+                pix = page.get_pixmap(dpi=PAGE_RENDER_DPI, alpha=False)
+                target = str(out_dir / f"page_{i:0{width}d}.{ext}")
+                pending.append(pool.submit(_encode_one, pix.width, pix.height, pix.samples, target))
+                if len(pending) >= max_workers * 2:
+                    pending.pop(0).result()
+            for fut in pending:
+                fut.result()
         return n
     finally:
         doc.close()
@@ -2892,161 +3176,183 @@ class Route:
     weight: int = 0   # static preference: higher = try first
 
 
+_ROUTES_LOCK = threading.Lock()
+_ROUTES_CACHE: dict[
+    tuple[str, str],
+    tuple[int, bool, tuple[tuple[str, Any], ...], tuple[Route, ...]],
+] = {}
+
+
+def _snapshot_backend_val(val: Any) -> Any:
+    return tuple(sorted(val.items())) if isinstance(val, dict) else val
+
+
 def _routes_for(src_ext: str, dst_ext: str) -> list[Route]:
     s, d = src_ext.lower().lstrip("."), dst_ext.lower().lstrip(".")
     if s == d:
         return []
+    b_id = id(BACKENDS)
+    cached = _ROUTES_CACHE.get((s, d))
+    if cached is not None:
+        c_bid, c_win, c_deps, c_routes = cached
+        if (
+            c_bid == b_id
+            and c_win == IS_WINDOWS
+            and all(_snapshot_backend_val(getattr(BACKENDS, k)) == v for k, v in c_deps)
+        ):
+            return list(c_routes)
+
+    accessed: dict[str, Any] = {}
+
+    def _b(attr: str) -> Any:
+        if attr not in accessed:
+            accessed[attr] = getattr(BACKENDS, attr)
+        return accessed[attr]
+
+    def _has_office() -> bool:
+        return IS_WINDOWS and bool(_b("office_app"))
+
+    def _has_word() -> bool:
+        return IS_WINDOWS and "word" in _b("office_app")
+
+    def _has_ppt() -> bool:
+        return IS_WINDOWS and "powerpoint" in _b("office_app")
+
     routes: list[Route] = []
 
     def add(name: str, fn: BackendFn, w: int = 0):
         routes.append(Route(name, fn, w))
 
-    office_available = IS_WINDOWS and bool(BACKENDS.office_app)
-    word_available = office_available and "word" in BACKENDS.office_app
-    ppt_available = office_available and "powerpoint" in BACKENDS.office_app
-
     # same family shortcuts ---------------------------------------------------
     if s in IMAGE_EXTS and d in IMAGE_EXTS:
-        if BACKENDS.pillow:
+        if _b("pillow"):
             add("pillow", conv_pillow, 100)
         add("libreoffice", conv_libreoffice, 20)
     elif s == "pdf" and d == "docx":
-        if BACKENDS.pdf2docx:
+        if _b("pdf2docx"):
             add("pdf2docx", conv_pdf2docx, 95)
-        if word_available:
+        if _has_word():
             # Word 2013+ PDF reflow: excellent for text-centric PDFs
             add("office-com", conv_office_com, 85)
-        if BACKENDS.pymupdf and BACKENDS.python_docx:
+        if _b("pymupdf") and _b("python_docx"):
             add("pymupdf-docx", conv_pdf_to_docx_pymupdf, 75)
         add("libreoffice", conv_libreoffice, 65)
-        if BACKENDS.pypdf and BACKENDS.python_docx:
+        if _b("pypdf") and _b("python_docx"):
             add("pypdf-docx", conv_pdf_to_docx_pypdf, 50)
     elif s == "pdf" and d == "pptx":
-        if BACKENDS.pymupdf and BACKENDS.python_pptx:
+        if _b("pymupdf") and _b("python_pptx"):
             add("pymupdf-python-pptx", conv_pdf_to_pptx, 95)
         add("libreoffice", conv_libreoffice, 40)
     elif s == "pdf" and d in ("md", "markdown"):
-        if BACKENDS.pymupdf:
+        if _b("pymupdf"):
             add("pymupdf-md", conv_pdf_to_md_structured, 99)
         else:
             add("pypdf", conv_pdf_to_text, 90)
         add("libreoffice", conv_libreoffice, 40)
     elif s == "pdf" and d in ("txt", "csv", "html", "htm"):
-        if d in ("html", "htm") and BACKENDS.pymupdf:
+        if d in ("html", "htm") and _b("pymupdf"):
             add("pymupdf-html", conv_pdf_to_html_fidelity, 99)
         else:
             add("pypdf", conv_pdf_to_text, 90 if d not in ("html", "htm") else 45)
-        if word_available and d in _WORD_ONLY_FMTS:
+        if d in _WORD_ONLY_FMTS and _has_word():
             add("office-com", conv_office_com, 60)
         add("libreoffice", conv_libreoffice, 40)
     elif s == "pdf" and d in ("odt", "rtf"):
-        if word_available and d == "rtf":
+        if d == "rtf" and _has_word():
             add("office-com", conv_office_com, 85)
         add("libreoffice", conv_libreoffice, 75)
     elif s in PAGED_IN and d in PAGE_IMAGE_EXTS:
-        if BACKENDS.pymupdf and (d == "png" or BACKENDS.pillow):
+        if _b("pymupdf") and (d == "png" or _b("pillow")):
             _page_img_ext = d
             add("pages-to-images", lambda src_, dst_, _e=_page_img_ext: conv_pages_to_image_folder(src_, dst_, _e), 100)
         if s == "pdf":
             add("libreoffice", conv_libreoffice, 30)
     elif s in IMAGE_EXTS and d == "pdf":
-        if BACKENDS.pillow:
+        if _b("pillow"):
             add("pillow-pdf", conv_image_to_pdf, 100)
         add("libreoffice", conv_libreoffice, 30)
     elif s in IMAGE_EXTS and d == "docx":
-        if BACKENDS.pillow and BACKENDS.python_docx:
+        if _b("pillow") and _b("python_docx"):
             add("pillow-python-docx", lambda s_, d_: conv_images_to_docx([s_], d_), 100)
     elif s in IMAGE_EXTS and d == "pptx":
-        if BACKENDS.pillow and BACKENDS.python_pptx:
+        if _b("pillow") and _b("python_pptx"):
             add("pillow-python-pptx", lambda s_, d_: conv_images_to_pptx([s_], d_), 100)
     elif s == "docx" and d == "pptx":
-        if BACKENDS.python_docx and BACKENDS.python_pptx:
+        if _b("python_docx") and _b("python_pptx"):
             add("python-docx-python-pptx", conv_docx_to_pptx, 95)
         add("libreoffice", conv_libreoffice, 30)
     elif s in (OFFICE_DOC_IN | {"md", "markdown", "rst"}) - {"docx"} and d == "pptx":
-        if s in TEXT_EXTS and BACKENDS.python_docx and BACKENDS.python_pptx:
+        if s in TEXT_EXTS and _b("python_docx") and _b("python_pptx"):
             add("text-python-docx-python-pptx", conv_via_docx_to_pptx, 85)
-        elif BACKENDS.python_docx and BACKENDS.python_pptx and (word_available or BACKENDS.libreoffice):
+        elif _b("python_docx") and _b("python_pptx") and (_has_word() or _b("libreoffice")):
             add("via-python-docx-python-pptx", conv_via_docx_to_pptx, 85)
         add("libreoffice", conv_libreoffice, 30)
     elif s == "pptx" and d == "docx":
-        if BACKENDS.python_pptx and BACKENDS.python_docx:
+        if _b("python_pptx") and _b("python_docx"):
             add("python-pptx-python-docx", conv_pptx_to_docx, 95)
         add("libreoffice", conv_libreoffice, 30)
     elif s in ("ppt", "odp") and d == "docx":
-        if BACKENDS.python_pptx and BACKENDS.python_docx and (ppt_available or BACKENDS.libreoffice):
+        if _b("python_pptx") and _b("python_docx") and (_has_ppt() or _b("libreoffice")):
             add("via-python-pptx-python-docx", conv_via_pptx_to_docx, 85)
         add("libreoffice", conv_libreoffice, 30)
     elif s in ("docx",) and d in TEXT_EXTS - {"docx"}:
         if s == "docx" and d in ("txt", "md", "log"):
             add("python-docx", conv_docx_to_text, 90)
-        if word_available and d in _WORD_ONLY_FMTS:
+        if d in _WORD_ONLY_FMTS and _has_word():
             add("office-com", conv_office_com, 45)
         add("libreoffice", conv_libreoffice, 50)
     elif s in TEXT_EXTS and d == "pdf":
-        if word_available:
+        if _has_word():
             # Word opens txt/md/html and exports a perfect PDF
             add("office-com", conv_office_com, 85)
-        if BACKENDS.libreoffice:
+        if _b("libreoffice"):
             add("libreoffice", conv_libreoffice, 60)
-        elif BACKENDS.python_docx:
-            def text_pdf_two_step(src: Path, dst: Path) -> None:
-                tmp = dst.with_suffix(".docx")
-                conv_text_to_docx(src, tmp)
-                try:
-                    lo_convert(tmp, dst)
-                finally:
-                    if not dst.exists():
-                        tmp.unlink(missing_ok=True)
-                        raise RuntimeError(
-                            "PDF generation needs LibreOffice or Microsoft Office installed")
-            add("text->docx->pdf", text_pdf_two_step, 40)
     elif s in TEXT_EXTS and d == "docx":
-        if BACKENDS.python_docx:
-            if s in ("html", "htm") and BACKENDS.libreoffice:
+        if _b("python_docx"):
+            if s in ("html", "htm") and _b("libreoffice"):
                 add("libreoffice-html", conv_html_to_docx, 80)
             add("python-docx-md", conv_text_to_docx, 70)
         add("libreoffice", conv_libreoffice, 50)
     elif s == "epub":
-        if BACKENDS.python_docx and d == "docx":
+        if _b("python_docx") and d == "docx":
             add("epub->docx", conv_epub_extract, 80)
         if d in ("txt", "md", "html", "htm"):
             add("epub-extract", conv_epub_extract, 90)
         add("libreoffice", conv_libreoffice, 30)
     elif s in TEXT_EXTS and d in TEXT_EXTS:
         add("text-passthru", conv_text_generic, 100)
-        if office_available and s in OFFICE_DOC_IN and d in ("html", "txt"):
-            add("office-com", conv_office_com, 60)
         if s in OFFICE_DOC_IN and d in ("html", "txt"):
+            if _has_office():
+                add("office-com", conv_office_com, 60)
             add("libreoffice", conv_libreoffice, 40)
     elif s in ("doc", "xls", "ppt", "odt", "ods", "odp", "rtf") and d in ("docx", "xlsx", "pptx", "pdf"):
-        if office_available:
+        if _has_office():
             add("office-com", conv_office_com, 100)
         add("libreoffice", conv_libreoffice, 70)
     elif s in OFFICE_SLIDE_IN and d == "pdf":
-        if ppt_available:
+        if _has_ppt():
             add("office-com", conv_office_com, 100)
         add("libreoffice", conv_libreoffice, 70)
-        if s == "pptx" and BACKENDS.python_pptx and BACKENDS.pymupdf:
+        if s == "pptx" and _b("python_pptx") and _b("pymupdf"):
             add("python-pptx-pymupdf-pdf", conv_pptx_to_pdf, 50)
     elif s in OFFICE_DOC_IN | OFFICE_SHEET_IN and d == "pdf":
-        if office_available:
+        if _has_office():
             add("office-com", conv_office_com, 100)
         add("libreoffice", conv_libreoffice, 70)
-        if s == "docx" and BACKENDS.python_docx and BACKENDS.pymupdf:
+        if s == "docx" and _b("python_docx") and _b("pymupdf"):
             add("python-docx-pymupdf-pdf", conv_docx_to_pdf, 45)
     elif s in OFFICE_DOC_IN and d in ("docx", "odt", "rtf", "html"):
-        if office_available:
+        if _has_office():
             add("office-com", conv_office_com, 100)
         add("libreoffice", conv_libreoffice, 70)
-        if BACKENDS.python_docx and d == "docx":
+        if d == "docx" and _b("python_docx"):
             add("python-docx-md", conv_text_to_docx, 65)
         if s in TEXT_EXTS and d in ("html", "htm"):
             add("text-passthru", conv_text_generic, 90)
     elif s in ("docx", "xlsx", "pptx") and d in ("pdf", "odt", "ods", "odp", "rtf", "html", "txt", "csv"):
-        if office_available and d == "pdf":
+        if d == "pdf" and _has_office():
             add("office-com", conv_office_com, 100)
-        elif word_available and s == "docx" and d in _WORD_ONLY_FMTS:
+        elif s == "docx" and d in _WORD_ONLY_FMTS and _has_word():
             add("office-com", conv_office_com, 45)
         add("libreoffice", conv_libreoffice, 70)
     else:
@@ -3058,28 +3364,34 @@ def _routes_for(src_ext: str, dst_ext: str) -> list[Route]:
             if s in TEXT_EXTS and d in TEXT_EXTS:
                 add("text-passthru", conv_text_generic, 50)
             add("libreoffice", conv_libreoffice, 10)
-            if office_available and d in _OFFICE_ALLOWED_DST:
+            if d in _OFFICE_ALLOWED_DST and _has_office():
                 add("office-com", conv_office_com, 5)
 
     # prune routes whose deps are missing
     live: list[Route] = []
     for r in routes:
-        if r.name.startswith("pillow") and not BACKENDS.pillow:
+        if r.name.startswith("pillow") and not _b("pillow"):
             continue
-        if ("python-docx" in r.name) and not BACKENDS.python_docx:
+        if ("python-docx" in r.name) and not _b("python_docx"):
             continue
-        if ("python-pptx" in r.name) and not BACKENDS.python_pptx:
+        if ("python-pptx" in r.name) and not _b("python_pptx"):
             continue
-        if ("pymupdf" in r.name or "pages-to-images" in r.name) and not BACKENDS.pymupdf:
+        if ("pymupdf" in r.name or "pages-to-images" in r.name) and not _b("pymupdf"):
             continue
-        if r.name == "office-com" and not (IS_WINDOWS and BACKENDS.office_app):
+        if r.name == "office-com" and not (IS_WINDOWS and _b("office_app")):
             continue
-        if r.name.startswith("libreoffice") and not BACKENDS.libreoffice:
+        if r.name.startswith("libreoffice") and not _b("libreoffice"):
             continue
-        if r.name == "pdf2docx" and not BACKENDS.pdf2docx:
+        if r.name == "pdf2docx" and not _b("pdf2docx"):
             continue
         live.append(r)
     live.sort(key=lambda r: -r.weight)
+
+    deps = tuple((k, _snapshot_backend_val(v)) for k, v in sorted(accessed.items()))
+    with _ROUTES_LOCK:
+        if len(_ROUTES_CACHE) > 512:
+            _ROUTES_CACHE.clear()
+        _ROUTES_CACHE[(s, d)] = (b_id, IS_WINDOWS, deps, tuple(live))
     return live
 
 
@@ -3117,21 +3429,26 @@ class ConversionEngine:
     def convert(self, src: str | Path, dst_ext: str, out_dir: Optional[str | Path] = None,
                 out_path: Optional[str | Path] = None) -> ConversionResult:
         from . import debuglog
-        from .debuglog import _fmt_exc
-        sess = debuglog.new_session(src, dst_ext)
+        dbg_mode = debuglog.get_mode()
+        sess = debuglog.new_session(src, dst_ext) if dbg_mode != debuglog.MODE_OFF else None
         src = Path(src)
-        if not src.exists():
+        try:
+            src_st = src.stat()
+        except OSError:
             res = ConversionResult(str(src), "", "-", 0, False, "source file not found")
-            sess.update(ok=False, final_error=res.error, attempts=[],
-                        planned_out="", out_path="")
-            debuglog.finalize(sess, res)
+            if sess is not None:
+                sess.update(ok=False, final_error=res.error, attempts=[],
+                            planned_out="", out_path="")
+                debuglog.finalize(sess, res)
             return res
+        src_size = src_st.st_size
         dst_ext = _norm_ext(dst_ext)
         if not dst_ext:
             res = ConversionResult(str(src), "", "-", 0, False, "missing target extension")
-            sess.update(ok=False, final_error=res.error, attempts=[],
-                        planned_out="", out_path="")
-            debuglog.finalize(sess, res)
+            if sess is not None:
+                sess.update(ok=False, final_error=res.error, attempts=[],
+                            planned_out="", out_path="")
+                debuglog.finalize(sess, res)
             return res
         base = Path(out_path) if out_path else (Path(out_dir) if out_dir else src.parent) / (src.stem + dst_ext)
         pages_mode = is_pages_to_images(src, dst_ext)
@@ -3141,63 +3458,98 @@ class ConversionEngine:
             base = _unique_dir(folder)
         else:
             base = _unique(Path(base))
-        sess["planned_out"] = str(base)
-        sess["dst_ext"] = dst_ext
-        try:
-            sess["bytes_in"] = src.stat().st_size
-        except OSError:
-            pass
+        if sess is not None:
+            sess["planned_out"] = str(base)
+            sess["dst_ext"] = dst_ext
+            sess["bytes_in"] = src_size
         routes = _routes_for(src.suffix, dst_ext)
-        sess["routes_static"] = [r.name for r in routes]
-        if self._selector:
-            routes, ml_info = self._selector.rank_debug(src, dst_ext, routes) \
-                if hasattr(self._selector, "rank_debug") else (self._selector.rank(src, dst_ext, routes), {})
-            sess["ml"].update(ml_info)
-        sess["routes"] = [{"name": r.name, "weight": r.weight} for r in routes]
+        if sess is not None:
+            sess["routes_static"] = [r.name for r in routes]
+        sel = self._selector
+        ml_vec: Any = None
+        sel_feat = bool(sel is not None and hasattr(sel, "extract_features"))
+        if sel is not None:
+            if sel_feat:
+                ml_vec = sel.extract_features(src, dst_ext, src_size=src_size)
+            if hasattr(sel, "rank_debug"):
+                routes, ml_info = (
+                    sel.rank_debug(src, dst_ext, routes, features=ml_vec, src_size=src_size)
+                    if sel_feat else sel.rank_debug(src, dst_ext, routes)
+                )
+                if sess is not None:
+                    sess["ml"].update(ml_info)
+            else:
+                routes = (
+                    sel.rank(src, dst_ext, routes, features=ml_vec, src_size=src_size)
+                    if sel_feat else sel.rank(src, dst_ext, routes)
+                )
+        if sess is not None:
+            sess["routes"] = [{"name": r.name, "weight": r.weight} for r in routes]
         if not routes:
             res = ConversionResult(str(src), dst_ext, "-", 0, False,
                                    f"No conversion path known for {src.suffix} -> {dst_ext}")
-            sess.update(ok=False, final_error=res.error, attempts=[])
-            debuglog.finalize(sess, res)
+            if sess is not None:
+                sess.update(ok=False, final_error=res.error, attempts=[])
+                debuglog.finalize(sess, res)
             return res
         t0 = time.perf_counter()
         err = ""
-        attempts: list[dict] = []
+        attempts: Optional[list[dict]] = [] if sess is not None else None
+        mkdir_done = False
         for r in routes:
             ta = time.perf_counter()
             try:
-                base.parent.mkdir(parents=True, exist_ok=True)
+                if not mkdir_done:
+                    base.parent.mkdir(parents=True, exist_ok=True)
+                    mkdir_done = True
                 r.fn(src, base)
-                ms = (time.perf_counter() - t0) * 1000
-                att_ms = (time.perf_counter() - ta) * 1000
-                attempts.append({"backend": r.name, "ok": True, "ms": att_ms,
-                                 "error": "", "traceback": ""})
-                if self._selector:
-                    self._selector.record(src, dst_ext, r.name, att_ms, True)
-                out_bytes = (_dir_size(base) if base.is_dir()
-                             else (base.stat().st_size if base.exists() else 0))
+                now = time.perf_counter()
+                ms = (now - t0) * 1000
+                att_ms = (now - ta) * 1000
+                if attempts is not None:
+                    attempts.append({"backend": r.name, "ok": True, "ms": att_ms,
+                                     "error": "", "traceback": ""})
+                if sel is not None:
+                    if sel_feat:
+                        sel.record(src, dst_ext, r.name, att_ms, True,
+                                   features=ml_vec, src_size=src_size)
+                    else:
+                        sel.record(src, dst_ext, r.name, att_ms, True)
+                if pages_mode:
+                    out_bytes = _dir_size(base) if base.is_dir() else 0
+                else:
+                    try:
+                        out_bytes = base.stat().st_size
+                    except OSError:
+                        out_bytes = 0
                 res = ConversionResult(str(src), str(base), r.name, ms, True,
-                                       bytes_in=src.stat().st_size,
-                                       bytes_out=out_bytes)
-                sess.update(ok=True, winning_backend=r.name, total_ms=ms,
-                            attempts=attempts, out_path=str(base),
-                            bytes_out=res.bytes_out)
-                debuglog.finalize(sess, res)
+                                       bytes_in=src_size, bytes_out=out_bytes)
+                if sess is not None:
+                    sess.update(ok=True, winning_backend=r.name, total_ms=ms,
+                                attempts=attempts, out_path=str(base),
+                                bytes_out=out_bytes)
+                    debuglog.finalize(sess, res)
                 return res
             except Exception as exc:  # try next backend
                 att_ms = (time.perf_counter() - ta) * 1000
-                if self._selector:
-                    self._selector.record(src, dst_ext, r.name, att_ms, False)
+                if sel is not None:
+                    if sel_feat:
+                        sel.record(src, dst_ext, r.name, att_ms, False,
+                                   features=ml_vec, src_size=src_size)
+                    else:
+                        sel.record(src, dst_ext, r.name, att_ms, False)
                 err = f"{type(exc).__name__}: {exc}"
-                attempts.append({"backend": r.name, "ok": False, "ms": att_ms,
-                                 "error": err, "traceback": _fmt_exc(exc)})
-                if os.environ.get("CLICKSHIFT_DEBUG"):
+                if attempts is not None:
+                    attempts.append({"backend": r.name, "ok": False, "ms": att_ms,
+                                     "error": err, "exc": exc})
+                if dbg_mode != debuglog.MODE_OFF:
                     traceback.print_exc()
         ms = (time.perf_counter() - t0) * 1000
         res = ConversionResult(str(src), str(base), routes[0].name, ms, False, err)
-        sess.update(ok=False, final_error=err, attempts=attempts,
-                    total_ms=ms, out_path=str(base))
-        debuglog.finalize(sess, res)
+        if sess is not None:
+            sess.update(ok=False, final_error=err, attempts=attempts,
+                        total_ms=ms, out_path=str(base))
+            debuglog.finalize(sess, res)
         return res
 
     # -- combine multiple images -> single pdf/docx/pptx -------------------- #
@@ -3205,7 +3557,6 @@ class ConversionEngine:
                        out_dir: Optional[str | Path] = None,
                        out_path: Optional[str | Path] = None) -> ConversionResult:
         from . import debuglog
-        from .debuglog import _fmt_exc
         paths = [Path(s) for s in srcs if Path(s).exists()]
         ext = _norm_ext(dst_ext)
         if not paths:
@@ -3215,11 +3566,13 @@ class ConversionEngine:
                                     f"unsupported combine target: {dst_ext}")
         base = Path(out_path) if out_path else (Path(out_dir) if out_dir else paths[0].parent) / (paths[0].stem + ext)
         base = _unique(Path(base))
-        sess = debuglog.new_session(paths[0], ext)
-        sess["planned_out"] = str(base)
-        sess["dst_ext"] = ext
+        dbg_mode = debuglog.get_mode()
+        sess = debuglog.new_session(paths[0], ext) if dbg_mode != debuglog.MODE_OFF else None
         bytes_in = sum((p.stat().st_size for p in paths), 0)
-        sess["bytes_in"] = bytes_in
+        if sess is not None:
+            sess["planned_out"] = str(base)
+            sess["dst_ext"] = ext
+            sess["bytes_in"] = bytes_in
         backend_name = {".pdf": "pillow-pdf", ".docx": "pillow-python-docx", ".pptx": "pillow-python-pptx"}[ext]
         fn = {".pdf": conv_images_to_pdf, ".docx": conv_images_to_docx, ".pptx": conv_images_to_pptx}[ext]
         t0 = time.perf_counter()
@@ -3227,38 +3580,182 @@ class ConversionEngine:
             base.parent.mkdir(parents=True, exist_ok=True)
             fn(paths, base)
             ms = (time.perf_counter() - t0) * 1000
-            bytes_out = base.stat().st_size if base.exists() else 0
+            try:
+                bytes_out = base.stat().st_size
+            except OSError:
+                bytes_out = 0
             res = ConversionResult(str(paths[0]), str(base), backend_name, ms, True,
                                    bytes_in=bytes_in, bytes_out=bytes_out)
-            sess.update(ok=True, winning_backend=backend_name, total_ms=ms,
-                        out_path=str(base), bytes_out=bytes_out)
-            debuglog.finalize(sess, res)
+            if sess is not None:
+                sess.update(ok=True, winning_backend=backend_name, total_ms=ms,
+                            out_path=str(base), bytes_out=bytes_out)
+                debuglog.finalize(sess, res)
             return res
         except Exception as exc:
             ms = (time.perf_counter() - t0) * 1000
             err = f"{type(exc).__name__}: {exc}"
             res = ConversionResult(str(paths[0]), str(base), backend_name, ms, False, err,
                                    bytes_in=bytes_in)
-            sess.update(ok=False, final_error=err, total_ms=ms, out_path=str(base),
-                        attempts=[{"backend": backend_name, "ok": False, "ms": ms,
-                                   "error": err, "traceback": _fmt_exc(exc)}])
-            debuglog.finalize(sess, res)
+            if sess is not None:
+                sess.update(ok=False, final_error=err, total_ms=ms, out_path=str(base),
+                            attempts=[{"backend": backend_name, "ok": False, "ms": ms,
+                                       "error": err, "exc": exc}])
+                debuglog.finalize(sess, res)
             return res
 
     # -- batch -------------------------------------------------------------- #
     def convert_many(self, jobs: list[tuple[str, str]],
                      progress: Optional[Callable[[ConversionResult], None]] = None) -> list[ConversionResult]:
-        futs = [self._pool.submit(self.convert, s, e) for s, e in jobs]
-        results: list[ConversionResult] = []
-        for f in futs:
-            res = f.result()
-            results.append(res)
+        if not jobs:
+            return []
+        if len(jobs) == 1:
+            res = self.convert(jobs[0][0], jobs[0][1])
             if progress:
                 try:
                     progress(res)
                 except Exception:
                     pass
-        return results
+            return [res]
+
+        def _emit(res: ConversionResult) -> None:
+            if progress:
+                try:
+                    progress(res)
+                except Exception:
+                    pass
+
+        n_jobs = len(jobs)
+        results: list[Optional[ConversionResult]] = [None] * n_jobs
+        sel = self._selector
+        batch_ctx = (
+            sel.batch_persistence()
+            if sel is not None and hasattr(sel, "batch_persistence")
+            else contextlib.nullcontext()
+        )
+        with batch_ctx:
+            remaining: list[tuple[int, str, str]] = []
+            lo_groups: dict[tuple[str, Optional[str]], list[tuple[int, str, str, Path, Path, str, int, Any]]] = {}
+            reserved_outs: set[str] = set()
+            sel_feat = bool(sel is not None and hasattr(sel, "extract_features"))
+            has_bandit_data = (
+                bool(sel is not None and (not hasattr(sel, "bandit") or sel.bandit.total_samples() > 0))
+            )
+
+            for idx, (s, e) in enumerate(jobs):
+                dst_ext = _norm_ext(e)
+                src_p = Path(s)
+                if not dst_ext or is_pages_to_images(src_p, dst_ext):
+                    remaining.append((idx, s, e))
+                    continue
+                routes = _routes_for(src_p.suffix, dst_ext)
+                if not routes or not any(r.name == "libreoffice" and r.fn is conv_libreoffice for r in routes):
+                    remaining.append((idx, s, e))
+                    continue
+                if not has_bandit_data and (routes[0].name != "libreoffice" or routes[0].fn is not conv_libreoffice):
+                    remaining.append((idx, s, e))
+                    continue
+                try:
+                    src_st = src_p.stat()
+                except OSError:
+                    remaining.append((idx, s, e))
+                    continue
+                src_size = src_st.st_size
+                ml_vec = None
+                if sel is not None:
+                    if sel_feat:
+                        ml_vec = sel.extract_features(src_p, dst_ext, src_size=src_size)
+                        routes = sel.rank(src_p, dst_ext, routes, features=ml_vec, src_size=src_size)
+                    else:
+                        routes = sel.rank(src_p, dst_ext, routes)
+                if routes and routes[0].name == "libreoffice" and routes[0].fn is conv_libreoffice:
+                    infilter = _lo_infilter_for(src_p.suffix.lstrip(".").lower(), dst_ext.lstrip("."))
+                    base = _unique(src_p.parent / (src_p.stem + dst_ext))
+                    norm_out = os.path.normcase(os.path.abspath(str(base)))
+                    if norm_out in reserved_outs:
+                        remaining.append((idx, s, e))
+                        continue
+                    reserved_outs.add(norm_out)
+                    lo_groups.setdefault((dst_ext, infilter), []).append(
+                        (idx, s, e, src_p, base, dst_ext, src_size, ml_vec)
+                    )
+                else:
+                    remaining.append((idx, s, e))
+
+            if lo_groups:
+                from . import debuglog
+                dbg_mode = debuglog.get_mode()
+                for (dst_ext, infilter), items in lo_groups.items():
+                    if len(items) < 2:
+                        for item in items:
+                            remaining.append((item[0], item[1], item[2]))
+                        continue
+                    # Split into sub-batches with distinct file stems so LibreOffice
+                    # --outdir filenames never collide inside the staging directory.
+                    sub_batches: list[list[tuple[int, str, str, Path, Path, str, int, Any]]] = []
+                    for item in items:
+                        stem_key = item[3].stem.lower()
+                        placed = False
+                        for sb in sub_batches:
+                            if stem_key not in {it[3].stem.lower() for it in sb}:
+                                sb.append(item)
+                                placed = True
+                                break
+                        if not placed:
+                            sub_batches.append([item])
+                    for sb in sub_batches:
+                        if len(sb) < 2:
+                            remaining.append((sb[0][0], sb[0][1], sb[0][2]))
+                            continue
+                        pairs = [(it[3], it[4]) for it in sb]
+                        t0 = time.perf_counter()
+                        ok_map, _ = _lo_convert_batch(pairs, dst_ext.lstrip("."), infilter)
+                        per_ms = ((time.perf_counter() - t0) * 1000) / len(sb)
+                        for idx, s, e, src_p, base, de, bytes_in, ml_vec in sb:
+                            if ok_map.get(src_p) and base.exists():
+                                if sel is not None:
+                                    if sel_feat:
+                                        sel.record(src_p, de, "libreoffice", per_ms, True,
+                                                   features=ml_vec, src_size=bytes_in)
+                                    else:
+                                        sel.record(src_p, de, "libreoffice", per_ms, True)
+                                try:
+                                    out_bytes = base.stat().st_size
+                                except OSError:
+                                    out_bytes = 0
+                                res = ConversionResult(
+                                    str(src_p), str(base), "libreoffice", per_ms, True,
+                                    bytes_in=bytes_in, bytes_out=out_bytes,
+                                )
+                                if dbg_mode == debuglog.MODE_ALWAYS:
+                                    sess = debuglog.new_session(src_p, de)
+                                    sess.update(
+                                        ok=True, winning_backend="libreoffice", total_ms=per_ms,
+                                        planned_out=str(base), out_path=str(base),
+                                        dst_ext=de, bytes_in=bytes_in, bytes_out=out_bytes,
+                                        routes_static=["libreoffice"],
+                                        routes=[{"name": "libreoffice", "weight": 0}],
+                                        attempts=[{"backend": "libreoffice", "ok": True,
+                                                   "ms": per_ms, "error": "", "traceback": ""}],
+                                    )
+                                    debuglog.finalize(sess, res)
+                                results[idx] = res
+                                _emit(res)
+                            else:
+                                remaining.append((idx, s, e))
+
+            if len(remaining) == 1:
+                idx, s, e = remaining[0]
+                res = self.convert(s, e)
+                results[idx] = res
+                _emit(res)
+            elif remaining:
+                fut_map = {self._pool.submit(self.convert, s, e): idx for idx, s, e in remaining}
+                for fut in as_completed(fut_map):
+                    idx = fut_map[fut]
+                    res = fut.result()
+                    results[idx] = res
+                    _emit(res)
+        return [r for r in results if r is not None]
 
     def shutdown(self) -> None:
         self._pool.shutdown(wait=False)

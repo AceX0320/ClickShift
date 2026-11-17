@@ -14,6 +14,7 @@ a = Analysis(
     binaries=[],
     datas=[(str(ROOT / "assets"), "assets")] if (ROOT / "assets").exists() else [],
     hiddenimports=[
+        "clickshift.formats",
         "clickshift.engine", "clickshift.learning", "clickshift.monitor", "clickshift.cli",
         "clickshift.cloud", "clickshift.debuglog", "clickshift.updater",
         # Dynamically imported backends and Windows-only modules:

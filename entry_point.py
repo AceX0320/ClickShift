@@ -12,7 +12,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 from clickshift.cli import main                      # noqa: E402
-from clickshift import monitor, updater              # noqa: E402
 
 
 def _strip_cleanup_args(argv: list[str]) -> tuple[list[str], int, str]:
@@ -40,6 +39,8 @@ def _strip_cleanup_args(argv: list[str]) -> tuple[list[str], int, str]:
 
 
 def _already_installed() -> bool:
+    from clickshift import monitor
+
     if not monitor.IS_WINDOWS:
         return monitor.config_file().exists()
     return monitor.config_file().exists() and monitor.is_startup_registered()
@@ -47,6 +48,8 @@ def _already_installed() -> bool:
 
 def first_run_wizard(quiet: bool = False) -> int:
     """Double-click / post-update experience: install everything then stay running."""
+    from clickshift import monitor, updater
+
     notice = updater.peek_update_notice(monitor.data_dir())
     is_silent = quiet or bool(notice and notice.get("silent"))
     rc = 0
@@ -61,6 +64,8 @@ if __name__ == "__main__":
     multiprocessing.freeze_support()
     args, cleanup_pid, cleanup_old = _strip_cleanup_args(sys.argv[1:])
     if cleanup_old:
+        from clickshift import updater
+
         updater.cleanup_replaced_exe(cleanup_pid, Path(cleanup_old))
     if not args:
         sys.exit(first_run_wizard(quiet=False))

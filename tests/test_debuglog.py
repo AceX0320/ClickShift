@@ -148,3 +148,39 @@ def test_retention_pruning(home, monkeypatch):
     debuglog.write_report(sess)
     remaining = list(dd.glob("*.clickshift-debug.txt"))
     assert len(remaining) <= 11  # 10 kept + fresh one
+
+
+def test_lazy_backend_snapshot_and_exc_traceback(tmp_path, monkeypatch):
+    from clickshift import debuglog
+    import clickshift.engine as eng_mod
+
+    monkeypatch.setenv("CLICKSHIFT_HOME", str(tmp_path))
+    monkeypatch.setenv("CLICKSHIFT_DEBUG_REPORTS", "off")
+
+    called = False
+
+    def fail_summary():
+        nonlocal called
+        called = True
+        return {}
+
+    monkeypatch.setattr(eng_mod.BACKENDS, "summary", fail_summary)
+    sess = debuglog.new_session("foo.txt", ".html")
+    assert sess["backends"] is None
+    assert called is False
+
+    try:
+        raise ValueError("boom trace")
+    except ValueError as err:
+        rep = debuglog.render_report({
+            "run_id": "r1", "src": "foo.txt", "dst_ext": ".html",
+            "planned_out": "foo.html", "out_path": "foo.html",
+            "backends": None, "ml": {"enabled": False},
+            "routes": [{"name": "x", "weight": 50}],
+            "attempts": [{"backend": "x", "ok": False, "ms": 2.0, "error": "boom", "exc": err}],
+            "ok": False, "winning_backend": "", "total_ms": 2.0,
+            "data_dir": str(tmp_path),
+        })
+    assert called is True
+    assert "ValueError: boom trace" in rep
+

@@ -68,3 +68,37 @@ def test_sherman_morrison_matches_exact_inverse(tmp_path):
         sel.bandit.update(arm, x, float(rng.uniform(-1.0, 1.0)))
     exact_inv = np.linalg.inv(sel.bandit.A[arm])
     assert np.allclose(sel.bandit.A_inv[arm], exact_inv, atol=1e-6)
+
+
+def test_batch_persistence_and_history_tail_compaction(tmp_path, monkeypatch):
+    from clickshift import learning as learning_mod
+
+    src = tmp_path / "sample.txt"
+    src.write_text("hello world", encoding="utf-8")
+    sel = learning_mod.BanditSelector(history_file=tmp_path / "h.jsonl")
+
+    saves = 0
+    orig_save = sel._save_state
+
+    def counted_save():
+        nonlocal saves
+        saves += 1
+        orig_save()
+
+    monkeypatch.setattr(sel, "_save_state", counted_save)
+    with sel.batch_persistence():
+        for i in range(5):
+            sel.record(src, ".html", "text-passthru", 10.0 + i, True)
+        assert saves == 0
+    assert saves == 1
+    assert len(sel.history_file.read_text(encoding="utf-8").splitlines()) == 5
+
+    # Synthetic >1 MB history triggers binary tail compaction keeping <= 3000 valid lines
+    big_line = '{"pair":"txt>html","arm":"txt>html|text-passthru","ms":5.0,"ok":true,"reward":1.0,"file":"abc.txt","t":1}\n'
+    repeat = (1_050_000 // len(big_line)) + 10
+    sel.history_file.write_text(big_line * repeat, encoding="utf-8")
+    sel.record(src, ".html", "text-passthru", 12.0, True)
+    kept_lines = sel.history_file.read_text(encoding="utf-8").splitlines()
+    assert 1 <= len(kept_lines) <= 3000
+    assert kept_lines[-1].startswith("{") and kept_lines[-1].endswith("}")
+

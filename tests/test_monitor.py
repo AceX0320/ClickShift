@@ -258,4 +258,71 @@ def test_store_msix_skips_self_signed_win11_uac_install(monkeypatch):
     assert monitor.install_context_menu(extensions=["pdf"]) == 1
 
 
+def test_load_config_stat_cache_and_cli_tail_lines(tmp_path, monkeypatch):
+    import json
+    from clickshift import cli, monitor
+
+    cfg_path = tmp_path / "config.json"
+    monkeypatch.setattr(monitor, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(monitor, "CONFIG_FILE", cfg_path)
+    monitor._CONFIG_CACHE = None
+
+    cfg_path.write_text(json.dumps({"auto_target": "pdf"}), encoding="utf-8")
+    read_calls = 0
+    orig_read = json.loads
+
+    def wrapped_loads(s, *a, **kw):
+        nonlocal read_calls
+        read_calls += 1
+        return orig_read(s, *a, **kw)
+
+    monkeypatch.setattr(json, "loads", wrapped_loads)
+    assert monitor.load_config()["auto_target"] == "pdf"
+    assert monitor.load_config()["auto_target"] == "pdf"
+    assert read_calls == 1
+
+    # Verify WatchFolder converts once without re-converting unchanged source/output
+    watch_dir = tmp_path / "drop"
+    watch_dir.mkdir()
+    doc = watch_dir / "note.txt"
+    doc.write_text("hello watch folder", encoding="utf-8")
+
+    converts: list[str] = []
+
+    class FakeEngine:
+        def convert(self, src_path, dst_ext, out_path=None):
+            converts.append(str(src_path))
+            out_p = Path(out_path)
+            out_p.write_text("converted", encoding="utf-8")
+            from clickshift.formats import ConversionResult
+            return ConversionResult(str(src_path), str(out_p), "text-passthru", 1.0, True)
+
+    import clickshift.engine as eng_mod
+    monkeypatch.setattr(eng_mod, "get_engine", lambda **_kw: FakeEngine())
+    monkeypatch.setattr(monitor.WatchFolder, "POLL_SECONDS", 0.03)
+    wf = monitor.WatchFolder(watch_dir, {"auto_target": "html"})
+    wf.start()
+    try:
+        import time
+        deadline = time.monotonic() + 2.0
+        while not converts and time.monotonic() < deadline:
+            time.sleep(0.03)
+        time.sleep(0.18)
+    finally:
+        wf.stop_event.set()
+        wf.join(timeout=1.5)
+    assert len(converts) == 1
+
+    # Verify _tail_lines across small, empty, and multi-chunk (>64 KiB) files
+    empty = tmp_path / "empty.jsonl"
+    empty.write_text("", encoding="utf-8")
+    assert cli._tail_lines(empty, 10) == []
+
+    big = tmp_path / "big.jsonl"
+    lines = [f'{{"i":{i},"pad":"' + ("x" * 60) + '"}' for i in range(1500)]
+    big.write_bytes(("\r\n".join(lines) + "\r\n").encode("utf-8"))
+    assert cli._tail_lines(big, 25) == lines[-25:]
+
+
+
 

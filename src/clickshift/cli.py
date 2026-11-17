@@ -16,32 +16,32 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     __package__ = "clickshift"
 
 from . import __version__ as version
-from .engine import get_engine, newest_target_for, BACKENDS, _norm_ext
+from .formats import IMAGE_EXTS, _norm_ext, newest_target_for
 from . import monitor
-from . import debuglog as _dbg
 
 
-# --------------------------------------------------------------------------- #
-#  helpers
-# --------------------------------------------------------------------------- #
-
-def _is_ascii_console() -> bool:
-    try:
-        "✓".encode(sys.stdout.encoding or "utf-8")
-        return True
-    except Exception:
-        return False
+_ERRSIGN_CACHE: Optional[str] = None
 
 
-OK = "OK " if not _is_ascii_console() else "OK "
-ERRSIGN = "×" if _is_ascii_console() else "x"
+def _errsign() -> str:
+    global _ERRSIGN_CACHE
+    if _ERRSIGN_CACHE is None:
+        try:
+            "×".encode(sys.stdout.encoding or "utf-8")
+            _ERRSIGN_CACHE = "×"
+        except Exception:
+            _ERRSIGN_CACHE = "x"
+    return _ERRSIGN_CACHE
+
+
+OK = "OK "
 
 
 def _popup(title: str, text: str) -> None:
@@ -135,14 +135,24 @@ def _pick_target_popup(src: Path) -> Optional[str]:
 def _latest_report(res) -> str:
     """Path of the debug txt report produced for this conversion (if any)."""
     try:
-        dd = monitor.DATA_DIR / "debug"
-        if dd.exists():
+        from . import debuglog as _dbg
+        if _dbg.get_mode() == _dbg.MODE_OFF and res.ok:
+            return ""
+        dd = monitor.data_dir() / "debug"
+        if dd.is_dir():
             stem = Path(res.source).stem[:60]
             status = "OK" if res.ok else "FAIL"
-            matches = sorted(dd.glob(f"*-{stem}-{status}.clickshift-debug.txt"),
-                             key=lambda p: p.stat().st_mtime)
-            if matches:
-                return str(matches[-1])
+            best_path = ""
+            best_mtime = -1.0
+            prefix = f"-{stem}-{status}.clickshift-debug.txt"
+            with os.scandir(dd) as it:
+                for entry in it:
+                    if entry.name.endswith(prefix) and entry.is_file():
+                        mt = entry.stat().st_mtime
+                        if mt >= best_mtime:
+                            best_mtime = mt
+                            best_path = entry.path
+            return best_path
     except Exception:
         pass
     return ""
@@ -193,7 +203,7 @@ def cmd_convert(args) -> int:
 
     def on_done(res):
         results.append(res)
-        mark = OK if res.ok else ERRSIGN
+        mark = OK if res.ok else _errsign()
         ms = f"{res.elapsed_ms:.0f} ms"
         line = f"  {mark} {Path(res.source).name} -> {Path(res.target).name}" \
                f"  [{res.backend}, {ms}]"
@@ -206,7 +216,6 @@ def cmd_convert(args) -> int:
             print(f"      debug report: {rep}")
 
     t0 = time.perf_counter()
-    from .engine import IMAGE_EXTS
     combine_target = (chosen_target or "").lower().lstrip(".")
     combine_mode = (
         len(files) > 1
@@ -219,12 +228,16 @@ def cmd_convert(args) -> int:
             ordered, combine_target, enable_ml=not args.no_ml, progress=on_done
         )
         if ipc_res is None:
+            from .engine import get_engine
+
             results.clear()
             engine = get_engine(enable_ml=not args.no_ml)
             on_done(engine.combine_images(ordered, combine_target))
     else:
         ipc_res = monitor.try_daemon_convert(jobs, enable_ml=not args.no_ml, progress=on_done)
         if ipc_res is None:
+            from .engine import get_engine
+
             results.clear()
             engine = get_engine(enable_ml=not args.no_ml)
             engine.convert_many(jobs, progress=on_done)
@@ -244,9 +257,18 @@ def cmd_run(args) -> int:
     return monitor.run_daemon(headless=args.headless)
 
 
-def cmd_install(args) -> int:
-    from .updater import InstallProgressPopup
+class _NullPopup:
+    def update(self, *a, **kw) -> None:
+        pass
 
+    def complete(self, *a, **kw) -> None:
+        pass
+
+    def error(self, *a, **kw) -> None:
+        pass
+
+
+def cmd_install(args) -> int:
     print("ClickShift setup")
     quiet = bool(getattr(args, "quiet", False))
     show_popup = (
@@ -254,11 +276,16 @@ def cmd_install(args) -> int:
         and not quiet
         and os.environ.get("CLICKSHIFT_NO_POPUP") != "1"
     )
-    popup = InstallProgressPopup(
-        title="ClickShift Setup",
-        heading=f"Installing ClickShift v{version}...",
-        enabled=show_popup,
-    ).start()
+    if show_popup:
+        from .updater import InstallProgressPopup
+
+        popup: Any = InstallProgressPopup(
+            title="ClickShift Setup",
+            heading=f"Installing ClickShift v{version}...",
+            enabled=True,
+        ).start()
+    else:
+        popup = _NullPopup()
     try:
         popup.update("Preparing ClickShift configuration...", progress=10, detail="Creating data and watch folders")
         monitor.DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -302,6 +329,9 @@ def cmd_uninstall(args) -> int:
 
 
 def cmd_status(args) -> int:
+    from . import debuglog as _dbg
+    from .engine import BACKENDS
+
     cfg = monitor.load_config()
     info = {
         "version": version,
@@ -312,19 +342,37 @@ def cmd_status(args) -> int:
         "auto_target": cfg["auto_target"],
         "ml_enabled": cfg["ml_enabled"],
         "debug_reports": _dbg.get_mode(),
-        "data_dir": str(monitor.DATA_DIR),
+        "data_dir": str(monitor.data_dir()),
         "log": str(monitor.LOG_FILE),
     }
     print(json.dumps(info, indent=2))
     return 0
 
 
+def _tail_lines(path: Path, limit: int) -> list[str]:
+    if limit <= 0:
+        return []
+    with open(path, "rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        pos = fh.tell()
+        chunks: list[bytes] = []
+        nl_count = 0
+        while pos > 0 and nl_count <= limit:
+            step = min(65536, pos)
+            pos -= step
+            fh.seek(pos)
+            buf = fh.read(step)
+            nl_count += buf.count(b"\n")
+            chunks.append(buf)
+    return b"".join(reversed(chunks)).decode("utf-8", errors="replace").splitlines()[-limit:]
+
+
 def cmd_stats(args) -> int:
-    hist = monitor.DATA_DIR / "history.jsonl"
+    hist = monitor.data_dir() / "history.jsonl"
     if not hist.exists():
         print("No conversions recorded yet.")
         return 0
-    lines = hist.read_text(encoding="utf-8").splitlines()[-args.limit:]
+    lines = _tail_lines(hist, args.limit)
     rows = [json.loads(l) for l in lines if l.strip()]
     if not rows:
         print("(empty)")
