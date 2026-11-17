@@ -385,3 +385,33 @@ def test_parse_release_payload_matches_versioned_exe():
     info = updater.parse_release_payload(payload)
     assert info is not None
     assert info.download_url.endswith("/ClickShift-v1.0.18.exe")
+
+
+def test_sign_release_sums_expands_globs_and_fails_on_empty(tmp_path, monkeypatch):
+    import hashlib
+    import importlib.util
+
+    script_path = Path(__file__).resolve().parent.parent / "scripts" / "sign_release.py"
+    spec = importlib.util.spec_from_file_location("sign_release", script_path)
+    assert spec is not None and spec.loader is not None
+    sign_release = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sign_release)
+
+    dist_dir = tmp_path / "dist"
+    dist_dir.mkdir()
+    exe = dist_dir / "ClickShift-v1.0.19.exe"
+    payload = b"MZ" + b"\x00" * 1024
+    exe.write_bytes(payload)
+
+    sums_out = dist_dir / "SHA256SUMS.txt"
+    pattern = str(dist_dir / "ClickShift-v*.exe")
+    monkeypatch.setattr(sys, "argv", ["sign_release.py", "sums", pattern, "--out", str(sums_out)])
+    assert sign_release.main() == 0
+    assert sums_out.is_file() and sums_out.stat().st_size > 0
+    parsed = updater.parse_sha256sums(sums_out.read_text(encoding="utf-8"), exe.name)
+    assert parsed == hashlib.sha256(payload).hexdigest()
+
+    missing_out = dist_dir / "EMPTY_SUMS.txt"
+    missing_pattern = str(dist_dir / "NoSuch-v*.exe")
+    assert sign_release.cmd_sums([missing_pattern], missing_out) == 1
+    assert not missing_out.exists()

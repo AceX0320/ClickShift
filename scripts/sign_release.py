@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import argparse
 import base64
+import glob
 import hashlib
 import os
 import struct
 import sys
 from pathlib import Path
+from typing import Sequence
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -61,14 +63,42 @@ def cmd_keygen() -> int:
     return 0
 
 
-def cmd_sums(files: list[Path], out: Path) -> int:
+def _resolve_input_files(patterns: Sequence[Path | str]) -> list[Path]:
+    """Resolve explicit paths and wildcard globs (needed on Windows shells like pwsh)."""
+    seen: set[Path] = set()
+    resolved: list[Path] = []
+    for item in patterns:
+        raw = str(item)
+        direct = Path(raw)
+        if direct.is_file():
+            candidates = [direct]
+        elif glob.has_magic(raw):
+            candidates = [Path(m) for m in sorted(glob.glob(raw, recursive=True))]
+        else:
+            candidates = []
+        for cand in candidates:
+            if cand.is_file():
+                key = cand.resolve()
+                if key not in seen:
+                    seen.add(key)
+                    resolved.append(cand)
+    return resolved
+
+
+def cmd_sums(files: Sequence[Path | str], out: Path) -> int:
+    resolved = _resolve_input_files(files)
     lines: list[str] = []
-    for f in sorted(files):
-        if f.is_file():
-            digest = _file_sha256(f).hex()
-            lines.append(f"{digest}  {f.name}")
+    for f in sorted(resolved, key=lambda p: p.name.lower()):
+        digest = _file_sha256(f).hex()
+        lines.append(f"{digest}  {f.name}")
+    if not lines:
+        print(
+            f"Error: no matching files found for SHA256SUMS.txt ({[str(x) for x in files]})",
+            file=sys.stderr,
+        )
+        return 1
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"Wrote {len(lines)} SHA-256 entry(ies) to {out}")
     return 0
 
@@ -116,7 +146,7 @@ def main() -> int:
     sub.add_parser("keygen", help="Generate a new ECDSA P-256 keypair")
 
     sp_sums = sub.add_parser("sums", help="Write SHA256SUMS.txt")
-    sp_sums.add_argument("files", nargs="+", type=Path)
+    sp_sums.add_argument("files", nargs="+", type=str)
     sp_sums.add_argument("--out", type=Path, required=True)
 
     sp_sign = sub.add_parser("sign", help="Create <file>.sig using CLICKSHIFT_SIGNING_KEY_B64")

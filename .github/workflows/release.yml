@@ -90,6 +90,7 @@ jobs:
           if ($env:CLICKSHIFT_SIGNING_KEY_B64) {
             Get-ChildItem release-out -Recurse -Filter "ClickShift-v*.exe" | ForEach-Object {
               python scripts/sign_release.py sign $_.FullName
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             }
           } else {
             Write-Host "CLICKSHIFT_SIGNING_KEY_B64 not set; publishing SHA256SUMS.txt only (see docs/PUBLISHING_AND_CLOUD.md)."
