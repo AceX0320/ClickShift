@@ -1,7 +1,7 @@
 # Pinned CI & Release dependencies (auto-updated cleanly by Dependabot)
 numpy==2.4.6
 Pillow==11.0.0
-python-docx==1.1.2
+python-docx==1.2.0
 python-pptx==1.0.2
 pdf2docx==0.5.13
 PyMuPDF==2.1
