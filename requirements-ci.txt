@@ -12,5 +12,5 @@ lxml==5.4.0
 cryptography==46.0.7
 pytest==8.3.4
 pyinstaller>=6.10,<7.0
-pywin32==311 ; sys_platform == "win32"
+pywin32==312 ; sys_platform == "win32"
 pystray>=0.19.5,<1.0 ; sys_platform == "win32"
