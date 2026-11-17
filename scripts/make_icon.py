@@ -14,27 +14,37 @@ except ImportError:
 
 
 def make(size: int) -> Image.Image:
-    """Fallback geometric icon matching the navy / split-doc / gold-bolt design."""
+    """Fallback geometric icon matching the obsidian / crimson-white pages / cursor design."""
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     m = max(1, int(size * 0.04))
     r = max(2, int(size * 0.22))
-    # Dark navy rounded square
-    d.rounded_rectangle([m, m, size - m, size - m], radius=r, fill=(13, 30, 62, 255))
-    # Left white document half
-    x0, x_mid, x1 = int(size * 0.24), int(size * 0.50), int(size * 0.76)
-    y0, y1 = int(size * 0.17), int(size * 0.83)
-    d.rounded_rectangle([x0, y0, x1, y1], radius=max(2, size // 18), fill=(56, 189, 248, 255))
-    d.rectangle([x0, y0, x_mid, y1], fill=(248, 250, 252, 255))
-    # Gold lightning bolt
+    # Obsidian rounded square
+    d.rounded_rectangle([m, m, size - m, size - m], radius=r, fill=(20, 10, 11, 255))
+    # Shifted crimson back page
+    d.rounded_rectangle(
+        [int(size * 0.40), int(size * 0.11), int(size * 0.80), int(size * 0.65)],
+        radius=max(2, size // 18),
+        fill=(225, 29, 46, 255),
+    )
+    # Front white page
+    d.rounded_rectangle(
+        [int(size * 0.20), int(size * 0.24), int(size * 0.61), int(size * 0.80)],
+        radius=max(2, size // 18),
+        fill=(255, 255, 255, 255),
+        outline=(11, 11, 11, 255),
+        width=max(1, size // 48),
+    )
+    # Pointer cursor
     d.polygon([
-        (int(size * 0.54), int(size * 0.26)),
-        (int(size * 0.38), int(size * 0.54)),
-        (int(size * 0.50), int(size * 0.54)),
-        (int(size * 0.45), int(size * 0.76)),
-        (int(size * 0.63), int(size * 0.46)),
-        (int(size * 0.51), int(size * 0.46)),
-    ], fill=(250, 204, 21, 255))
+        (int(size * 0.44), int(size * 0.48)),
+        (int(size * 0.44), int(size * 0.83)),
+        (int(size * 0.53), int(size * 0.74)),
+        (int(size * 0.59), int(size * 0.89)),
+        (int(size * 0.65), int(size * 0.86)),
+        (int(size * 0.59), int(size * 0.72)),
+        (int(size * 0.71), int(size * 0.72)),
+    ], fill=(11, 11, 11, 255))
     return img
 
 

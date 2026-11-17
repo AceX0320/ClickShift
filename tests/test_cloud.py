@@ -200,8 +200,26 @@ def test_token_saved_owner_only(tmp_path, monkeypatch):
     monkeypatch.setenv("CLICKSHIFT_HOME", str(tmp_path))
     p = cloud.save_token("ghp_secret123")
     assert p.read_text() == "ghp_secret123"
-    mode = p.stat().st_mode & 0o777
-    assert mode == 0o600 or mode == 0o644             # Windows may ignore chmod; content ok
+    if sys.platform != "win32":
+        mode = p.stat().st_mode & 0o777
+        assert mode == 0o600
+    else:
+        import subprocess
+        out = subprocess.check_output(["icacls", str(p)], text=True)
+        # Protected DACL must not retain BUILTIN\Users or Everyone
+        assert "BUILTIN\\Users" not in out and "Everyone" not in out
+
+
+def test_ssrf_and_raw_url_guards():
+    assert not cloud._check_url("https://127.0.0.1/state")
+    assert not cloud._check_url("https://localhost/state")
+    assert not cloud._check_url("https://[::1]/state")
+    assert not cloud._check_url("https://10.0.0.5/state")
+    assert not cloud._check_url("https://169.254.169.254/latest")
+    assert not cloud._check_url("https://service.local/state")
+    assert not cloud._check_url("https://user:secret@example.invalid/state")
+    assert cloud._is_allowed_raw_url("https://gist.githubusercontent.com/user/id/raw/merged.json")
+    assert not cloud._is_allowed_raw_url("https://evil.example/payload.json")
 
 
 def test_merge_preserves_accumulated_reward_scale():

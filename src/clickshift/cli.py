@@ -148,8 +148,30 @@ def _latest_report(res) -> str:
     return ""
 
 
+def _load_filelist(filelist_path: Path) -> list[Path]:
+    """Read UTF-8 ordered file paths from a response file and remove staging temp lists."""
+    paths: list[Path] = []
+    try:
+        raw = filelist_path.read_text(encoding="utf-8", errors="ignore")
+        for line in raw.splitlines():
+            item = line.strip()
+            if item:
+                paths.append(Path(item))
+    finally:
+        try:
+            name_low = filelist_path.name.lower()
+            parent_low = str(filelist_path.parent).lower()
+            if name_low.endswith(".filelist") and "clickshift" in parent_low:
+                filelist_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+    return paths
+
+
 def cmd_convert(args) -> int:
-    files = [Path(f) for f in args.files]
+    files = [Path(f) for f in (args.files or [])]
+    if getattr(args, "filelist", None):
+        files.extend(_load_filelist(Path(args.filelist)))
     files = [f for f in files if f.exists()]
     if not files:
         print("No input files found.", file=sys.stderr)
@@ -369,8 +391,15 @@ def cmd_config(args) -> int:
         k, v = assign.split("=", 1)
         k = k.strip().lower()
         if k in ("watch_folder", "folder"):
-            Path(v).mkdir(parents=True, exist_ok=True)
-            cfg["watch_folder"] = str(Path(v).resolve())
+            try:
+                safe_folder = monitor.validate_watch_folder(Path(v))
+            except ValueError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 1
+            safe_folder.mkdir(parents=True, exist_ok=True)
+            cfg["watch_folder"] = str(safe_folder)
+        elif k in ("office_disable_macros", "disable_macros"):
+            cfg["office_disable_macros"] = v.lower() in ("1", "on", "true", "yes")
         elif k == "auto_target":
             cfg["auto_target"] = _norm_ext(v).lstrip(".")
         elif k in ("ml", "ml_enabled"):
@@ -406,8 +435,8 @@ def cmd_config(args) -> int:
         elif k == "cloud_token":
             from .cloud import save_token
             p = save_token(v)
-            print(f"token saved to {p} (owner-only). It should be a fine-grained "
-                  f"PAT with ONLY the 'gist' scope.")
+            print(f"token saved to {p} (owner-only). Prefer setting CLICKSHIFT_CLOUD_TOKEN "
+                  f"in your environment so tokens never sit in shell history.")
         elif k in ("cloud_interval", "cloud_interval_s"):
             cfg["cloud_interval_s"] = max(60, int(float(v)))
         elif k in ("auto_update", "auto_update_check"):
@@ -460,7 +489,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = p.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("convert", help="convert one or more documents")
-    c.add_argument("files", nargs="+", help="source file(s)")
+    c.add_argument("files", nargs="*", help="source file(s)")
+    c.add_argument("--filelist", default=None, help="UTF-8 response file listing ordered source files")
     c.add_argument("-t", "--target", default=None,
                    help="target extension (default: latest generation for that type)")
     c.add_argument("--choose", action="store_true",

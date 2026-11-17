@@ -7,13 +7,28 @@ New-Item -ItemType Directory -Force -Path $assets | Out-Null
 
 # 1. Compile ClickShiftShell.dll and ClickShiftStub.exe if g++ is available
 $gpp = Get-Command "g++.exe" -ErrorAction SilentlyContinue
-if (-not $gpp -and (Test-Path "C:\mingw64\bin\g++.exe")) {
-    $gpp = Get-Item "C:\mingw64\bin\g++.exe"
+if (-not $gpp) {
+    foreach ($cand in @(
+        "C:\mingw64\bin\g++.exe",
+        "C:\msys64\mingw64\bin\g++.exe",
+        "C:\msys64\ucrt64\bin\g++.exe"
+    )) {
+        if (Test-Path $cand) {
+            $gpp = Get-Item $cand
+            break
+        }
+    }
 }
 if ($gpp) {
+    $gppBin = Split-Path -Parent $gpp.Source
+    $env:PATH = "$gppBin;$env:PATH"
     Write-Host "Compiling ClickShiftShell.dll and ClickShiftStub.exe with $($gpp.Source)..."
     & $gpp.Source -shared -O2 -std=c++17 "$srcExt\ClickShiftShell.cpp" "$srcExt\ClickShiftShell.def" -o "$assets\ClickShiftShell.dll" -lole32 -luuid -lshlwapi -lshell32 -ladvapi32 -static
+    if ($LASTEXITCODE -ne 0) { throw "Failed compiling ClickShiftShell.dll" }
     & $gpp.Source -O2 -municode -mwindows "$srcExt\ClickShiftStub.cpp" -o "$assets\ClickShiftStub.exe" -static
+    if ($LASTEXITCODE -ne 0) { throw "Failed compiling ClickShiftStub.exe" }
+} elseif ($env:GITHUB_ACTIONS -eq "true") {
+    throw "g++.exe not found in CI environment; refusing to ship prebuilt native binaries."
 }
 
 Copy-Item "$srcExt\AppxManifest.xml" "$assets\AppxManifest.xml" -Force
@@ -23,12 +38,13 @@ if (-not (Test-Path "$assets\clickshift.png")) {
     Add-Type -AssemblyName System.Drawing
     $bmp = New-Object System.Drawing.Bitmap(150, 150)
     $g = [System.Drawing.Graphics]::FromImage($bmp)
-    $brush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 37, 99, 235))
+    $brush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 20, 10, 11))
     $g.FillRectangle($brush, 10, 10, 130, 130)
+    $rBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 225, 29, 46))
+    $g.FillRectangle($rBrush, 60, 20, 56, 76)
     $wBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::White)
-    $g.FillRectangle($wBrush, 42, 30, 50, 90)
-    $yBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 255, 214, 10))
-    $g.FillRectangle($yBrush, 92, 58, 36, 12)
+    $g.FillRectangle($wBrush, 32, 36, 56, 76)
+    $rBrush.Dispose()
     $bmp.Save("$assets\clickshift.png", [System.Drawing.Imaging.ImageFormat]::Png)
     $g.Dispose()
     $bmp.Dispose()

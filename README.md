@@ -2,7 +2,7 @@
 
 **One EXE. Right-click any document → converted. Learns to get faster.**
 
-> **📥 Direct EXE Download (Latest — v1.0.18):** [**Download `ClickShift-v1.0.18.exe`**](https://github.com/AceX0320/ClickShift/releases/download/v1.0.18/ClickShift-v1.0.18.exe) · [**Latest Release Page**](https://github.com/AceX0320/ClickShift/releases/latest)  
+> **📥 Direct EXE Download (Latest — v1.0.19):** [**Download `ClickShift-v1.0.19.exe`**](https://github.com/AceX0320/ClickShift/releases/download/v1.0.19/ClickShift-v1.0.19.exe) · [**Latest Release Page**](https://github.com/AceX0320/ClickShift/releases/latest)  
 > *(Or grab the latest CI artifact from [GitHub Actions](https://github.com/AceX0320/ClickShift/actions/workflows/build.yml) / browse [Releases](https://github.com/AceX0320/ClickShift/releases))*
 
 ClickShift is a 100 % local, offline document conversion tool:
@@ -127,19 +127,19 @@ https://github.com/AceX0320/ClickShift/releases/latest
 ```
 
 * **Direct Download (Latest Release Page):** [https://github.com/AceX0320/ClickShift/releases/latest](https://github.com/AceX0320/ClickShift/releases/latest)
-* **Direct Download (v1.0.18 Pinned):** [https://github.com/AceX0320/ClickShift/releases/download/v1.0.18/ClickShift-v1.0.18.exe](https://github.com/AceX0320/ClickShift/releases/download/v1.0.18/ClickShift-v1.0.18.exe)
+* **Direct Download (v1.0.19 Pinned):** [https://github.com/AceX0320/ClickShift/releases/download/v1.0.19/ClickShift-v1.0.19.exe](https://github.com/AceX0320/ClickShift/releases/download/v1.0.19/ClickShift-v1.0.19.exe)
 * **All Releases:** [https://github.com/AceX0320/ClickShift/releases](https://github.com/AceX0320/ClickShift/releases)
 * **CI Build Artifacts (`ClickShift-windows-exe`):** [https://github.com/AceX0320/ClickShift/actions/workflows/build.yml](https://github.com/AceX0320/ClickShift/actions/workflows/build.yml)
 * `/releases/latest` **always points to the newest published versioned EXE** (`ClickShift-v<version>.exe`). ClickShift checks for new GitHub releases automatically every **12 hours** in the background, updates silently, and leaves a Windows notification showing the old → new version when it restarts.
 
-Publishing happens automatically on every push to `main` (via `.github/workflows/build.yml`) as well as on version tags (via `.github/workflows/release.yml`):
+Publishing public releases happens on version tags (`v*`) via `.github/workflows/release.yml`, while `.github/workflows/build.yml` runs tests and builds downloadable CI test artifacts (`ClickShift-windows-exe`) on every push/PR:
 
-1. Push to `main` (or tag and push a version) → CI runs the full test suite, builds `ClickShift-v<version>.exe` on a Windows runner, uploads the `ClickShift-windows-exe` artifact, and publishes `ClickShift-v<version>.exe` to the latest GitHub Release:
+1. Tag and push a version → CI runs the full test suite, compiles the shell extension and `ClickShift-v<version>.exe`, generates `SHA256SUMS.txt` (plus optional ECDSA `.sig`), and publishes assets to the GitHub Release after `release` environment approval:
    ```bat
-   git tag v1.0.18
-   git push origin v1.0.18
+   git tag v1.0.19
+   git push origin v1.0.19
    ```
-2. Share the link above. Anyone who downloads and double-clicks the
+2. Share `/releases/latest`. Anyone who downloads and double-clicks the
    EXE gets the self-install (both Windows right-click menus + Task Manager Startup entry).
 
 **"Each EXE downloaded with the latest improvements":** ML learnings are
@@ -163,7 +163,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
 The script creates a venv, installs deps, runs `build.py`, copies `dist\ClickShift-v<version>.exe` to `%LOCALAPPDATA%\ClickShift`, performs the install (startup + right-click menus) and launches the tray daemon.
 
 ### Option B — free GitHub CI
-Push to GitHub; the included workflow **`.github/workflows/build.yml`** runs tests on Linux and builds `ClickShift-v<version>.exe` on `windows-latest`, publishing it both as the downloadable artifact **`ClickShift-windows-exe`** and to the latest GitHub Release.
+Push to GitHub; `.github/workflows/build.yml` runs tests on Linux and builds `ClickShift-v<version>.exe` on `windows-latest`, uploading the **`ClickShift-windows-exe`** artifact for testing (`v*` tags trigger `.github/workflows/release.yml` to publish public GitHub Releases).
 
 Manual build if you prefer:
 ```bat

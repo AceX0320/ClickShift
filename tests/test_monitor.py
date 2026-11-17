@@ -3,6 +3,8 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 _tmp = Path(__file__).parent / "_tmp_home"
 os.environ["CLICKSHIFT_HOME"] = str(_tmp)
@@ -160,4 +162,100 @@ def test_auto_update_12h_interval_and_background_check(tmp_path, monkeypatch):
     assert res == "updated"
     assert bg_calls == [("v1.0.99", "1.0.18")]
     assert monitor.load_config()["last_update_check_ts"] == 50_000.0
+
+
+def test_win11_uac_decline_shows_admin_popup(tmp_path, monkeypatch):
+    """If the user selects 'No' at the UAC prompt, show the exact admin rights message."""
+    import base64
+
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    (assets / "ClickShiftShell.dll").write_bytes(b"MZ")
+    (assets / "AppxManifest.xml").write_text("<Package/>", encoding="utf-8")
+    (assets / "ClickShiftShell.msix").write_bytes(b"PK")
+    (assets / "ClickShiftShell.cer").write_bytes(b"FAKECER")
+
+    monkeypatch.setattr(monitor, "IS_WINDOWS", True)
+    monkeypatch.setattr(monitor, "_assets_dir", lambda: assets)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+
+    runs = []
+
+    class _FakeProc:
+        def __init__(self, rc):
+            self.returncode = rc
+            self.stderr = ""
+            self.stdout = ""
+
+    def fake_run(cmd, **_kw):
+        runs.append(cmd)
+        # First call = direct Add-AppxPackage fails; second call = UAC declined (1223)
+        return _FakeProc(1 if len(runs) == 1 else 1223)
+
+    popups = []
+    monkeypatch.setattr(monitor.subprocess, "run", fake_run)
+    monkeypatch.setattr(monitor, "_show_admin_required_popup", lambda: popups.append("ClickShift needs the admin rights to work!"))
+
+    ok = monitor._install_win11_shell_extension()
+    assert ok is False
+    assert popups == ["ClickShift needs the admin rights to work!"]
+    assert "-EncodedCommand" in runs[1]
+    uac_script = base64.b64decode(runs[1][runs[1].index("-EncodedCommand") + 1]).decode("utf-16le")
+    assert "Start-Process powershell -Verb RunAs" in uac_script
+    # MSIX mode must not unlock AllowDevelopmentWithoutDevLicense
+    assert "AllowDevelopmentWithoutDevLicense" not in uac_script
+
+
+def test_daemon_ipc_rejects_bad_token_and_oversized_line(tmp_path, monkeypatch):
+    import json
+    import socket
+
+    monkeypatch.setenv("CLICKSHIFT_HOME", str(tmp_path))
+    srv = monitor.DaemonIPCServer({"ml_enabled": False})
+    srv.start_and_publish()
+    try:
+        # 1. Bad token returns empty response cleanly
+        with socket.create_connection(("127.0.0.1", srv.port), timeout=2.0) as s:
+            s.sendall((json.dumps({"token": "wrong", "jobs": []}) + "\n").encode("utf-8"))
+            assert s.recv(1024) == b""
+
+        # 2. Oversized header without newline fails cleanly without OOM/hang
+        with socket.create_connection(("127.0.0.1", srv.port), timeout=2.0) as s:
+            try:
+                s.sendall(b"x" * (srv.MAX_REQUEST_BYTES + 512))
+                assert s.recv(1024) == b""
+            except (ConnectionResetError, BrokenPipeError):
+                pass  # Windows Winsock sends RST when server closes socket with unread bytes
+    finally:
+        srv.stop()
+
+
+def test_validate_watch_folder_rejects_protected_dirs(tmp_path):
+    with pytest.raises(ValueError):
+        monitor.validate_watch_folder(Path.home())
+    with pytest.raises(ValueError):
+        monitor.validate_watch_folder(Path.home() / "Desktop")
+    assert monitor.validate_watch_folder(tmp_path / "drop") == (tmp_path / "drop").resolve()
+
+
+def test_store_msix_skips_self_signed_win11_uac_install(monkeypatch):
+    from clickshift import updater
+    monkeypatch.setattr(monitor, "IS_WINDOWS", True)
+    monkeypatch.setattr(monitor, "winreg", None)
+    monkeypatch.setattr(monitor, "_save_exe_path_registry", lambda: None)
+    monkeypatch.setattr(monitor, "_purge_duplicate_class_verbs", lambda: None)
+    monkeypatch.setattr(monitor, "_set_win11_both_menus", lambda _v: None)
+    monkeypatch.setattr(monitor, "_register_openwith", lambda _ext: None)
+    monkeypatch.setattr(monitor, "_verb_locations", lambda ext: [rf"Software\Classes\SystemFileAssociations\.{ext}"])
+    monkeypatch.setattr(monitor, "_delete_verb", lambda *_a: None)
+    monkeypatch.setattr(monitor, "_is_win11", lambda: True)
+    monkeypatch.setattr(updater, "is_packaged_store_app", lambda: True)
+    monkeypatch.setattr(
+        monitor,
+        "_install_win11_shell_extension",
+        lambda: (_ for _ in ()).throw(AssertionError("Store MSIX must never invoke UAC self-signed cert install")),
+    )
+    assert monitor.install_context_menu(extensions=["pdf"]) == 1
+
+
 

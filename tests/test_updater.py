@@ -114,7 +114,7 @@ def test_download_update_verifies_pe_header_and_writes(tmp_path, monkeypatch):
     seen_progress = []
     dest = tmp_path / "ClickShift-new.exe"
     out = updater.download_update(
-        url, dest, progress_cb=lambda d, t: seen_progress.append((d, t)), min_bytes=512
+        url, dest, progress_cb=lambda d, t: seen_progress.append((d, t)), min_bytes=512, trusted_pubkeys=()
     )
     assert out == dest
     assert dest.read_bytes() == payload
@@ -128,32 +128,154 @@ def test_download_update_verifies_pe_header_and_writes(tmp_path, monkeypatch):
 
     monkeypatch.setattr(updater.urllib.request, "build_opener", lambda *a: _BadOpener())
     with pytest.raises(ValueError, match="not a valid Windows executable"):
-        updater.download_update(url, bad_dest, min_bytes=128)
+        updater.download_update(url, bad_dest, min_bytes=128, trusted_pubkeys=())
     assert not bad_dest.exists()
 
 
-def test_apply_windows_update_writes_self_deleting_script(tmp_path, monkeypatch):
-    monkeypatch.setattr(updater.tempfile, "gettempdir", lambda: str(tmp_path))
+def test_apply_windows_update_uses_native_relaunch(tmp_path, monkeypatch):
     popen_calls = []
-    monkeypatch.setattr(updater.subprocess, "Popen", lambda cmd, **kw: popen_calls.append(cmd))
+    monkeypatch.setattr(
+        updater.subprocess,
+        "Popen",
+        lambda cmd, **kw: popen_calls.append((cmd, kw)),
+    )
+    monkeypatch.setenv("_MEIPASS2", r"C:\Temp\_MEI999")
+    monkeypatch.setenv("_PYI_APPLICATION_HOME_DIR", r"C:\Temp\_MEI999")
 
-    src = tmp_path / "new.exe"
-    dst = tmp_path / "ClickShift.exe"
+    src = tmp_path / "staging" / "ClickShift-update-v1.0.99.exe"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    old_dst = tmp_path / "ClickShift-v1.0.98.exe"
+    new_dst = tmp_path / "ClickShift-v1.0.99.exe"
     src.write_bytes(b"MZ" + b"x" * 100)
-    dst.write_bytes(b"MZ" + b"y" * 100)
+    old_dst.write_bytes(b"MZ" + b"y" * 100)
 
-    script = updater.apply_windows_update(src, dst, pid_to_wait=99999, relaunch_args=["--post-update"])
-    assert script.exists()
-    content = script.read_text(encoding="utf-8-sig")
-    assert script.suffix == ".ps1"
-    assert str(src.resolve()) in content
-    assert str(dst.resolve()) in content
-    assert "99999" in content
-    assert "--post-update" in content
-    assert "PYINSTALLER_RESET_ENVIRONMENT" in content
+    out = updater.apply_windows_update(
+        src,
+        old_dst,
+        pid_to_wait=99999,
+        new_exe_path=new_dst,
+        relaunch_args=["--post-update"],
+    )
+    assert out == new_dst.resolve()
+    assert new_dst.exists()
     assert len(popen_calls) == 1
-    assert popen_calls[0][0].lower().endswith("powershell.exe")
-    assert popen_calls[0][-2:] == ["-File", str(script)]
+    cmd, kw = popen_calls[0]
+    assert Path(cmd[0]) == new_dst.resolve()
+    assert "--post-update" in cmd
+    assert "--cleanup-pid" in cmd and "99999" in cmd
+    assert "--cleanup-old" in cmd and str(old_dst.resolve()) in cmd
+    assert not any(str(a).lower().endswith("powershell.exe") for a in cmd)
+    assert kw["env"].get("PYINSTALLER_RESET_ENVIRONMENT") == "1"
+    assert "_MEIPASS2" not in kw["env"]
+    assert "_PYI_APPLICATION_HOME_DIR" not in kw["env"]
+
+
+def test_parse_release_payload_rejects_arbitrary_exe():
+    payload = {
+        "tag_name": "v1.0.19",
+        "assets": [
+            {
+                "name": "unrelated.exe",
+                "size": 5_000_000,
+                "browser_download_url": "https://github.com/AceX0320/ClickShift/releases/download/v1.0.19/unrelated.exe",
+            }
+        ],
+    }
+    assert updater.parse_release_payload(payload) is None
+
+
+def test_download_update_verifies_sha256_and_ecdsa_signature(tmp_path, monkeypatch):
+    import base64
+    import hashlib
+    import struct
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives.asymmetric.utils import Prehashed, decode_dss_signature
+
+    priv = ec.generate_private_key(ec.SECP256R1())
+    nums = priv.public_key().public_numbers()
+    cng_blob = struct.pack("<II", 0x31534345, 32) + nums.x.to_bytes(32, "big") + nums.y.to_bytes(32, "big")
+    pub_b64 = base64.b64encode(cng_blob).decode("ascii")
+
+    payload = b"MZ" + (b"\x90" * 2046)
+    digest = hashlib.sha256(payload).digest()
+    der_sig = priv.sign(digest, ec.ECDSA(Prehashed(hashes.SHA256())))
+    r, s = decode_dss_signature(der_sig)
+    sig_b64 = base64.b64encode(r.to_bytes(32, "big") + s.to_bytes(32, "big"))
+
+    exe_url = "https://github.com/AceX0320/ClickShift/releases/download/v1.0.19/ClickShift-v1.0.19.exe"
+    sums_url = "https://github.com/AceX0320/ClickShift/releases/download/v1.0.19/SHA256SUMS.txt"
+    sig_url = "https://github.com/AceX0320/ClickShift/releases/download/v1.0.19/ClickShift-v1.0.19.exe.sig"
+    sums_bytes = f"{digest.hex()}  ClickShift-v1.0.19.exe\n".encode("utf-8")
+
+    routes = {exe_url: payload, sums_url: sums_bytes, sig_url: sig_b64}
+
+    class _FakeResp(io.BytesIO):
+        def __init__(self, data, target_url):
+            super().__init__(data)
+            self._url = target_url
+            self.headers = {"Content-Length": str(len(data))}
+
+        def geturl(self):
+            return self._url
+
+    class _FakeOpener:
+        def open(self, req, timeout=60.0):
+            u = req.full_url
+            return _FakeResp(routes[u], u)
+
+    monkeypatch.setattr(updater.urllib.request, "build_opener", lambda *a: _FakeOpener())
+
+    dest = tmp_path / "ok.exe"
+    out = updater.download_update(
+        exe_url,
+        dest,
+        min_bytes=512,
+        sha256_url=sums_url,
+        sig_url=sig_url,
+        trusted_pubkeys=("AAAA_ROTATED_OLD_KEY_INVALID_LEN", pub_b64),
+        require_signature=True,
+    )
+    assert out == dest and dest.read_bytes() == payload
+
+    # Bad SHA-256 fails closed
+    routes[sums_url] = f"{'0' * 64}  ClickShift-v1.0.19.exe\n".encode("utf-8")
+    with pytest.raises(ValueError, match="SHA-256 mismatch"):
+        updater.download_update(exe_url, tmp_path / "bad_sha.exe", min_bytes=512, sha256_url=sums_url)
+
+    # Restore SHA-256, break ECDSA sig -> fails closed
+    routes[sums_url] = sums_bytes
+    routes[sig_url] = base64.b64encode(b"\x01" * 64)
+    with pytest.raises(ValueError, match="ECDSA signature verification"):
+        updater.download_update(
+            exe_url,
+            tmp_path / "bad_sig.exe",
+            min_bytes=512,
+            sha256_url=sums_url,
+            sig_url=sig_url,
+            trusted_pubkeys=(pub_b64,),
+            require_signature=True,
+        )
+
+    # Missing .sig when pubkey configured fails closed
+    with pytest.raises(ValueError, match="Missing cryptographic signature"):
+        updater.download_update(
+            exe_url,
+            tmp_path / "missing_sig.exe",
+            min_bytes=512,
+            trusted_pubkeys=(pub_b64,),
+        )
+
+
+def test_staging_dir_avoids_shared_temp(tmp_path, monkeypatch):
+    monkeypatch.delenv("CLICKSHIFT_STAGING_DIR", raising=False)
+    monkeypatch.setattr(updater.tempfile, "gettempdir", lambda: r"C:\SharedTemp")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.setattr(updater.sys, "platform", "win32")
+    st = updater._resolve_staging_dir(None)
+    assert st.exists()
+    assert st.parent == tmp_path / "ClickShift" / "staging"
+    assert Path(r"C:\SharedTemp") not in st.parents
 
 
 def test_install_progress_popup_suppressed_by_env(monkeypatch):
@@ -241,6 +363,7 @@ def test_run_background_update_silent_and_records_notice(tmp_path, monkeypatch):
     assert peeked["from_version"] == "v1.0.17" and peeked["to_version"] == "v1.0.18"
 
     consumed = updater.consume_update_notice(tmp_path)
+    assert consumed is not None
     assert consumed == peeked
     assert updater.consume_update_notice(tmp_path) is None
     title, body = updater.format_update_notification(consumed)

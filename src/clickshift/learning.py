@@ -37,6 +37,7 @@ Set environment variable ``CLICKSHIFT_DISABLE_ML=1`` to switch this off entirely
 # pyright: reportMissingImports=false, reportMissingModuleSource=false
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 import math
@@ -371,14 +372,19 @@ class BanditSelector:
         except Exception:
             pass
 
+        file_tag = f"{hashlib.sha256(src.name.encode('utf-8', 'replace')).hexdigest()[:12]}{src.suffix.lower()}"
         entry = {
             "pair": pair_key, "arm": arm, "ms": round(elapsed_ms, 1),
-            "ok": ok, "reward": round(reward, 3), "file": src.name, "t": time.time(),
+            "ok": ok, "reward": round(reward, 3), "file": file_tag, "t": time.time(),
         }
         with self._io_lock:
             try:
                 with open(self.history_file, "a", encoding="utf-8") as fh:
                     fh.write(json.dumps(entry) + "\n")
+                # Keep history bounded on disk so it never grows without limit
+                if self.history_file.stat().st_size > 1_000_000:
+                    recent = self.history_file.read_text(encoding="utf-8", errors="ignore").splitlines()[-5000:]
+                    self.history_file.write_text("\n".join(recent) + ("\n" if recent else ""), encoding="utf-8")
             except Exception:
                 pass
         self._save_state()

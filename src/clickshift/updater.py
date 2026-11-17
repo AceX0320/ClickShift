@@ -1,11 +1,17 @@
 """GitHub auto-updater and branded setup/update progress UI for ClickShift."""
 from __future__ import annotations
 
+import base64
+import ctypes
+import hashlib
+import hmac
 import json
 import os
 import queue
 import re
+import shutil
 import ssl
+import struct
 import subprocess
 import sys
 import tempfile
@@ -14,10 +20,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 from clickshift import APP_NAME, __version__
 
@@ -53,6 +60,20 @@ _ALLOWED_DOWNLOAD_HOSTS = {
 
 _VERSION_RE = re.compile(r"^\s*v?(\d+(?:\.\d+)*)")
 
+# Dual-slot ECDSA P-256 public key list for zero-downtime key rotation:
+# Add new keys here (base64 of 72-byte CNG ECCPUBLICBLOB, 65-byte X9.62, or SPKI DER)
+# or override via CLICKSHIFT_UPDATE_PUBKEYS_B64 during testing.
+TRUSTED_ECDSA_PUBKEYS_B64: tuple[str, ...] = (
+    "RUNTMSAAAAA51GhTNj8aBWoIBxWojEWaMNYmLZBR+9rwzScwqaFE/nMIqrMDoTuPrnN/VFzAM8Biv7QwpRHdLnn6z9Op3OhU",
+)
+
+
+def active_trusted_pubkeys() -> tuple[str, ...]:
+    env = os.environ.get("CLICKSHIFT_UPDATE_PUBKEYS_B64", "").strip()
+    if env:
+        return tuple(k.strip() for k in env.split(",") if k.strip())
+    return TRUSTED_ECDSA_PUBKEYS_B64
+
 
 @dataclass(frozen=True)
 class ReleaseInfo:
@@ -64,6 +85,27 @@ class ReleaseInfo:
     release_notes: str = ""
     html_url: str = RELEASES_PAGE_URL
     asset_size: int = 0
+    sha256_url: str = ""
+    sig_url: str = ""
+    expected_sha256: str = ""
+
+
+def is_packaged_store_app() -> bool:
+    """Return True only when running inside ClickShift's own MSIX / Store package identity."""
+    if sys.platform != "win32" or os.environ.get("CLICKSHIFT_ALLOW_SELF_UPDATE") == "1":
+        return False
+    try:
+        length = ctypes.c_uint32(0)
+        rc = ctypes.windll.kernel32.GetCurrentPackageFullName(ctypes.byref(length), None)
+        if rc != 122 or not length.value:
+            return False
+        buf = ctypes.create_unicode_buffer(length.value)
+        rc2 = ctypes.windll.kernel32.GetCurrentPackageFullName(ctypes.byref(length), buf)
+        if rc2 != 0:
+            return False
+        return buf.value.lower().startswith(("clickshift", "confas"))
+    except Exception:
+        return False
 
 
 def parse_version(version_str: str) -> tuple[int, ...]:
@@ -164,17 +206,26 @@ def parse_release_payload(data: object) -> Optional[ReleaseInfo]:
         return None
 
     download_url = ""
+    matched_asset_name = ""
     asset_size = 0
+    sha256_url = ""
+    sig_url = ""
     assets = data.get("assets")
     if isinstance(assets, list):
-        for asset in assets:
-            if not isinstance(asset, dict):
-                continue
-            name = str(asset.get("name") or "")
-            url = str(asset.get("browser_download_url") or "")
-            if name.lower().startswith(("clickshift", "confas")) and name.lower().endswith(".exe") and is_allowed_download_url(url):
-                download_url = url
-                asset_size = int(asset.get("size") or 0)
+        # Strictly require official ClickShift/ConFas executable naming (prefer tag-exact match)
+        preferred = (f"clickshift-{tag}.exe".lower(), f"clickshift-v{'.'.join(str(p) for p in parse_version(tag))}.exe".lower(), "clickshift.exe")
+        for target_name in preferred:
+            for asset in assets:
+                if not isinstance(asset, dict):
+                    continue
+                name = str(asset.get("name") or "")
+                url = str(asset.get("browser_download_url") or "")
+                if name.lower() == target_name and is_allowed_download_url(url):
+                    download_url = url
+                    matched_asset_name = name
+                    asset_size = int(asset.get("size") or 0)
+                    break
+            if download_url:
                 break
         if not download_url:
             for asset in assets:
@@ -182,10 +233,24 @@ def parse_release_payload(data: object) -> Optional[ReleaseInfo]:
                     continue
                 name = str(asset.get("name") or "")
                 url = str(asset.get("browser_download_url") or "")
-                if name.lower().endswith(".exe") and is_allowed_download_url(url):
+                if name.lower().startswith(("clickshift", "confas")) and name.lower().endswith(".exe") and is_allowed_download_url(url):
                     download_url = url
+                    matched_asset_name = name
                     asset_size = int(asset.get("size") or 0)
                     break
+
+        for asset in assets:
+            if not isinstance(asset, dict):
+                continue
+            name = str(asset.get("name") or "")
+            url = str(asset.get("browser_download_url") or "")
+            if not is_allowed_download_url(url):
+                continue
+            nl = name.lower()
+            if nl == "sha256sums.txt":
+                sha256_url = url
+            elif matched_asset_name and nl == f"{matched_asset_name.lower()}.sig":
+                sig_url = url
 
     if not download_url:
         return None
@@ -201,7 +266,168 @@ def parse_release_payload(data: object) -> Optional[ReleaseInfo]:
         release_notes=str(data.get("body") or "").strip(),
         html_url=html_url,
         asset_size=asset_size,
+        sha256_url=sha256_url,
+        sig_url=sig_url,
     )
+
+
+def _fetch_text_asset(url: str, max_bytes: int = 65536, timeout: float = 15.0) -> bytes:
+    if not is_allowed_download_url(url):
+        raise ValueError(f"Blocked untrusted asset URL: {url}")
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": f"{APP_NAME}/{__version__}"},
+        method="GET",
+    )
+    ctx = ssl.create_default_context()
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=ctx),
+        _SafeRedirectHandler(),
+    )
+    with opener.open(req, timeout=timeout) as resp:
+        if not is_allowed_download_url(resp.geturl()):
+            raise ValueError(f"Blocked redirected asset URL: {resp.geturl()}")
+        data = resp.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise ValueError("Metadata asset exceeded maximum allowed size")
+    return data
+
+
+def parse_sha256sums(text: str, asset_filename: str) -> Optional[str]:
+    """Extract lowercase SHA-256 hex digest for ``asset_filename`` from SHA256SUMS.txt."""
+    want = Path(asset_filename).name.lower()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = re.match(r"^([0-9a-fA-F]{64})\s+\*?(.+)$", line)
+        if not m:
+            continue
+        digest, fname = m.group(1).lower(), Path(m.group(2).strip()).name.lower()
+        if fname == want:
+            return digest
+    return None
+
+
+def _to_bcrypt_p256_blob(raw_or_b64: str) -> bytes:
+    raw = base64.b64decode(raw_or_b64.strip())
+    if len(raw) == 72 and raw[:4] == b"ECS1":
+        return raw
+    if len(raw) == 65 and raw[0] == 0x04:
+        return struct.pack("<II", 0x31534345, 32) + raw[1:65]
+    if len(raw) == 91 and raw[-65] == 0x04:  # X.509 SPKI DER for P-256
+        return struct.pack("<II", 0x31534345, 32) + raw[-64:]
+    raise ValueError("Unsupported ECDSA P-256 public key format")
+
+
+def _decode_ecdsa_sig_raw64(sig_bytes: bytes) -> bytes:
+    """Accept raw 64-byte (r||s), base64-encoded, or ASN.1 DER ECDSA P-256 signatures."""
+    data = sig_bytes.strip()
+    if len(data) == 64:
+        return data
+    if data and all(chr(b).isascii() for b in data):
+        try:
+            decoded = base64.b64decode(data, validate=True)
+            if len(decoded) == 64:
+                return decoded
+            data = decoded
+        except Exception:
+            pass
+    # ASN.1 DER: 0x30 <len> 0x02 <rlen> <r> 0x02 <slen> <s>
+    if len(data) >= 8 and data[0] == 0x30:
+        idx = 2 if data[1] < 0x80 else 3
+        if idx < len(data) and data[idx] == 0x02:
+            rlen = data[idx + 1]
+            r = data[idx + 2:idx + 2 + rlen].lstrip(b"\x00")
+            pos = idx + 2 + rlen
+            if pos + 2 <= len(data) and data[pos] == 0x02:
+                slen = data[pos + 1]
+                s = data[pos + 2:pos + 2 + slen].lstrip(b"\x00")
+                if len(r) <= 32 and len(s) <= 32:
+                    return r.rjust(32, b"\x00") + s.rjust(32, b"\x00")
+    if len(sig_bytes) == 64:
+        return sig_bytes
+    raise ValueError("Invalid ECDSA P-256 signature encoding")
+
+
+def verify_ecdsa_p256_sha256(
+    sha256_digest: bytes,
+    sig_bytes: bytes,
+    pubkeys_b64: Sequence[str],
+) -> bool:
+    """Verify a SHA-256 digest against any trusted ECDSA P-256 public key."""
+    if len(sha256_digest) != 32 or not pubkeys_b64:
+        return False
+    try:
+        sig64 = _decode_ecdsa_sig_raw64(sig_bytes)
+    except ValueError:
+        return False
+
+    if sys.platform == "win32":
+        try:
+            bcrypt = ctypes.WinDLL("bcrypt")
+            bcrypt.BCryptOpenAlgorithmProvider.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
+            bcrypt.BCryptOpenAlgorithmProvider.restype = ctypes.c_uint32
+            bcrypt.BCryptCloseAlgorithmProvider.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            bcrypt.BCryptCloseAlgorithmProvider.restype = ctypes.c_uint32
+            bcrypt.BCryptImportKeyPair.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32]
+            bcrypt.BCryptImportKeyPair.restype = ctypes.c_uint32
+            bcrypt.BCryptDestroyKey.argtypes = [ctypes.c_void_p]
+            bcrypt.BCryptDestroyKey.restype = ctypes.c_uint32
+            bcrypt.BCryptVerifySignature.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32]
+            bcrypt.BCryptVerifySignature.restype = ctypes.c_uint32
+
+            h_alg = ctypes.c_void_p()
+            if bcrypt.BCryptOpenAlgorithmProvider(ctypes.byref(h_alg), "ECDSA_P256", None, 0) != 0:
+                return False
+            try:
+                digest_buf = (ctypes.c_ubyte * 32).from_buffer_copy(sha256_digest)
+                sig_buf = (ctypes.c_ubyte * 64).from_buffer_copy(sig64)
+                for key_b64 in pubkeys_b64:
+                    try:
+                        blob = _to_bcrypt_p256_blob(key_b64)
+                    except Exception:
+                        continue
+                    blob_buf = (ctypes.c_ubyte * len(blob)).from_buffer_copy(blob)
+                    h_key = ctypes.c_void_p()
+                    if bcrypt.BCryptImportKeyPair(
+                        h_alg, None, "ECCPUBLICBLOB", ctypes.byref(h_key), blob_buf, len(blob), 0
+                    ) != 0:
+                        continue
+                    try:
+                        if bcrypt.BCryptVerifySignature(
+                            h_key, None, digest_buf, 32, sig_buf, 64, 0
+                        ) == 0:
+                            return True
+                    finally:
+                        bcrypt.BCryptDestroyKey(h_key)
+                return False
+            finally:
+                bcrypt.BCryptCloseAlgorithmProvider(h_alg, 0)
+        except Exception:
+            pass
+
+    # Fallback (Linux/macOS tests or when cryptography is installed)
+    try:
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.hazmat.primitives.asymmetric.utils import Prehashed, encode_dss_signature
+
+        r = int.from_bytes(sig64[:32], "big")
+        s = int.from_bytes(sig64[32:], "big")
+        der_sig = encode_dss_signature(r, s)
+        for key_b64 in pubkeys_b64:
+            try:
+                blob = _to_bcrypt_p256_blob(key_b64)
+                x962 = b"\x04" + blob[8:72]
+                pub = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), x962)
+                pub.verify(der_sig, sha256_digest, ec.ECDSA(Prehashed(hashes.SHA256())))
+                return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
 
 
 def check_for_update(
@@ -257,8 +483,13 @@ def download_update(
     progress_cb: Optional[Callable[[int, int], None]] = None,
     timeout: float = 120.0,
     min_bytes: int = DEFAULT_MIN_EXE_BYTES,
+    expected_sha256: str = "",
+    sha256_url: str = "",
+    sig_url: str = "",
+    trusted_pubkeys: Optional[Sequence[str]] = None,
+    require_signature: bool = False,
 ) -> Path:
-    """Download a verified Windows PE executable from GitHub Releases to dest."""
+    """Download and verify a Windows PE executable from GitHub Releases to dest."""
     if not is_allowed_download_url(url):
         raise ValueError(f"Refusing download from non-GitHub URL: {url}")
 
@@ -278,6 +509,7 @@ def download_update(
     )
 
     downloaded = 0
+    sha = hashlib.sha256()
     try:
         with opener.open(req, timeout=timeout) as resp:
             if not is_allowed_download_url(resp.geturl()):
@@ -293,6 +525,7 @@ def download_update(
                     downloaded += len(chunk)
                     if downloaded > MAX_EXE_BYTES:
                         raise ValueError("Download exceeded maximum allowed size")
+                    sha.update(chunk)
                     fh.write(chunk)
                     if progress_cb is not None:
                         progress_cb(downloaded, total)
@@ -305,6 +538,26 @@ def download_update(
         if magic != b"MZ":
             raise ValueError("Downloaded file is not a valid Windows executable")
 
+        actual_hex = sha.hexdigest().lower()
+        want_hex = (expected_sha256 or "").strip().lower()
+        if not want_hex and sha256_url:
+            sums_txt = _fetch_text_asset(sha256_url).decode("utf-8", errors="replace")
+            asset_name = Path(urllib.parse.urlparse(url).path).name
+            parsed_hex = parse_sha256sums(sums_txt, asset_name)
+            if not parsed_hex:
+                raise ValueError(f"SHA256SUMS.txt missing entry for {asset_name}")
+            want_hex = parsed_hex
+        if want_hex and not hmac.compare_digest(actual_hex, want_hex):
+            raise ValueError("Downloaded binary SHA-256 mismatch")
+
+        pubkeys = tuple(trusted_pubkeys) if trusted_pubkeys is not None else active_trusted_pubkeys()
+        if pubkeys or require_signature:
+            if not sig_url:
+                raise ValueError("Missing cryptographic signature (.sig) for release")
+            sig_bytes = _fetch_text_asset(sig_url, max_bytes=16384)
+            if not verify_ecdsa_p256_sha256(sha.digest(), sig_bytes, pubkeys):
+                raise ValueError("Downloaded binary failed ECDSA signature verification")
+
         os.replace(part, dest)
         return dest
     except Exception:
@@ -316,6 +569,88 @@ def download_update(
         raise
 
 
+def _resolve_staging_dir(data_dir: Optional[Path] = None) -> Path:
+    """Create a private per-update staging folder outside shared %TEMP%."""
+    base_env = os.environ.get("CLICKSHIFT_STAGING_DIR", "").strip()
+    if base_env:
+        root = Path(base_env)
+    elif data_dir is not None:
+        root = Path(data_dir) / "staging"
+    elif sys.platform == "win32":
+        local_app = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
+        root = local_app / "ClickShift" / "staging"
+    else:
+        root = _resolve_data_dir(data_dir) / "staging"
+    stage = root / f"upd-{uuid.uuid4().hex[:12]}"
+    stage.mkdir(parents=True, exist_ok=True)
+    try:
+        from clickshift.monitor import _restrict_to_current_user
+        _restrict_to_current_user(root)
+        _restrict_to_current_user(stage)
+    except Exception:
+        pass
+    return stage
+
+
+def cleanup_replaced_exe(old_pid: int, old_exe: Path, wait_ms: int = 20000) -> bool:
+    """Wait on the exited previous EXE PID and remove the superseded binary safely."""
+    try:
+        old_path = Path(old_exe).resolve()
+        cur_dir = Path(sys.executable).resolve().parent
+        # Safety check: never delete outside our own install/staging folders or non-ClickShift names
+        allowed_name = bool(re.match(r"^(?:clickshift|confas).*\.exe(?:\.old)?$", old_path.name, re.I))
+        in_app_dir = (old_path.parent == cur_dir or "clickshift" in str(old_path.parent).lower())
+        if not (allowed_name and in_app_dir):
+            return False
+
+        if sys.platform == "win32" and old_pid > 0 and old_pid != os.getpid():
+            SYNCHRONIZE = 0x00100000
+            h = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE, False, int(old_pid))
+            if h:
+                try:
+                    ctypes.windll.kernel32.WaitForSingleObject(h, int(wait_ms))
+                finally:
+                    ctypes.windll.kernel32.CloseHandle(h)
+
+        for _ in range(15):
+            if not old_path.exists():
+                return True
+            try:
+                old_path.unlink()
+                return True
+            except OSError:
+                time.sleep(0.5)
+
+        if sys.platform == "win32" and old_path.exists():
+            MOVEFILE_DELAY_UNTIL_REBOOT = 0x00000004
+            ctypes.windll.kernel32.MoveFileExW(str(old_path), None, MOVEFILE_DELAY_UNTIL_REBOOT)
+    except Exception:
+        pass
+    return False
+
+
+def _place_executable(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if src.resolve() == dst.resolve():
+        return
+    try:
+        os.replace(src, dst)
+    except OSError:
+        tmp_dst = dst.with_suffix(".exe.stage")
+        shutil.copy2(src, tmp_dst)
+        os.replace(tmp_dst, dst)
+        try:
+            src.unlink(missing_ok=True)
+        except OSError:
+            pass
+    # Clear Mark-of-the-Web ADS if present so Windows doesn't repeatedly warn on our signed/verified update
+    if sys.platform == "win32":
+        try:
+            os.unlink(f"{dst}:Zone.Identifier")
+        except OSError:
+            pass
+
+
 def apply_windows_update(
     downloaded_exe: Path,
     target_exe: Path,
@@ -323,87 +658,49 @@ def apply_windows_update(
     new_exe_path: Optional[Path] = None,
     relaunch_args: Optional[list[str]] = None,
 ) -> Path:
-    """Spawn a detached Windows helper script that installs final_exe and relaunches it."""
+    """Install ``downloaded_exe`` natively without PowerShell bypass scripts and relaunch."""
     downloaded_exe = Path(downloaded_exe).resolve()
     target_exe = Path(target_exe).resolve()
     final_exe = Path(new_exe_path).resolve() if new_exe_path is not None else target_exe
     if not downloaded_exe.exists():
         raise FileNotFoundError(f"Missing downloaded update: {downloaded_exe}")
 
-    pid = pid_to_wait or os.getpid()
-    tmp_dir = Path(tempfile.gettempdir())
-    script = tmp_dir / f"clickshift_apply_update_{pid}.ps1"
-    log_path = tmp_dir / "clickshift_update.log"
+    pid = int(pid_to_wait or os.getpid())
+    old_to_cleanup: Optional[Path] = None
 
-    def q(value: object) -> str:
-        """PowerShell single-quoted literal."""
-        return "'" + str(value).replace("'", "''") + "'"
-
-    if relaunch_args:
-        arg_list = "@(" + ", ".join(q(a) for a in relaunch_args) + ")"
-        start_cmd = f"Start-Process -FilePath $dst -ArgumentList {arg_list} -WorkingDirectory (Split-Path -Parent $dst)"
+    if final_exe == target_exe and target_exe.exists():
+        backup = target_exe.with_name(f"{target_exe.name}.{pid}.old")
+        os.replace(target_exe, backup)
+        _place_executable(downloaded_exe, final_exe)
+        old_to_cleanup = backup
     else:
-        start_cmd = "Start-Process -FilePath $dst -WorkingDirectory (Split-Path -Parent $dst)"
+        _place_executable(downloaded_exe, final_exe)
+        if target_exe != final_exe and target_exe.exists():
+            old_to_cleanup = target_exe
 
-    # Wait on old PID natively via PowerShell (no console child tools), retry copy
-    # while AV scans the fresh download, reset PyInstaller env, relaunch, self-delete.
-    ps = (
-        "$ErrorActionPreference = 'Continue'\r\n"
-        f"$src = {q(downloaded_exe)}\r\n"
-        f"$dst = {q(final_exe)}\r\n"
-        f"$old = {q(target_exe)}\r\n"
-        f"$log = {q(log_path)}\r\n"
-        f"$oldPid = {int(pid)}\r\n"
-        "function Log($m) { try { Add-Content -LiteralPath $log -Value ('[{0}] {1}' -f (Get-Date -Format s), $m) } catch {} }\r\n"
-        "Log \"update helper started (waiting for pid $oldPid)\"\r\n"
-        "try { Wait-Process -Id $oldPid -Timeout 20 -ErrorAction SilentlyContinue } catch {}\r\n"
-        "if (Get-Process -Id $oldPid -ErrorAction SilentlyContinue) {\r\n"
-        "  Log 'old process still alive; stopping it'\r\n"
-        "  Stop-Process -Id $oldPid -Force -ErrorAction SilentlyContinue\r\n"
-        "  Start-Sleep -Seconds 2\r\n"
-        "}\r\n"
-        "$ok = $false\r\n"
-        "for ($i = 1; $i -le 40 -and -not $ok; $i++) {\r\n"
-        "  try { Copy-Item -LiteralPath $src -Destination $dst -Force -ErrorAction Stop; $ok = $true }\r\n"
-        "  catch { Log \"copy attempt $i failed: $($_.Exception.Message)\"; Start-Sleep -Seconds 1 }\r\n"
-        "}\r\n"
-        "if (-not $ok) { Log 'giving up: could not place new EXE'; exit 1 }\r\n"
-        "Remove-Item -LiteralPath $src -Force -ErrorAction SilentlyContinue\r\n"
-        "try { Unblock-File -LiteralPath $dst -ErrorAction SilentlyContinue } catch {}\r\n"
-        "Log \"installed $dst\"\r\n"
-        "if ($old -ne $dst) {\r\n"
-        "  for ($i = 1; $i -le 15; $i++) {\r\n"
-        "    if (-not (Test-Path -LiteralPath $old)) { break }\r\n"
-        "    try { Remove-Item -LiteralPath $old -Force -ErrorAction Stop; break } catch { Start-Sleep -Seconds 1 }\r\n"
-        "  }\r\n"
-        "}\r\n"
-        "Get-ChildItem Env: | Where-Object { $_.Name -like '_MEIPASS2' -or $_.Name -like '_PYI_*' } | ForEach-Object { Remove-Item -LiteralPath (\"Env:\" + $_.Name) -ErrorAction SilentlyContinue }\r\n"
-        "$env:PYINSTALLER_RESET_ENVIRONMENT = '1'\r\n"
-        f"try {{ {start_cmd}; Log 'relaunched new EXE' }}\r\n"
-        "catch { Log \"relaunch failed: $($_.Exception.Message)\" }\r\n"
-        "Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue\r\n"
-    )
-    script.write_bytes(b"\xef\xbb\xbf" + ps.encode("utf-8"))
+    child_env = {
+        k: v for k, v in os.environ.items()
+        if k != "_MEIPASS2" and not k.startswith("_PYI_")
+    }
+    child_env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
 
-    # CREATE_NO_WINDOW gives PowerShell a hidden console (no DETACHED_PROCESS).
+    cmd = [str(final_exe)]
+    if relaunch_args:
+        cmd.extend(relaunch_args)
+    if old_to_cleanup is not None:
+        cmd.extend(["--cleanup-pid", str(pid), "--cleanup-old", str(old_to_cleanup)])
+
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(
         subprocess, "CREATE_NEW_PROCESS_GROUP", 0
     )
-    powershell = os.path.join(
-        os.environ.get("SystemRoot", r"C:\Windows"),
-        "System32", "WindowsPowerShell", "v1.0", "powershell.exe",
-    )
-    if not os.path.exists(powershell):
-        powershell = "powershell.exe"
     subprocess.Popen(
-        [
-            powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-            "-WindowStyle", "Hidden", "-File", str(script),
-        ],
+        cmd,
+        cwd=str(final_exe.parent),
+        env=child_env,
         creationflags=creationflags,
         close_fds=True,
     )
-    return script
+    return final_exe
 
 
 class InstallProgressPopup:
@@ -478,7 +775,7 @@ class InstallProgressPopup:
             root = tk.Tk()
             root.title(self.title)
             root.resizable(False, False)
-            root.configure(bg="#0F172A")
+            root.configure(bg="#140A0B")
             try:
                 ico = find_icon_path()
                 if ico is not None:
@@ -502,22 +799,22 @@ class InstallProgressPopup:
                 pass
             style.configure(
                 "ClickShift.Horizontal.TProgressbar",
-                troughcolor="#1E293B",
-                background="#38BDF8",
-                bordercolor="#1E293B",
-                lightcolor="#38BDF8",
-                darkcolor="#0284C7",
+                troughcolor="#2A1215",
+                background="#E11D2E",
+                bordercolor="#2A1215",
+                lightcolor="#FF3B4A",
+                darkcolor="#B80F1F",
                 thickness=10,
             )
 
-            frame = tk.Frame(root, bg="#0F172A", padx=22, pady=18)
+            frame = tk.Frame(root, bg="#140A0B", padx=22, pady=18)
             frame.pack(fill="both", expand=True)
 
             tk.Label(
                 frame,
                 text=self.heading,
-                bg="#0F172A",
-                fg="#F8FAFC",
+                bg="#140A0B",
+                fg="#FFFFFF",
                 font=("Segoe UI", 12, "bold"),
                 anchor="w",
             ).pack(fill="x")
@@ -525,8 +822,8 @@ class InstallProgressPopup:
             status_lbl = tk.Label(
                 frame,
                 text="Starting...",
-                bg="#0F172A",
-                fg="#CBD5E1",
+                bg="#140A0B",
+                fg="#E9E9E9",
                 font=("Segoe UI", 9),
                 anchor="w",
             )
@@ -547,8 +844,8 @@ class InstallProgressPopup:
             detail_lbl = tk.Label(
                 frame,
                 text=f"ClickShift v{__version__}",
-                bg="#0F172A",
-                fg="#64748B",
+                bg="#140A0B",
+                fg="#A1A1AA",
                 font=("Segoe UI", 8),
                 anchor="w",
             )
@@ -730,7 +1027,7 @@ def prompt_update_dialog(info: ReleaseInfo, current_version: str = __version__) 
     root = tk.Tk()
     root.title("ClickShift Update")
     root.resizable(False, False)
-    root.configure(bg="#0F172A")
+    root.configure(bg="#140A0B")
     try:
         ico = find_icon_path()
         if ico is not None:
@@ -738,14 +1035,14 @@ def prompt_update_dialog(info: ReleaseInfo, current_version: str = __version__) 
     except Exception:
         pass
 
-    wrap = tk.Frame(root, bg="#0F172A", padx=24, pady=20)
+    wrap = tk.Frame(root, bg="#140A0B", padx=24, pady=20)
     wrap.pack(fill="both", expand=True)
 
     tk.Label(
         wrap,
         text=f"Installed: v{current_version}",
-        bg="#0F172A",
-        fg="#CBD5E1",
+        bg="#140A0B",
+        fg="#E9E9E9",
         font=("Segoe UI", 10),
         anchor="w",
     ).pack(fill="x")
@@ -753,8 +1050,8 @@ def prompt_update_dialog(info: ReleaseInfo, current_version: str = __version__) 
     tk.Label(
         wrap,
         text=f"Available: {info.tag_name}",
-        bg="#0F172A",
-        fg="#38BDF8",
+        bg="#140A0B",
+        fg="#FF3B4A",
         font=("Segoe UI", 11, "bold"),
         anchor="w",
     ).pack(fill="x", pady=(6, 16))
@@ -767,9 +1064,9 @@ def prompt_update_dialog(info: ReleaseInfo, current_version: str = __version__) 
         wrap,
         text="Update",
         command=lambda: choose("update"),
-        bg="#0284C7",
+        bg="#E11D2E",
         fg="#FFFFFF",
-        activebackground="#0369A1",
+        activebackground="#B80F1F",
         activeforeground="#FFFFFF",
         relief="flat",
         padx=20,
@@ -796,6 +1093,26 @@ def prompt_update_dialog(info: ReleaseInfo, current_version: str = __version__) 
     return choice["value"]
 
 
+def _download_verified_release(
+    info: ReleaseInfo,
+    dest: Path,
+    progress_cb: Optional[Callable[[int, int], None]] = None,
+) -> Path:
+    """Call download_update with typed arguments (avoids **dict unpacking and preserves stubbed callbacks)."""
+    if info.expected_sha256 or info.sha256_url or info.sig_url:
+        return download_update(
+            info.download_url,
+            dest,
+            progress_cb=progress_cb,
+            expected_sha256=info.expected_sha256,
+            sha256_url=info.sha256_url,
+            sig_url=info.sig_url,
+        )
+    if progress_cb is not None:
+        return download_update(info.download_url, dest, progress_cb=progress_cb)
+    return download_update(info.download_url, dest)
+
+
 def run_background_update(
     info: ReleaseInfo,
     current_version: str = __version__,
@@ -806,8 +1123,11 @@ def run_background_update(
 ) -> str:
     """Silently download, apply, and restart ClickShift in the background without prompts.
 
-    Returns one of: 'updated', 'not_frozen', 'error'.
+    Returns one of: 'updated', 'not_frozen', 'store_managed', 'error'.
     """
+    if is_packaged_store_app():
+        _log_info("updater: Microsoft Store package detected; OS Store manages updates")
+        return "store_managed"
     frozen = getattr(sys, "frozen", False) if is_frozen is None else is_frozen
     if not frozen or sys.platform != "win32":
         _log_info(f"updater: {info.tag_name} available (skipping silent replace in source/non-Windows run)")
@@ -815,11 +1135,12 @@ def run_background_update(
 
     dest_exe = Path(target_exe or sys.executable).resolve()
     versioned_exe = dest_exe.parent / f"{APP_NAME}-{info.tag_name}.exe"
-    staging_exe = Path(tempfile.gettempdir()) / f"ClickShift-update-{info.tag_name}.exe"
+    stage_dir = _resolve_staging_dir(data_dir)
+    staging_exe = stage_dir / f"ClickShift-update-{info.tag_name}.exe"
 
     try:
         _log_info(f"updater: silently downloading {info.tag_name} in background")
-        download_update(info.download_url, staging_exe)
+        _download_verified_release(info, staging_exe)
         write_update_notice(current_version, info.tag_name, silent=True, data_dir=data_dir)
         apply_windows_update(
             staging_exe,
@@ -846,8 +1167,10 @@ def run_interactive_update(
 ) -> str:
     """Prompt the user, download the verified update, apply it, and restart ClickShift.
 
-    Returns one of: 'updated', 'opened_browser', 'later', 'skip', 'error'.
+    Returns one of: 'updated', 'opened_browser', 'later', 'skip', 'store_managed', 'error'.
     """
+    if is_packaged_store_app():
+        return "store_managed"
     decision = prompt_update_dialog(info, current_version=current_version)
     if decision in ("later", "skip"):
         return decision
@@ -859,7 +1182,8 @@ def run_interactive_update(
 
     dest_exe = Path(target_exe or sys.executable).resolve()
     versioned_exe = dest_exe.parent / f"{APP_NAME}-{info.tag_name}.exe"
-    staging_exe = Path(tempfile.gettempdir()) / f"ClickShift-update-{info.tag_name}.exe"
+    stage_dir = _resolve_staging_dir(data_dir)
+    staging_exe = stage_dir / f"ClickShift-update-{info.tag_name}.exe"
 
     popup = InstallProgressPopup(
         title="Updating ClickShift",
@@ -886,7 +1210,7 @@ def run_interactive_update(
                     detail=f"{done / (1024 * 1024):.1f} MB downloaded",
                 )
 
-        download_update(info.download_url, staging_exe, progress_cb=on_progress)
+        _download_verified_release(info, staging_exe, progress_cb=on_progress)
         popup.update("Installing update and restarting...", progress=98.0, detail="Replacing executable")
         write_update_notice(current_version, info.tag_name, silent=False, data_dir=data_dir)
         apply_windows_update(

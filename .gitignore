@@ -6,6 +6,10 @@ dist/
 *.egg-info/
 .venv/
 assets/clickshift.ico.bak
+assets/ClickShiftShell.dll
+assets/ClickShiftStub.exe
+assets/ClickShiftShell.msix
+assets/ClickShiftShell.cer
 tests/_tmp_home/
 logs_118368604049/
 logs_*/

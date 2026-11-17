@@ -26,7 +26,10 @@ are still importable there for development & CI testing).
 # pyright: reportMissingImports=false, reportMissingModuleSource=false
 from __future__ import annotations
 
+import base64
 import ctypes
+import hashlib
+import hmac
 import importlib
 import json
 import os
@@ -161,7 +164,115 @@ DEFAULT_CONFIG = {
     "update_check_interval_s": 43200,   # check every 12 hours
     "last_update_check_ts": 0.0,
     "skipped_update_version": "",
+    # --- Security hardening ---------------------------------------------- #
+    "office_disable_macros": True,
 }
+
+
+def _restrict_to_current_user(path: Path) -> bool:
+    """Restrict file/directory permissions to the current user (NTFS DACL on Windows, 0o600/0o700 on POSIX)."""
+    try:
+        os.chmod(path, 0o700 if path.is_dir() else 0o600)
+    except OSError:
+        pass
+    if not IS_WINDOWS:
+        return True
+    try:
+        from ctypes import wintypes
+        advapi32 = ctypes.windll.advapi32
+        kernel32 = ctypes.windll.kernel32
+        TOKEN_QUERY = 0x0008
+        TokenUser = 1
+        SE_FILE_OBJECT = 1
+        DACL_SECURITY_INFORMATION = 0x00000004
+        PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
+        SDDL_REVISION_1 = 1
+
+        class SID_AND_ATTRIBUTES(ctypes.Structure):
+            _fields_ = [("Sid", ctypes.c_void_p), ("Attributes", wintypes.DWORD)]
+
+        h_token = wintypes.HANDLE()
+        if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), TOKEN_QUERY, ctypes.byref(h_token)):
+            return False
+        try:
+            needed = wintypes.DWORD(0)
+            advapi32.GetTokenInformation(h_token, TokenUser, None, 0, ctypes.byref(needed))
+            if not needed.value:
+                return False
+            buf = ctypes.create_string_buffer(needed.value)
+            if not advapi32.GetTokenInformation(h_token, TokenUser, buf, needed, ctypes.byref(needed)):
+                return False
+            tu = SID_AND_ATTRIBUTES.from_buffer(buf)
+            sid_ptr = ctypes.c_wchar_p()
+            if not advapi32.ConvertSidToStringSidW(tu.Sid, ctypes.byref(sid_ptr)):
+                return False
+            try:
+                sid_str = sid_ptr.value or ""
+            finally:
+                kernel32.LocalFree(sid_ptr)
+        finally:
+            kernel32.CloseHandle(h_token)
+
+        if not sid_str:
+            return False
+        # Grant Full Access exclusively to SYSTEM and the current user SID; block inherited ACEs
+        sddl = f"D:P(A;;FA;;;SY)(A;;FA;;;{sid_str})"
+        sd = ctypes.c_void_p()
+        if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl, SDDL_REVISION_1, ctypes.byref(sd), None
+        ):
+            return False
+        try:
+            dacl = ctypes.c_void_p()
+            dacl_present = wintypes.BOOL()
+            dacl_defaulted = wintypes.BOOL()
+            if not advapi32.GetSecurityDescriptorDacl(
+                sd, ctypes.byref(dacl_present), ctypes.byref(dacl), ctypes.byref(dacl_defaulted)
+            ) or not dacl_present.value:
+                return False
+            rc = advapi32.SetNamedSecurityInfoW(
+                str(path),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                dacl,
+                None,
+            )
+            return rc == 0
+        finally:
+            kernel32.LocalFree(sd)
+    except Exception:
+        return False
+
+
+def validate_watch_folder(path: Path) -> Path:
+    """Resolve and verify a watch folder isn't a protected system/profile root."""
+    resolved = path.resolve()
+    if len(resolved.parts) <= 1:
+        raise ValueError(f"Refusing root path as watch folder: {resolved}")
+    home = Path.home().resolve()
+    protected = {
+        home,
+        home / "Desktop",
+        home / "Documents",
+        home / "Downloads",
+        home / "Pictures",
+        home / "Videos",
+        home / "Music",
+    }
+    if IS_WINDOWS:
+        win_root = Path(os.environ.get("SystemRoot", r"C:\Windows")).resolve()
+        pf = Path(os.environ.get("ProgramFiles", r"C:\Program Files")).resolve()
+        pf86 = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")).resolve()
+        for sys_dir in (win_root, pf, pf86):
+            if resolved == sys_dir or sys_dir in resolved.parents:
+                raise ValueError(f"Refusing system directory as watch folder: {resolved}")
+    if resolved in protected:
+        raise ValueError(
+            f"Refusing user library folder as watch folder (it would auto-convert all existing files): {resolved}"
+        )
+    return resolved
 
 
 def config_file() -> Path:
@@ -529,6 +640,39 @@ def _save_exe_path_registry() -> None:
         _log(f"save ExePath registry failed: {exc}")
 
 
+def _cer_thumbprint(cer_path: Path) -> str:
+    """Compute uppercase SHA-1 thumbprint of a DER/PEM .cer file."""
+    try:
+        raw = cer_path.read_bytes()
+        if b"-----BEGIN CERTIFICATE-----" in raw:
+            import ssl
+            txt = raw.decode("ascii", errors="ignore")
+            body = "".join(
+                ln.strip() for ln in txt.splitlines()
+                if ln.strip() and not ln.strip().startswith("-----")
+            )
+            raw = base64.b64decode(body)
+        return hashlib.sha1(raw).hexdigest().upper()
+    except Exception:
+        return ""
+
+
+def _show_admin_required_popup() -> None:
+    """Notify the user when UAC elevation was declined or unavailable."""
+    msg = "ClickShift needs the admin rights to work!"
+    if not IS_WINDOWS or os.environ.get("CLICKSHIFT_NO_POPUP") == "1":
+        print(msg)
+        return
+    try:
+        ctypes.windll.user32.MessageBoxW(None, msg, "ClickShift", 0x00000030 | 0x00040000)
+    except Exception:
+        print(msg)
+
+
+def _ps_encoded(script_text: str) -> str:
+    return base64.b64encode(script_text.encode("utf-16le")).decode("ascii")
+
+
 def _install_win11_shell_extension() -> bool:
     """Install the packaged IExplorerCommand shell extension (ClickShiftShell.dll) so
     the expandable 'Convert with ClickShift >' submenu appears in the Windows 11 main menu.
@@ -560,19 +704,22 @@ def _install_win11_shell_extension() -> bool:
         msix_path = shell_dir / "ClickShiftShell.msix"
         cer_path = shell_dir / "ClickShiftShell.cer"
         manifest_path = shell_dir / "AppxManifest.xml"
+        thumb_file = shell_dir / "installed_cert.thumbprint"
 
         # 1. Remove any stale version (or legacy ConFas extension) and try direct registration
-        prep_remove = (
-            'Get-AppxPackage -Name "ClickShift.ShellExtension" -ErrorAction SilentlyContinue | Remove-AppxPackage -ErrorAction SilentlyContinue; '
-            'Get-AppxPackage -Name "ConFas.ShellExtension" -ErrorAction SilentlyContinue | Remove-AppxPackage -ErrorAction SilentlyContinue; '
-        )
-        direct_cmd = prep_remove + (
-            f'Add-AppxPackage -Path "{msix_path}" -ForceApplicationShutdown -ErrorAction Stop'
-            if msix_path.exists()
-            else f'Add-AppxPackage -Register "{manifest_path}" -ForceApplicationShutdown -ErrorAction Stop'
+        msix_lit = str(msix_path).replace("'", "''")
+        manifest_lit = str(manifest_path).replace("'", "''")
+        direct_cmd = (
+            "Get-AppxPackage -Name 'ClickShift.ShellExtension' -ErrorAction SilentlyContinue | Remove-AppxPackage -ErrorAction SilentlyContinue; "
+            "Get-AppxPackage -Name 'ConFas.ShellExtension' -ErrorAction SilentlyContinue | Remove-AppxPackage -ErrorAction SilentlyContinue; "
+            + (
+                f"Add-AppxPackage -Path '{msix_lit}' -ForceApplicationShutdown -ErrorAction Stop"
+                if msix_path.exists()
+                else f"Add-AppxPackage -Register '{manifest_lit}' -ForceApplicationShutdown -ErrorAction Stop"
+            )
         )
         r = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", direct_cmd],
+            ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", _ps_encoded(direct_cmd)],
             capture_output=True, text=True, timeout=25,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
@@ -580,28 +727,56 @@ def _install_win11_shell_extension() -> bool:
             _log("Win11 IExplorerCommand shell extension registered directly")
             return True
 
-        # 2. One-time elevated trust + registration (enables sideloading/dev-unlock + trusts cert + registers)
+        # 2. One-time elevated trust + registration (triggers UAC prompt).
+        # Only unlock AllowDevelopmentWithoutDevLicense when unpacked manifest fallback is used.
         elev_parts = [
             'New-Item -Path "HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\AppModelUnlock" -Force | Out-Null',
-            'Set-ItemProperty -Path "HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\AppModelUnlock" -Name "AllowDevelopmentWithoutDevLicense" -Value 1 -Type DWord -Force',
             'Set-ItemProperty -Path "HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\AppModelUnlock" -Name "AllowAllTrustedApps" -Value 1 -Type DWord -Force',
         ]
+        if not msix_path.exists():
+            elev_parts.append(
+                'Set-ItemProperty -Path "HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\AppModelUnlock" -Name "AllowDevelopmentWithoutDevLicense" -Value 1 -Type DWord -Force'
+            )
         if cer_path.exists():
+            cer_lit = str(cer_path).replace("'", "''")
             elev_parts.append(
-                f'Import-Certificate -FilePath "{cer_path}" -CertStoreLocation "Cert:\\LocalMachine\\TrustedPeople" | Out-Null'
+                f"Import-Certificate -FilePath '{cer_lit}' -CertStoreLocation 'Cert:\\LocalMachine\\TrustedPeople' | Out-Null"
             )
             elev_parts.append(
-                f'Import-Certificate -FilePath "{cer_path}" -CertStoreLocation "Cert:\\LocalMachine\\Root" | Out-Null'
+                f"Import-Certificate -FilePath '{cer_lit}' -CertStoreLocation 'Cert:\\LocalMachine\\Root' | Out-Null"
             )
-        elev_Scripts = "; ".join(elev_parts)
-        outer_cmd = (
-            f'Start-Process powershell -Verb RunAs -WindowStyle Hidden -Wait '
-            f'-ArgumentList \'-NoProfile -WindowStyle Hidden -Command "{elev_Scripts}"\'; '
-            f'{direct_cmd}'
+            tp = _cer_thumbprint(cer_path)
+            if tp:
+                try:
+                    thumb_file.write_text(tp, encoding="utf-8")
+                except Exception:
+                    pass
+
+        elev_b64 = _ps_encoded("; ".join(elev_parts))
+        uac_wrapper = (
+            "try {\n"
+            f"  $p = Start-Process powershell -Verb RunAs -WindowStyle Hidden -PassThru -Wait -ArgumentList '-NoProfile','-NonInteractive','-WindowStyle','Hidden','-EncodedCommand','{elev_b64}'\n"
+            "  if ($null -eq $p) { exit 5 }\n"
+            "  exit $p.ExitCode\n"
+            "} catch [System.ComponentModel.Win32Exception] {\n"
+            "  if ($_.Exception.NativeErrorCode -eq 1223) { exit 1223 }\n"
+            "  exit 5\n"
+            "}\n"
         )
+        r_uac = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", _ps_encoded(uac_wrapper)],
+            capture_output=True, text=True, timeout=60,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if r_uac.returncode != 0:
+            _log(f"Win11 admin elevation declined or failed (exit={r_uac.returncode}): {r_uac.stderr.strip()}")
+            if r_uac.returncode in (1223, 5):
+                _show_admin_required_popup()
+            return False
+
         r2 = subprocess.run(
-            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", outer_cmd],
-            capture_output=True, text=True, timeout=45,
+            ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", _ps_encoded(direct_cmd)],
+            capture_output=True, text=True, timeout=30,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         if r2.returncode == 0:
@@ -617,15 +792,31 @@ def _remove_win11_shell_extension() -> None:
     if not IS_WINDOWS:
         return
     try:
+        local_app = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
+        shell_dir = local_app / "ClickShift" / "win11_shell"
+        thumb_file = shell_dir / "installed_cert.thumbprint"
+        tp = ""
+        if thumb_file.exists():
+            tp = thumb_file.read_text(encoding="utf-8", errors="ignore").strip()
+            if not all(c in "0123456789ABCDEFabcdef" for c in tp):
+                tp = ""
         cmd = (
-            'Get-AppxPackage -Name "ClickShift.ShellExtension" -ErrorAction SilentlyContinue | Remove-AppxPackage -ErrorAction SilentlyContinue; '
-            'Get-AppxPackage -Name "ConFas.ShellExtension" -ErrorAction SilentlyContinue | Remove-AppxPackage -ErrorAction SilentlyContinue'
+            "Get-AppxPackage -Name 'ClickShift.ShellExtension' -ErrorAction SilentlyContinue | Remove-AppxPackage -ErrorAction SilentlyContinue; "
+            "Get-AppxPackage -Name 'ConFas.ShellExtension' -ErrorAction SilentlyContinue | Remove-AppxPackage -ErrorAction SilentlyContinue"
         )
+        if tp:
+            cmd += (
+                f"; Remove-Item 'Cert:\\LocalMachine\\TrustedPeople\\{tp}' -ErrorAction SilentlyContinue"
+                f"; Remove-Item 'Cert:\\LocalMachine\\Root\\{tp}' -ErrorAction SilentlyContinue"
+            )
         subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", cmd],
+            ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", _ps_encoded(cmd)],
             capture_output=True, text=True, timeout=20,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
+        import shutil
+        if shell_dir.exists():
+            shutil.rmtree(shell_dir, ignore_errors=True)
     except Exception:
         pass
 
@@ -703,7 +894,11 @@ def install_context_menu(
     # (Windows 10, or when the package could not be registered).
     _set_win11_both_menus(False)
     _report("Registering Windows 11 shell extension...", 42)
-    shell_ext_ok = _is_win11() and _install_win11_shell_extension()
+    from .updater import is_packaged_store_app
+    if is_packaged_store_app():
+        shell_ext_ok = _is_win11()
+    else:
+        shell_ext_ok = _is_win11() and _install_win11_shell_extension()
     exts = extensions or MENU_EXTENSIONS
     total_exts = max(1, len(exts))
     n = 0
@@ -938,14 +1133,37 @@ def ipc_file() -> Path:
     return data_dir() / "daemon_ipc.json"
 
 
+def _recv_line_bounded(conn, max_bytes: int = 65536) -> str:
+    """Read a single newline-delimited UTF-8 request capped at ``max_bytes``."""
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = conn.recv(min(4096, max_bytes - total))
+        if not chunk:
+            break
+        nl = chunk.find(b"\n")
+        if nl != -1:
+            chunks.append(chunk[:nl])
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if total >= max_bytes:
+            raise ValueError("IPC request exceeded maximum line length")
+    return b"".join(chunks).decode("utf-8", errors="strict")
+
+
 class DaemonIPCServer(threading.Thread):
     """Loopback IPC server so CLI/right-click conversions run inside the warm daemon."""
+
+    MAX_REQUEST_BYTES = 65536
+    MAX_CONCURRENT_CONNS = 16
 
     def __init__(self, cfg: dict) -> None:
         super().__init__(daemon=True, name="clickshift-ipc")
         self.cfg = cfg
         self.token = uuid.uuid4().hex
         self.stop_event = threading.Event()
+        self._conn_sem = threading.BoundedSemaphore(self.MAX_CONCURRENT_CONNS)
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.bind(("127.0.0.1", 0))
         self._sock.listen(16)
@@ -955,6 +1173,7 @@ class DaemonIPCServer(threading.Thread):
     def start_and_publish(self) -> None:
         f = ipc_file()
         f.parent.mkdir(parents=True, exist_ok=True)
+        _restrict_to_current_user(f.parent)
         try:
             fd = os.open(str(f), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -962,6 +1181,7 @@ class DaemonIPCServer(threading.Thread):
         except Exception:
             f.write_text(json.dumps({"port": self.port, "token": self.token, "pid": os.getpid()}),
                          encoding="utf-8")
+        _restrict_to_current_user(f)
         self.start()
 
     def stop(self) -> None:
@@ -989,21 +1209,36 @@ class DaemonIPCServer(threading.Thread):
                 continue
             except OSError:
                 break
-            threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+            if not self._conn_sem.acquire(blocking=False):
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                continue
+            threading.Thread(target=self._handle_guarded, args=(conn,), daemon=True).start()
+
+    def _handle_guarded(self, conn) -> None:
+        try:
+            self._handle(conn)
+        finally:
+            self._conn_sem.release()
 
     def _handle(self, conn) -> None:
         from .engine import get_engine
         try:
-            conn.settimeout(300.0)
+            conn.settimeout(2.0)
             with conn:
-                rfile = conn.makefile("r", encoding="utf-8")
-                wfile = conn.makefile("w", encoding="utf-8")
-                line = rfile.readline()
+                line = _recv_line_bounded(conn, max_bytes=self.MAX_REQUEST_BYTES)
                 if not line:
                     return
                 req = json.loads(line)
-                if req.get("token") != self.token:
+                if not isinstance(req, dict):
                     return
+                tok = str(req.get("token") or "")
+                if not hmac.compare_digest(tok, self.token):
+                    return
+                conn.settimeout(300.0)
+                wfile = conn.makefile("w", encoding="utf-8")
                 enable_ml = bool(req.get("enable_ml", True))
                 eng = get_engine(enable_ml=enable_ml)
                 write_lock = threading.Lock()
@@ -1107,13 +1342,14 @@ def _make_tray_icon_image():
                 return img.convert("RGBA").resize((64, 64), Image.LANCZOS)
             except Exception:
                 pass
-    # Fallback matching the navy / split-doc / gold-bolt icon design
+    # Fallback matching the obsidian / crimson-white stacked pages + cursor icon
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    d.rounded_rectangle([3, 3, 61, 61], radius=14, fill=(13, 30, 62, 255))
-    d.rounded_rectangle([15, 11, 49, 53], radius=4, fill=(56, 189, 248, 255))
-    d.rectangle([15, 11, 32, 53], fill=(248, 250, 252, 255))
-    d.polygon([(35, 17), (24, 35), (32, 35), (29, 49), (40, 30), (33, 30)], fill=(250, 204, 21, 255))
+    d.rounded_rectangle([3, 3, 61, 61], radius=14, fill=(20, 10, 11, 255))
+    d.rounded_rectangle([26, 8, 51, 41], radius=4, fill=(225, 29, 46, 255))
+    d.rounded_rectangle([13, 16, 39, 51], radius=4, fill=(255, 255, 255, 255), outline=(11, 11, 11, 255), width=2)
+    d.polygon([(28, 31), (28, 53), (34, 48), (38, 57), (42, 55), (38, 46), (46, 46)],
+              fill=(11, 11, 11, 255), outline=(255, 255, 255, 255))
     return img
 
 

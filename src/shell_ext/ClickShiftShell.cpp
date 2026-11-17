@@ -149,19 +149,101 @@ static std::wstring GetCachedExt() {
     return out;
 }
 
+static bool IsValidExeFile(const std::wstring& path) {
+    if (path.size() < 5) return false;
+    DWORD attrs = GetFileAttributesW(path.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) return false;
+    std::wstring tail = ToLower(path.substr(path.size() - 4));
+    return tail == L".exe";
+}
+
+static std::wstring QuoteWindowsArg(const std::wstring& arg) {
+    if (!arg.empty() && arg.find_first_of(L" \t\n\v\"") == std::wstring::npos && arg.back() != L'\\') {
+        return arg;
+    }
+    std::wstring out = L"\"";
+    size_t backslashes = 0;
+    for (wchar_t ch : arg) {
+        if (ch == L'\\') {
+            backslashes++;
+        } else if (ch == L'"') {
+            out.append(backslashes * 2 + 1, L'\\');
+            out.push_back(L'"');
+            backslashes = 0;
+        } else {
+            out.append(backslashes, L'\\');
+            out.push_back(ch);
+            backslashes = 0;
+        }
+    }
+    out.append(backslashes * 2, L'\\');
+    out.push_back(L'"');
+    return out;
+}
+
+static std::wstring WriteFilelistFallback(const std::vector<std::wstring>& files) {
+    std::wstring dir;
+    wchar_t localApp[MAX_PATH] = {0};
+    DWORD nLocal = GetEnvironmentVariableW(L"LOCALAPPDATA", localApp, MAX_PATH);
+    if (nLocal > 0 && nLocal < MAX_PATH) {
+        std::wstring base = std::wstring(localApp) + L"\\ClickShift";
+        CreateDirectoryW(base.c_str(), nullptr);
+        dir = base + L"\\staging";
+        CreateDirectoryW(dir.c_str(), nullptr);
+    } else {
+        wchar_t tmp[MAX_PATH] = {0};
+        DWORD nTmp = GetTempPathW(MAX_PATH, tmp);
+        if (nTmp == 0 || nTmp >= MAX_PATH) return L"";
+        dir = tmp;
+        while (!dir.empty() && dir.back() == L'\\') dir.pop_back();
+    }
+    std::wstring path = dir + L"\\batch_" + std::to_wstring(GetCurrentProcessId()) +
+                        L"_" + std::to_wstring(GetTickCount64()) + L".filelist";
+    HANDLE hFile = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                               FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return L"";
+    std::string utf8Payload;
+    for (const auto& f : files) {
+        int needed = WideCharToMultiByte(CP_UTF8, 0, f.c_str(), -1, nullptr, 0, nullptr, nullptr);
+        if (needed > 1) {
+            std::string line(needed - 1, '\0');
+            WideCharToMultiByte(CP_UTF8, 0, f.c_str(), -1, &line[0], needed, nullptr, nullptr);
+            utf8Payload += line;
+            utf8Payload.push_back('\n');
+        }
+    }
+    DWORD written = 0;
+    BOOL ok = utf8Payload.empty() || WriteFile(hFile, utf8Payload.data(), (DWORD)utf8Payload.size(), &written, nullptr);
+    CloseHandle(hFile);
+    if (!ok) {
+        DeleteFileW(path.c_str());
+        return L"";
+    }
+    return path;
+}
+
 static std::wstring GetClickShiftExePath() {
-    wchar_t buf[MAX_PATH * 2] = {0};
+    wchar_t modPath[MAX_PATH] = {0};
+    if (GetModuleFileNameW(g_hModule, modPath, MAX_PATH) > 0) {
+        PathRemoveFileSpecW(modPath);
+        std::wstring packagedExe = std::wstring(modPath) + L"\\ClickShift.exe";
+        if (IsValidExeFile(packagedExe)) {
+            return packagedExe;
+        }
+    }
+    wchar_t buf[32768] = {0};
     DWORD cb = sizeof(buf);
     if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\ClickShift", L"ExePath",
                      RRF_RT_REG_SZ, nullptr, buf, &cb) == ERROR_SUCCESS && buf[0]) {
-        if (GetFileAttributesW(buf) != INVALID_FILE_ATTRIBUTES) {
-            return std::wstring(buf);
+        std::wstring candidate(buf);
+        if (IsValidExeFile(candidate)) {
+            return candidate;
         }
     }
     wchar_t localApp[MAX_PATH] = {0};
     if (GetEnvironmentVariableW(L"LOCALAPPDATA", localApp, MAX_PATH) > 0) {
         std::wstring candidate = std::wstring(localApp) + L"\\ClickShift\\ClickShift.exe";
-        if (GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        if (IsValidExeFile(candidate)) {
             return candidate;
         }
     }
@@ -173,7 +255,7 @@ static std::wstring GetClickShiftExePath() {
             size_t endQ = cmd.find(L'"', 1);
             if (endQ != std::wstring::npos) {
                 std::wstring exe = cmd.substr(1, endQ - 1);
-                if (GetFileAttributesW(exe.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                if (IsValidExeFile(exe)) {
                     return exe;
                 }
             }
@@ -201,37 +283,55 @@ static std::wstring GetIconString() {
 static void LaunchClickShift(IShellItemArray* psiArray, const std::wstring& target, bool chooseMode) {
     if (!psiArray) return;
     std::wstring exe = GetClickShiftExePath();
-    if (exe.empty()) return;
+    if (exe.empty()) {
+        MessageBoxW(nullptr, L"ClickShift executable could not be found. Try running ClickShift setup again.",
+                    L"ClickShift", MB_OK | MB_ICONWARNING);
+        return;
+    }
 
     DWORD count = 0;
     if (FAILED(psiArray->GetCount(&count)) || count == 0) return;
 
-    std::wstring cmdLine = L"\"" + exe + L"\" convert";
-    if (chooseMode) {
-        cmdLine += L" --choose";
-    }
-    DWORD added = 0;
+    std::vector<std::wstring> files;
+    files.reserve(count);
     for (DWORD i = 0; i < count; ++i) {
         IShellItem* psi = nullptr;
         if (SUCCEEDED(psiArray->GetItemAt(i, &psi)) && psi) {
             LPWSTR pszFile = nullptr;
             if (SUCCEEDED(psi->GetDisplayName(SIGDN_FILESYSPATH, &pszFile)) && pszFile) {
-                cmdLine += L" \"";
-                cmdLine += pszFile;
-                cmdLine += L"\"";
-                added++;
+                files.emplace_back(pszFile);
                 CoTaskMemFree(pszFile);
             }
             psi->Release();
         }
     }
-    if (added == 0) return;
+    if (files.empty()) return;
+
+    std::wstring baseCmd = QuoteWindowsArg(exe) + L" convert";
+    if (chooseMode) {
+        baseCmd += L" --choose";
+    }
+    std::wstring targetSuffix;
     if (!target.empty() && !chooseMode) {
-        cmdLine += L" -t " + target;
+        targetSuffix = L" -t " + QuoteWindowsArg(target);
     }
 
-    STARTUPINFOW si = {sizeof(si)};
-    PROCESS_INFORMATION pi = {0};
+    std::wstring cmdLine = baseCmd;
+    for (const auto& f : files) {
+        cmdLine += L" " + QuoteWindowsArg(f);
+    }
+    cmdLine += targetSuffix;
+
+    if (cmdLine.size() > 16000) {
+        std::wstring flPath = WriteFilelistFallback(files);
+        if (!flPath.empty()) {
+            cmdLine = baseCmd + L" --filelist " + QuoteWindowsArg(flPath) + targetSuffix;
+        }
+    }
+
+    STARTUPINFOW si = {};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi = {};
     std::vector<wchar_t> mutableCmd(cmdLine.begin(), cmdLine.end());
     mutableCmd.push_back(0);
 
@@ -239,6 +339,9 @@ static void LaunchClickShift(IShellItemArray* psiArray, const std::wstring& targ
                        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
+    } else {
+        MessageBoxW(nullptr, L"ClickShift could not start the conversion process. Try reinstalling ClickShift.",
+                    L"ClickShift", MB_OK | MB_ICONERROR);
     }
 }
 

@@ -1,51 +1,36 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" xmlns:c2pa="http://c2pa.org/manifest">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
   <defs>
-    <radialGradient id="bg" cx="0.28" cy="0.2" r="1.05">
-      <stop offset="0" stop-color="#27358F"/>
-      <stop offset="0.55" stop-color="#121A52"/>
-      <stop offset="1" stop-color="#080C26"/>
+    <radialGradient id="bg" cx="0.15" cy="0.95" r="1.1">
+      <stop offset="0" stop-color="#3B0A10"/><stop offset="0.5" stop-color="#140A0B"/><stop offset="1" stop-color="#070707"/>
     </radialGradient>
-    <linearGradient id="L" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#FFFFFF"/><stop offset="1" stop-color="#D5DCFF"/>
+    <linearGradient id="red" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FF3B4A"/><stop offset="1" stop-color="#B80F1F"/>
     </linearGradient>
-    <linearGradient id="R" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#22D3EE"/><stop offset="0.55" stop-color="#6366F1"/><stop offset="1" stop-color="#A855F7"/>
+    <linearGradient id="wh" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/><stop offset="1" stop-color="#E9E9E9"/>
     </linearGradient>
-    <linearGradient id="K" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#FFF7B0"/><stop offset="0.5" stop-color="#FDE047"/><stop offset="1" stop-color="#FBA81C"/>
-    </linearGradient>
-    <clipPath id="cl"><polygon points="0,0 304,0 304,40 236,236 288,236 220,470 220,512 0,512"/></clipPath>
-    <clipPath id="cr"><polygon points="304,0 512,0 512,512 220,512 220,470 288,236 236,236 304,40"/></clipPath>
-    <clipPath id="pg"><path d="M148 64 H312 L376 128 V420 a28 28 0 0 1 -28 28 H148 a28 28 0 0 1 -28 -28 V92 a28 28 0 0 1 28 -28 Z"/></clipPath>
-    <clipPath id="band"><rect x="60" y="56" width="400" height="400"/></clipPath>
-    <filter id="blur" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="12"/></filter>
     <filter id="sh" x="-30%" y="-30%" width="160%" height="160%">
-      <feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#02040F" flood-opacity="0.55"/>
+      <feDropShadow dx="0" dy="10" stdDeviation="11" flood-color="#000000" flood-opacity="0.6"/>
     </filter>
   </defs>
   <rect width="512" height="512" rx="112" fill="url(#bg)"/>
   <rect x="1.5" y="1.5" width="509" height="509" rx="110.5" fill="none" stroke="#FFFFFF" stroke-opacity="0.10" stroke-width="3"/>
-  <!-- soft glow behind pieces -->
-  <g clip-path="url(#band)" filter="url(#blur)" opacity="0.8">
-    <polyline points="304,40 236,236 288,236 220,470" transform="translate(9.0,-5.0)" fill="none" stroke="#FBBF24" stroke-width="44" stroke-linejoin="miter"/>
-  </g>
+  
+  <!-- shifted red page (behind) -->
   <g filter="url(#sh)">
-    <!-- source half -->
-    <g clip-path="url(#cl)"><g clip-path="url(#pg)">
-      <rect width="512" height="512" fill="url(#L)"/><g fill="#B8C2F7"><rect x="148" y="144" width="200" height="16" rx="8"/><rect x="148" y="184" width="200" height="16" rx="8"/><rect x="148" y="292" width="200" height="16" rx="8"/><rect x="148" y="332" width="200" height="16" rx="8"/><rect x="148" y="372" width="200" height="16" rx="8"/></g>
-    </g></g>
-    <!-- converted half -->
-    <g transform="translate(18,-10)"><g clip-path="url(#cr)"><g clip-path="url(#pg)">
-      <rect width="512" height="512" fill="url(#R)"/><g fill="#FFFFFF" fill-opacity="0.38"><rect x="148" y="144" width="200" height="16" rx="8"/><rect x="148" y="184" width="200" height="16" rx="8"/><rect x="148" y="292" width="200" height="16" rx="8"/><rect x="148" y="332" width="200" height="16" rx="8"/><rect x="148" y="372" width="200" height="16" rx="8"/></g>
-      <path d="M312 64 V100 a28 28 0 0 0 28 28 H376 Z" fill="#FFFFFF" fill-opacity="0.45"/>
-    </g></g></g>
+    <path d="M232 52 H344 L408 116 V308 a26 26 0 0 1 -26 26 H232 a26 26 0 0 1 -26 -26 V78 a26 26 0 0 1 26 -26 Z" fill="url(#red)"/>
   </g>
-  <g clip-path="url(#band)">
-    <polyline points="304,40 236,236 288,236 220,470" fill="none" stroke="#FFFBD0" stroke-opacity="0.9" stroke-width="5" stroke-linejoin="miter"/>
+  <path d="M344 52 V90 a26 26 0 0 0 26 26 H408 Z" fill="#9E0F1C"/>
+  <!-- white page (front) -->
+  <g filter="url(#sh)">
+    <path d="M130 124 H246 L310 188 V384 a26 26 0 0 1 -26 26 H130 a26 26 0 0 1 -26 -26 V150 a26 26 0 0 1 26 -26 Z" fill="url(#wh)" stroke="#0B0B0B" stroke-width="8" stroke-linejoin="round" transform="translate(0,0)"/>
   </g>
-  <!-- bolt stripe, centred in the gap, drawn above the pieces -->
-  <g clip-path="url(#band)" transform="translate(9.0,-5.0)">
-    <polyline points="304,40 236,236 288,236 220,470" fill="none" stroke="url(#K)" stroke-width="22" stroke-linejoin="miter"/>
-    <polyline points="304,40 236,236 288,236 220,470" fill="none" stroke="#FFFDE0" stroke-opacity="0.55" stroke-width="3" stroke-linejoin="miter"/>
+  <path d="M246 124 V162 a26 26 0 0 0 26 26 H310 Z" fill="#CFCFCF"/>
+  
+  <!-- click sparks -->
+  <g stroke="#E11D2E" stroke-width="14" stroke-linecap="round"><line x1="194" y1="248" x2="162" y2="248"/><line x1="202" y1="224" x2="180" y2="202"/><line x1="226" y1="216" x2="226" y2="184"/></g>
+  <!-- cursor -->
+  <g filter="url(#sh)">
+    <polygon points="224.0,246.0 224.0,424.5 271.2,380.4 302.8,456.0 334.2,442.4 302.8,368.9 365.8,368.9" fill="#0B0B0B" stroke="#FFFFFF" stroke-width="12" stroke-linejoin="round"/>
   </g>
 </svg>

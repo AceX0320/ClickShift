@@ -72,6 +72,20 @@ def _fmt_exc(exc: Optional[BaseException]) -> str:
         return ""
     return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
 
+def _redact_home_path(value: object) -> str:
+    """Redact user home directory prefixes so shared debug reports avoid leaking OS usernames."""
+    s = str(value or "")
+    if not s:
+        return ""
+    try:
+        home_str = str(Path.home())
+        if home_str and (s == home_str or s.lower().startswith(home_str.lower() + os.sep) or s.lower().startswith(home_str.lower() + "/")):
+            return "~" + s[len(home_str):]
+    except Exception:
+        pass
+    return s
+
+
 def render_report(session: dict) -> str:
     """Render a session dict into the plain-text report."""
     L: list[str] = []
@@ -90,15 +104,15 @@ def render_report(session: dict) -> str:
     L.append(f"  ClickShift version : {session.get('version', '?')}")
     L.append(f"  OS             : {platform.platform()}")
     L.append(f"  Python         : {sys.version.split()[0]} ({'frozen EXE' if getattr(sys, 'frozen', False) else 'source'})")
-    L.append(f"  Data dir       : {session.get('data_dir', '')}")
+    L.append(f"  Data dir       : {_redact_home_path(session.get('data_dir', ''))}")
     L.append("")
     src = Path(session.get("src", ""))
     L.append("[INPUT / OUTPUT]")
-    L.append(f"  Source         : {src}")
+    L.append(f"  Source         : {_redact_home_path(src)}")
     L.append(f"  Source size    : {session.get('bytes_in', 0):,} bytes")
     L.append(f"  Target ext     : {session.get('dst_ext', '')}")
-    L.append(f"  Planned output : {session.get('planned_out', '')}")
-    L.append(f"  Actual output  : {session.get('out_path', '')}")
+    L.append(f"  Planned output : {_redact_home_path(session.get('planned_out', ''))}")
+    L.append(f"  Actual output  : {_redact_home_path(session.get('out_path', ''))}")
     if session.get("bytes_out"):
         L.append(f"  Output size    : {session['bytes_out']:,} bytes")
     L.append("")

@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import ipaddress
 import json
 import logging
 import os
@@ -92,13 +93,47 @@ MAX_LATENCY_MS = 86_400_000.0             # > 24 h is nonsense -> reject
 ALLOWED_SCHEMES = ("https",)              # plaintext upload is forbidden
 
 
+_ALLOWED_RAW_HOSTS = {"gist.githubusercontent.com", "objects.githubusercontent.com"}
+
+
+def _is_disallowed_host(host: str) -> bool:
+    h = (host or "").strip().lower().rstrip(".")
+    if not h or h in ("localhost", "localhost.localdomain") or h.endswith((".local", ".internal", ".localhost")):
+        return True
+    try:
+        ip = ipaddress.ip_address(h.strip("[]"))
+        return (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        )
+    except ValueError:
+        return False
+
+
 def _check_url(url: str) -> bool:
-    """Reject anything that is not a clean https URL (SSRF/plaintext guard)."""
+    """Reject anything that is not a clean external https URL (SSRF/plaintext guard)."""
+    if not url or "\n" in url or "\r" in url:
+        return False
     try:
         p = urllib.parse.urlsplit(url)
     except ValueError:
         return False
-    return p.scheme in ALLOWED_SCHEMES and bool(p.netloc) and "\n" not in url
+    if p.scheme not in ALLOWED_SCHEMES or not p.netloc:
+        return False
+    if p.username or p.password:
+        return False
+    return not _is_disallowed_host(p.hostname or "")
+
+
+def _is_allowed_raw_url(url: str) -> bool:
+    if not _check_url(url):
+        return False
+    host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    return host in _ALLOWED_RAW_HOSTS
 
 
 # --------------------------------------------------------------------------- #
@@ -143,6 +178,12 @@ def save_token(t: str) -> Path:
     fd = os.open(str(f), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(t.strip())
+    try:
+        from .monitor import _restrict_to_current_user
+        _restrict_to_current_user(d)
+        _restrict_to_current_user(f)
+    except Exception:
+        pass
     return f
 
 
@@ -371,7 +412,11 @@ class CloudSync:
                 return None
             raw = entry.get("content")
             if raw is None:                      # too big -> must fetch raw_url
-                raw_resp = _request(str(entry.get("raw_url") or ""))
+                raw_url = str(entry.get("raw_url") or "")
+                if not _is_allowed_raw_url(raw_url):
+                    log.warning("refusing untrusted gist raw_url host: %r", raw_url[:100])
+                    return None
+                raw_resp = _request(raw_url)
                 return raw_resp                  # best effort
             try:
                 return json.loads(str(raw))

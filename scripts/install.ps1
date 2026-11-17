@@ -27,7 +27,7 @@ if (-not $builtExe) { Pop-Location; Write-Host "No ClickShift EXE found in dist\
 $installedExe = Join-Path $dest $builtExe.Name
 Copy-Item $builtExe.FullName $installedExe -Force
 Start-Process -FilePath $installedExe -ArgumentList "install" -Wait
-Start-Process -FilePath $installedExe   # launches tray daemon now
+Start-Process -FilePath $installedExe -ArgumentList "run"   # launches tray daemon now
 
 Pop-Location
 Write-Host ""

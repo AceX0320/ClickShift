@@ -376,7 +376,8 @@ def _merge_shaded_line_tables(xml: bytes) -> tuple[bytes, int]:
     paragraphs) into one full-width shaded cell. Returns (xml, merged_count)."""
     etree: Any = importlib.import_module("lxml.etree")
     w = "{%s}" % _W_NS
-    root = etree.fromstring(xml)
+    parser = etree.XMLParser(resolve_entities=False, no_network=True, huge_tree=False)
+    root = etree.fromstring(xml, parser=parser)
 
     def ival(el: Any, attr: str = "w") -> int:
         if el is None:
@@ -483,12 +484,43 @@ def _merge_shaded_line_tables(xml: bytes) -> tuple[bytes, int]:
     return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True), merged
 
 
+_MAX_ZIP_ENTRY_BYTES = 50 * 1024 * 1024
+_MAX_ZIP_TOTAL_BYTES = 500 * 1024 * 1024
+_MAX_ZIP_ENTRIES = 5000
+
+
+def _zip_read_bounded(z: zipfile.ZipFile, name: str, max_bytes: int = _MAX_ZIP_ENTRY_BYTES) -> bytes:
+    """Safely read a ZIP member up to ``max_bytes`` (guards against zip bombs)."""
+    info = z.getinfo(name)
+    if info.file_size > max_bytes:
+        raise ValueError(f"ZIP entry '{name}' exceeds size limit ({info.file_size} > {max_bytes})")
+    chunks: list[bytes] = []
+    total = 0
+    with z.open(info, "r") as stream:
+        while True:
+            chunk = stream.read(min(1024 * 1024, (max_bytes + 1) - total))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(f"ZIP entry '{name}' exceeded decompressed size cap ({max_bytes} bytes)")
+            chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _safe_xml_fromstring(data: bytes) -> ET.Element:
+    """Parse XML bytes rejecting DTD/ENTITY declarations."""
+    if b"<!ENTITY" in data[:16384].upper() or b"<!DOCTYPE" in data[:16384].upper():
+        raise ValueError("Refusing XML with DTD/ENTITY declarations")
+    return ET.fromstring(data)
+
+
 def _postprocess_pdf2docx(dst: Path) -> None:
     """Rewrite word/document.xml in-place with layout clean-ups (best effort)."""
     tmp_name: Optional[str] = None
     try:
         with zipfile.ZipFile(dst) as zin:
-            xml = zin.read("word/document.xml")
+            xml = _zip_read_bounded(zin, "word/document.xml", _MAX_ZIP_ENTRY_BYTES)
             new_xml, merged = _merge_shaded_line_tables(xml)
             if not merged:
                 return
@@ -496,7 +528,11 @@ def _postprocess_pdf2docx(dst: Path) -> None:
             os.close(fd)
             with zipfile.ZipFile(tmp_name, "w", zipfile.ZIP_DEFLATED) as zout:
                 for item in zin.infolist():
-                    data = new_xml if item.filename == "word/document.xml" else zin.read(item.filename)
+                    data = (
+                        new_xml
+                        if item.filename == "word/document.xml"
+                        else _zip_read_bounded(zin, item.filename, _MAX_ZIP_ENTRY_BYTES * 2)
+                    )
                     zout.writestr(item, data)
         os.replace(tmp_name, str(dst))
         tmp_name = None
@@ -555,33 +591,53 @@ _LO_FILTERS = {
 }
 
 
+_LO_XCU_HARDENED = (
+    '<?xml version="1.0" encoding="UTF-8"?>\n'
+    '<oor:items xmlns:oor="http://openoffice.org/2001/registry" '
+    'xmlns:xs="http://www.w3.org/2001/XMLSchema" '
+    'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">\n'
+    '<item oor:path="/org.openoffice.Office.Common/Security/Scripting">'
+    '<prop oor:name="BlockUntrustedRefererLinks" oor:op="fuse">'
+    '<value>true</value></prop></item>\n'
+    '<item oor:path="/org.openoffice.Office.Common/Security/Scripting">'
+    '<prop oor:name="DisableMacrosExecution" oor:op="fuse">'
+    '<value>true</value></prop></item>\n'
+    '</oor:items>\n'
+)
+
+
 def lo_convert(src: Path, dst: Path, extra: Optional[list[str]] = None) -> None:
     if not BACKENDS.libreoffice:
         raise RuntimeError("LibreOffice not found")
     outdir = dst.parent
+    src_resolved = Path(src).resolve()
     dst_ext = dst.suffix.lstrip(".").lower()
-    src_ext = src.suffix.lstrip(".").lower()
+    src_ext = src_resolved.suffix.lstrip(".").lower()
     filt = _LO_FILTERS.get(dst_ext)
-    prof_dir = Path(tempfile.gettempdir()) / f"clickshift_lo_profile_{os.getpid()}_{threading.get_ident()}"
-    prof_uri = prof_dir.resolve().as_uri()
-    args = [
-        BACKENDS.libreoffice, "--headless", "--norestore", "--nologo", "--nofirststartwizard",
-        f"-env:UserInstallation={prof_uri}",
-    ]
-    # Crucial for PDF -> DOCX/ODT/RTF/TXT/HTML: force LibreOffice Writer import
-    # instead of Draw (which rejects MS Word 2007 XML export with error 207).
-    if src_ext == "pdf" and dst_ext in ("docx", "doc", "odt", "rtf", "txt", "html", "htm"):
-        args.append("--infilter=writer_pdf_import")
-    elif src_ext == "pdf" and dst_ext in ("pptx", "ppt", "odp"):
-        args.append("--infilter=impress_pdf_import")
-    args += [
-        "--convert-to", (f"{dst_ext}:{filt}" if filt else dst_ext),
-    ]
-    if extra:
-        args[-1] += ": " + ", ".join(extra)
-    args += ["--outdir", str(outdir), str(src)]
-    proc = subprocess.run(args, capture_output=True, timeout=300)
-    produced = outdir / (src.stem + dst.suffix)
+    with tempfile.TemporaryDirectory(prefix="clickshift_lo_") as prof_tmp:
+        prof_dir = Path(prof_tmp)
+        user_dir = prof_dir / "user"
+        user_dir.mkdir(parents=True, exist_ok=True)
+        (user_dir / "registrymodifications.xcu").write_text(_LO_XCU_HARDENED, encoding="utf-8")
+        prof_uri = prof_dir.resolve().as_uri()
+        args = [
+            BACKENDS.libreoffice, "--headless", "--norestore", "--nologo", "--nofirststartwizard",
+            f"-env:UserInstallation={prof_uri}",
+        ]
+        # Crucial for PDF -> DOCX/ODT/RTF/TXT/HTML: force LibreOffice Writer import
+        # instead of Draw (which rejects MS Word 2007 XML export with error 207).
+        if src_ext == "pdf" and dst_ext in ("docx", "doc", "odt", "rtf", "txt", "html", "htm"):
+            args.append("--infilter=writer_pdf_import")
+        elif src_ext == "pdf" and dst_ext in ("pptx", "ppt", "odp"):
+            args.append("--infilter=impress_pdf_import")
+        args += [
+            "--convert-to", (f"{dst_ext}:{filt}" if filt else dst_ext),
+        ]
+        if extra:
+            args[-1] += ": " + ", ".join(extra)
+        args += ["--outdir", str(outdir), str(src_resolved)]
+        proc = subprocess.run(args, capture_output=True, timeout=300)
+    produced = outdir / (src_resolved.stem + dst.suffix)
     if produced.exists() and produced != dst:
         produced.replace(dst)
     if not dst.exists():
@@ -652,6 +708,11 @@ class _OfficeStaWorker:
             app.DisplayAlerts = False
         except Exception:
             pass
+        if _office_disable_macros_enabled():
+            try:
+                app.AutomationSecurity = 3  # msoAutomationSecurityForceDisable
+            except Exception:
+                pass
         return app
 
     def _quit_app(self, app: Any) -> None:
@@ -721,10 +782,81 @@ class _OfficeComPool:
 _OFFICE_POOL = _OfficeComPool()
 
 
+_RELS_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+_RTF_UNSAFE_RE = re.compile(
+    br"(?is)(?:\\\*\\template\b|\\template\b|\bDDEAUTO\b|\bINCLUDETEXT\b)"
+)
+_OFFICE_ALLOWED_DST = set(_FILEFORMAT) | {"doc", "xls", "ppt", "odt", "ods", "odp", "csv"}
+
+
+def _office_disable_macros_enabled() -> bool:
+    try:
+        from . import monitor
+        return bool(monitor.load_config().get("office_disable_macros", True))
+    except Exception:
+        return True
+
+
+def _is_unsafe_external_rel(rel_type: str, target: str) -> bool:
+    t = (target or "").strip()
+    tl = t.lower()
+    if t.startswith(("\\\\", "//")) or tl.startswith("file:"):
+        return True
+    return not rel_type.lower().endswith("/hyperlink")
+
+
+def _sanitize_ooxml_for_com(src: Path, tmp_dir: Path) -> Path:
+    """Strip external templates/links from OOXML `.rels` before opening in Office COM."""
+    if src.suffix.lower() not in (".docx", ".xlsx", ".pptx") or not zipfile.is_zipfile(src):
+        return src
+    rewrites: dict[str, bytes] = {}
+    with zipfile.ZipFile(src, "r") as zin:
+        infos = zin.infolist()
+        if len(infos) > _MAX_ZIP_ENTRIES:
+            raise ValueError("OOXML archive exceeds maximum entry count")
+        for info in infos:
+            if not info.filename.lower().endswith(".rels"):
+                continue
+            raw = _zip_read_bounded(zin, info.filename, 10 * 1024 * 1024)
+            root = _safe_xml_fromstring(raw)
+            changed = False
+            for rel in list(root):
+                if (rel.get("TargetMode") or "").strip().lower() != "external":
+                    continue
+                if _is_unsafe_external_rel(rel.get("Type") or "", rel.get("Target") or ""):
+                    root.remove(rel)
+                    changed = True
+            if changed:
+                ET.register_namespace("", _RELS_NS)
+                rewrites[info.filename] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+        if not rewrites:
+            return src
+        sanitized = tmp_dir / src.name
+        with zipfile.ZipFile(sanitized, "w", zipfile.ZIP_DEFLATED) as zout:
+            for info in infos:
+                data = rewrites[info.filename] if info.filename in rewrites else _zip_read_bounded(zin, info.filename, _MAX_ZIP_ENTRY_BYTES * 2)
+                zout.writestr(info, data)
+    return sanitized
+
+
+def _check_rtf_for_com(src: Path) -> None:
+    if src.suffix.lower() != ".rtf":
+        return
+    try:
+        with open(src, "rb") as fh:
+            head = fh.read(16 * 1024 * 1024)
+    except OSError:
+        return
+    if _RTF_UNSAFE_RE.search(head):
+        raise RuntimeError("Refusing unsafe external template/DDE reference in RTF via Office COM")
+
+
 def conv_office_com(src: Path, dst: Path) -> None:
     if not IS_WINDOWS:
         raise RuntimeError("Office COM requires Windows")
     ext = dst.suffix.lstrip(".").lower()
+    if ext not in _OFFICE_ALLOWED_DST:
+        raise RuntimeError(f"Unsupported Office COM target extension: .{ext}")
     if src.suffix.lstrip(".").lower() in OFFICE_SHEET_IN and ext in ("xlsx", "pdf", "csv", "xls"):
         app_name = "excel"
     elif src.suffix.lstrip(".").lower() in OFFICE_SLIDE_IN and ext in ("pptx", "pdf", "ppt"):
@@ -734,56 +866,65 @@ def conv_office_com(src: Path, dst: Path) -> None:
     progid = BACKENDS.office_app.get(app_name)
     if not progid:
         raise RuntimeError(f"Microsoft {app_name.title()} not installed")
+    _check_rtf_for_com(src)
     target = Path(dst)
     if target.exists():
         target = _unique(target)
     dst_abs = str(target.resolve())
-    src_abs = str(src.resolve())
 
-    def _do_convert(app: Any) -> None:
-        try:
-            app.DisplayAlerts = 0  # wdAlertsNone
-        except Exception:
-            pass
-        if app_name == "word":
-            doc = app.Documents.Open(
-                src_abs,
-                ConfirmConversions=False,
-                ReadOnly=True,
-                AddToRecentFiles=False,
-                Visible=False,
-                NoEncodingDialog=True,
-            )
-            try:
-                fmt = _FILEFORMAT.get(ext)
-                if ext == "pdf":
-                    doc.ExportAsFixedFormat(dst_abs, 17)  # wdExportFormatPDF
-                elif fmt is not None:
-                    doc.SaveAs2(dst_abs, FileFormat=fmt)
-                else:
-                    doc.SaveAs2(dst_abs)
-            finally:
-                doc.Close(SaveChanges=False)
-        elif app_name == "excel":
-            wb = app.Workbooks.Open(src_abs, ReadOnly=True)
-            try:
-                if ext == "pdf":
-                    wb.ExportAsFixedFormat(-1, dst_abs)  # xlTypePDF
-                else:
-                    wb.SaveAs(dst_abs, FileFormat=_FILEFORMAT.get(ext, 51))
-            finally:
-                wb.Close(SaveChanges=False)
-        else:  # powerpoint
-            pres = app.Presentations.Open(src_abs, WithWindow=False)
-            try:
-                if ext == "pdf":
-                    pres.SaveAs(dst_abs, 32)  # ppSaveAsPDF
-                else:
-                    pres.SaveAs(dst_abs, _FILEFORMAT.get(ext, 24))
-            finally:
-                pres.Close()
+    with tempfile.TemporaryDirectory(prefix="clickshift_com_") as tmp_dir:
+        safe_src = _sanitize_ooxml_for_com(src.resolve(), Path(tmp_dir))
+        src_abs = str(safe_src.resolve())
 
-    _OFFICE_POOL.run(app_name, progid, _do_convert)
+        def _do_convert(app: Any) -> None:
+            try:
+                app.DisplayAlerts = 0  # wdAlertsNone
+            except Exception:
+                pass
+            if _office_disable_macros_enabled():
+                try:
+                    app.AutomationSecurity = 3  # msoAutomationSecurityForceDisable
+                except Exception:
+                    pass
+            if app_name == "word":
+                doc = app.Documents.Open(
+                    src_abs,
+                    ConfirmConversions=False,
+                    ReadOnly=True,
+                    AddToRecentFiles=False,
+                    Visible=False,
+                    NoEncodingDialog=True,
+                )
+                try:
+                    fmt = _FILEFORMAT.get(ext)
+                    if ext == "pdf":
+                        doc.ExportAsFixedFormat(dst_abs, 17)  # wdExportFormatPDF
+                    elif fmt is not None:
+                        doc.SaveAs2(dst_abs, FileFormat=fmt)
+                    else:
+                        doc.SaveAs2(dst_abs)
+                finally:
+                    doc.Close(SaveChanges=False)
+            elif app_name == "excel":
+                wb = app.Workbooks.Open(src_abs, UpdateLinks=0, ReadOnly=True, IgnoreReadOnlyRecommended=True)
+                try:
+                    if ext == "pdf":
+                        wb.ExportAsFixedFormat(-1, dst_abs)  # xlTypePDF
+                    else:
+                        wb.SaveAs(dst_abs, FileFormat=_FILEFORMAT.get(ext, 51))
+                finally:
+                    wb.Close(SaveChanges=False)
+            else:  # powerpoint
+                pres = app.Presentations.Open(src_abs, WithWindow=False)
+                try:
+                    if ext == "pdf":
+                        pres.SaveAs(dst_abs, 32)  # ppSaveAsPDF
+                    else:
+                        pres.SaveAs(dst_abs, _FILEFORMAT.get(ext, 24))
+                finally:
+                    pres.Close()
+
+        _OFFICE_POOL.run(app_name, progid, _do_convert)
     out_file = Path(dst_abs)
     if not out_file.exists():
         raise RuntimeError("Office COM produced no output")
@@ -995,17 +1136,15 @@ def conv_text_generic(src: Path, dst: Path) -> None:
 _MD_HEURISTIC = re.compile(r"^(#{1,6}\s|[*-]\s|\d+.\s|>\s|`|\*\*)", re.M)
 
 
-def conv_text_to_docx(src: Path, dst: Path) -> None:
+def _write_text_to_docx(text: str, dst: Path, md: bool) -> None:
     docx: Any = importlib.import_module("docx")
     docx_shared: Any = importlib.import_module("docx.shared")
     Pt = docx_shared.Pt
-    text, _ = _read_text_auto(src)
     lines = text.splitlines()
     d = docx.Document()
     style = d.styles["Normal"]
     style.font.name = "Calibri"
     style.font.size = Pt(11)
-    md = src.suffix.lstrip(".").lower() in ("md", "markdown") or bool(_MD_HEURISTIC.search(text[:4000]))
     in_code = False
     code_buf: list[str] = []
     for line in lines:
@@ -1038,6 +1177,12 @@ def conv_text_to_docx(src: Path, dst: Path) -> None:
     d.save(dst)
 
 
+def conv_text_to_docx(src: Path, dst: Path) -> None:
+    text, _ = _read_text_auto(src)
+    md = src.suffix.lstrip(".").lower() in ("md", "markdown") or bool(_MD_HEURISTIC.search(text[:4000]))
+    _write_text_to_docx(text, dst, md=md)
+
+
 def _add_rich_md_paragraph(doc, line: str, md: bool) -> None:
     p = doc.add_paragraph()
     if not md or ("**" not in line and "`" not in line):
@@ -1062,15 +1207,24 @@ def conv_html_to_docx(src: Path, dst: Path) -> None:
 def conv_epub_extract(src: Path, dst: Path) -> None:
     texts: list[str] = []
     with zipfile.ZipFile(src) as z:
-        names = [n for n in z.namelist() if n.lower().endswith((".xhtml", ".html", ".htm"))]
+        all_infos = z.infolist()
+        if len(all_infos) > _MAX_ZIP_ENTRIES:
+            raise ValueError(f"EPUB archive exceeds maximum entries ({len(all_infos)} > {_MAX_ZIP_ENTRIES})")
+        name_set = {i.filename for i in all_infos}
+        names = [n for n in name_set if n.lower().endswith((".xhtml", ".html", ".htm"))]
+        total_read = 0
         # respect spine order when possible
         try:
-            root = ET.fromstring(z.read("META-INF/container.xml"))
+            container_bytes = _zip_read_bounded(z, "META-INF/container.xml", _MAX_ZIP_ENTRY_BYTES)
+            total_read += len(container_bytes)
+            root = _safe_xml_fromstring(container_bytes)
             rootfiles = root.findall(".//{urn:oasis:names:tc:opendocument:xmlns:container}rootfile")
             opf_path = rootfiles[0].get("full-path") if rootfiles else None
             if opf_path:
                 opf_dir = str(Path(opf_path).parent)
-                opf = ET.fromstring(z.read(opf_path))
+                opf_bytes = _zip_read_bounded(z, opf_path, _MAX_ZIP_ENTRY_BYTES)
+                total_read += len(opf_bytes)
+                opf = _safe_xml_fromstring(opf_bytes)
                 ns = {"p": "http://www.idpf.org/2007/opf", "c": "http://www.idpf.org/2007/opf"}
                 manifest: dict[str, str] = {}
                 for it in opf.findall(".//p:manifest/p:item", ns):
@@ -1084,12 +1238,19 @@ def conv_epub_extract(src: Path, dst: Path) -> None:
                     href = manifest.get(idref) if idref else None
                     if href:
                         ordered.append((opf_dir + "/" + href).replace("\\", "/").lstrip("./"))
-                names = [n for n in ordered if n in z.namelist()] or names
+                names = [n for n in ordered if n in name_set] or names
+        except ValueError:
+            raise
         except Exception:
             pass
         for n in sorted(names):
+            remaining = _MAX_ZIP_TOTAL_BYTES - total_read
+            if remaining <= 0:
+                raise ValueError("EPUB exceeded maximum cumulative decompressed size")
             try:
-                html = z.read(n).decode("utf-8", errors="replace")
+                raw_entry = _zip_read_bounded(z, n, min(_MAX_ZIP_ENTRY_BYTES, remaining))
+                total_read += len(raw_entry)
+                html = raw_entry.decode("utf-8", errors="replace")
             except KeyError:
                 continue
             html = re.sub(r"(?is)<(script|style).+?</\1>", " ", html)
@@ -1103,10 +1264,7 @@ def conv_epub_extract(src: Path, dst: Path) -> None:
     joined = "\n\n\n".join(texts) + "\n"
     ext = dst.suffix.lstrip(".").lower()
     if ext in ("docx",):
-        tmp = Path(tempfile.mkstemp(suffix=".txt")[1])
-        tmp.write_text(joined, encoding="utf-8")
-        conv_text_to_docx(tmp, dst)
-        tmp.unlink(missing_ok=True)
+        _write_text_to_docx(joined, dst, md=bool(_MD_HEURISTIC.search(joined[:4000])))
     elif ext in ("html", "htm"):
         body = _html_mod.escape(joined)
         dst.write_text(f"<!DOCTYPE html><html><head><meta charset='utf-8'></head>"
@@ -1150,7 +1308,7 @@ def _image_to_png_stream(src: Path) -> tuple[io.BytesIO, int, int]:
 
 
 def conv_images_to_pdf(srcs: list[Path], dst: Path) -> None:
-    """Combine one or more images (in exact order) into a multi-page PDF."""
+    """Combine one or more images (in exact order) into a multi-page PDF using O(1) RAM."""
     if not srcs:
         raise ValueError("No images provided")
     if not BACKENDS.pillow:
@@ -1158,14 +1316,43 @@ def conv_images_to_pdf(srcs: list[Path], dst: Path) -> None:
             lo_convert(srcs[0], dst)
             return
         raise RuntimeError("Pillow is required to combine images into PDF")
+    if BACKENDS.pymupdf:
+        fitz: Any = importlib.import_module("fitz")
+        doc = fitz.open()
+        try:
+            for p in srcs:
+                im = _load_transposed_rgb(p)
+                buf = io.BytesIO()
+                try:
+                    w_px, h_px = im.size
+                    w_pt = max(1.0, float(w_px) * 72.0 / 200.0)
+                    h_pt = max(1.0, float(h_px) * 72.0 / 200.0)
+                    if p.suffix.lower() in (".jpg", ".jpeg"):
+                        im.save(buf, format="JPEG", quality=95, subsampling=0)
+                    else:
+                        im.save(buf, format="PNG")
+                    page = doc.new_page(width=w_pt, height=h_pt)
+                    page.insert_image(page.rect, stream=buf.getvalue())
+                finally:
+                    buf.close()
+                    im.close()
+            doc.save(str(dst), deflate=True, garbage=3)
+        finally:
+            doc.close()
+        return
+
     pages = [_load_transposed_rgb(p) for p in srcs]
-    pages[0].save(
-        dst,
-        "PDF",
-        resolution=200.0,
-        save_all=True,
-        append_images=pages[1:],
-    )
+    try:
+        pages[0].save(
+            dst,
+            "PDF",
+            resolution=200.0,
+            save_all=True,
+            append_images=pages[1:],
+        )
+    finally:
+        for pg in pages:
+            pg.close()
 
 
 def conv_image_to_pdf(src: Path, dst: Path) -> None:
@@ -2863,12 +3050,16 @@ def _routes_for(src_ext: str, dst_ext: str) -> list[Route]:
             add("office-com", conv_office_com, 45)
         add("libreoffice", conv_libreoffice, 70)
     else:
-        # last-resort generic chain
-        if s in TEXT_EXTS and d in TEXT_EXTS:
-            add("text-passthru", conv_text_generic, 50)
-        add("libreoffice", conv_libreoffice, 10)
-        if office_available:
-            add("office-com", conv_office_com, 5)
+        known_targets = (
+            IMAGE_EXTS | TEXT_EXTS | OFFICE_DOC_IN | OFFICE_SHEET_IN | OFFICE_SLIDE_IN
+            | {"pdf", "docx", "xlsx", "pptx", "doc", "xls", "ppt", "odt", "ods", "odp", "rtf", "epub", "xps"}
+        )
+        if s in (SUPPORTED_INPUT_EXTS | TEXT_EXTS) and d in known_targets:
+            if s in TEXT_EXTS and d in TEXT_EXTS:
+                add("text-passthru", conv_text_generic, 50)
+            add("libreoffice", conv_libreoffice, 10)
+            if office_available and d in _OFFICE_ALLOWED_DST:
+                add("office-com", conv_office_com, 5)
 
     # prune routes whose deps are missing
     live: list[Route] = []

