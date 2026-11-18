@@ -116,6 +116,7 @@ def test_report_never_breaks_conversion(home, monkeypatch):
 def test_ml_scores_recorded(home, monkeypatch):
     h, monitor, debuglog = home
     monkeypatch.setenv("CLICKSHIFT_DEBUG_REPORTS", "always")
+    monkeypatch.setenv("CLICKSHIFT_DISABLE_CLOUD", "1")
     from clickshift.engine import ConversionEngine
     eng = ConversionEngine(enable_ml=True, history_file=h / "history.jsonl")
     src = Path(monitor.__file__).parent.parent.parent / "README.md"

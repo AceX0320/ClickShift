@@ -957,6 +957,7 @@ def test_paged_images_uses_ranked_pdf_routes(tmp_path, monkeypatch):
     prs.save(src)
 
     monkeypatch.setenv("CLICKSHIFT_HOME", str(tmp_path / "cs_home"))
+    monkeypatch.setenv("CLICKSHIFT_DISABLE_CLOUD", "1")
     monkeypatch.setattr(eng_mod.BACKENDS, "office_app", {})
     monkeypatch.setattr(eng_mod.BACKENDS, "libreoffice", None)
 

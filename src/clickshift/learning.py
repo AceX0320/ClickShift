@@ -316,7 +316,9 @@ class BanditSelector:
         self.history_file = self.data_dir / "history.jsonl"
         self.state_file = self.data_dir / "bandit.json"
         self.median_ms: dict[str, float] = {}       # "src>dst|arm" -> running median-ish
+        self.local_median_ms: dict[str, float] = {} # local-only latencies uploaded to cloud
         self.bandit = _LinearBandit()
+        self.local_bandit = _LinearBandit()         # local-only observations (prevents echo)
         self.cloud: Any = None                      # optional CloudSync (see cloud.py)
         self._io_lock = threading.Lock()
         self._defer_save_depth = 0
@@ -349,6 +351,12 @@ class BanditSelector:
             st = json.loads(self.state_file.read_text(encoding="utf-8"))
             self.bandit.import_state(st.get("bandit", {}))
             self.median_ms = st.get("median_ms", {})
+            if isinstance(st.get("local_bandit"), dict):
+                self.local_bandit.import_state(st["local_bandit"])
+                self.local_median_ms = st.get("local_median_ms", {})
+            else:
+                self.local_bandit.import_state(st.get("bandit", {}))
+                self.local_median_ms = dict(self.median_ms)
         except FileNotFoundError:
             pass
         except Exception:
@@ -358,9 +366,15 @@ class BanditSelector:
         with self._io_lock:
             tmp = self.state_file.with_suffix(f".{threading.get_ident()}.tmp")
             try:
-                tmp.write_text(json.dumps({"bandit": self.bandit.export(),
-                                           "median_ms": dict(self.median_ms)}),
-                               encoding="utf-8")
+                tmp.write_text(
+                    json.dumps({
+                        "bandit": self.bandit.export(),
+                        "median_ms": dict(self.median_ms),
+                        "local_bandit": self.local_bandit.export(),
+                        "local_median_ms": dict(self.local_median_ms),
+                    }),
+                    encoding="utf-8",
+                )
                 tmp.replace(self.state_file)
                 self._dirty = False
             except Exception:
@@ -368,6 +382,84 @@ class BanditSelector:
                     tmp.unlink(missing_ok=True)
                 except Exception:
                     pass
+
+    def export_local_payload(self) -> tuple[dict[str, Any], dict[str, float]]:
+        """Return only locally observed (bandit_arms, median_ms) so remote priors never echo back."""
+        return self.local_bandit.export(), dict(self.local_median_ms)
+
+    def merge_remote_state(
+        self,
+        remote_bandit: dict[str, Any],
+        remote_medians: Optional[dict[str, Any]] = None,
+        max_prior_samples: int = 24,
+    ) -> int:
+        """Blend validated remote pooled priors with local observations (preserving local adaptation)."""
+        if not isinstance(remote_bandit, dict):
+            return 0
+        tmp = _LinearBandit(
+            dim=self.bandit.dim,
+            alpha=self.bandit.alpha,
+            ridge=self.bandit.ridge,
+            gamma=self.bandit.gamma,
+        )
+        tmp.import_state(remote_bandit)
+        ridge_I = self.bandit._ridge_I
+        combined: dict[str, Any] = {}
+        with self.local_bandit._lock:
+            loc_A = {k: v.copy() for k, v in self.local_bandit.A.items()}
+            loc_b = {k: v.copy() for k, v in self.local_bandit.b.items()}
+            loc_n = dict(self.local_bandit.n)
+        for arm in set(tmp.A) | set(loc_A):
+            has_rem = arm in tmp.A
+            has_loc = arm in loc_A
+            if has_rem:
+                n_r = tmp.n[arm]
+                if max_prior_samples > 0 and n_r > max_prior_samples:
+                    scale = max_prior_samples / float(n_r)
+                    A_r = (1.0 - scale) * ridge_I + scale * tmp.A[arm]
+                    b_r = tmp.b[arm] * scale
+                    eff_n_r = max_prior_samples
+                else:
+                    A_r = tmp.A[arm]
+                    b_r = tmp.b[arm]
+                    eff_n_r = n_r
+            else:
+                A_r = ridge_I
+                b_r = np.zeros(self.bandit.dim)
+                eff_n_r = 0
+            if has_loc:
+                dA_l = loc_A[arm] - ridge_I
+                db_l = loc_b[arm]
+                n_l = loc_n[arm]
+            else:
+                dA_l = np.zeros_like(ridge_I)
+                db_l = np.zeros(self.bandit.dim)
+                n_l = 0
+            M = 0.5 * ((A_r + dA_l) + (A_r + dA_l).T)
+            if np.linalg.eigvalsh(M).min() <= 1e-6:
+                M = loc_A[arm] if has_loc else A_r
+                b_vec = loc_b[arm] if has_loc else b_r
+                n_tot = n_l if has_loc else eff_n_r
+            else:
+                b_vec = b_r + db_l
+                n_tot = min(self.bandit.MAX_SAMPLES_PER_ARM, eff_n_r + n_l)
+            combined[arm] = {"A": M.tolist(), "b": b_vec.tolist(), "n": n_tot}
+        if combined:
+            self.bandit.import_state(combined)
+        if isinstance(remote_medians, dict):
+            with self._io_lock:
+                for pair, ms in itertools.islice(remote_medians.items(), 2048):
+                    try:
+                        ms_val = float(ms)
+                    except (TypeError, ValueError):
+                        continue
+                    if not (0.0 < ms_val <= 86_400_000.0):
+                        continue
+                    cur = self.median_ms.get(pair)
+                    if cur is None or ms_val < cur:
+                        self.median_ms[pair] = ms_val
+        self._save_state()
+        return len(tmp.A)
 
     # -- API used by engine -------------------------------------------------- #
     def extract_features(self, src: Path, dst_ext: str, src_size: Optional[int] = None) -> Any:
@@ -430,11 +522,16 @@ class BanditSelector:
         reward = (1.0 if ok else -1.0) + max(min(speed_reward, 1.0), -1.0) * 0.5
 
         self.bandit.update(arm, x, float(reward))
+        self.local_bandit.update(arm, x, float(reward))
         # exponential moving average of successful latency per pair
         if ok:
             with self._io_lock:
                 prev = self.median_ms.get(key)
                 self.median_ms[key] = elapsed_ms if prev is None else prev * 0.7 + elapsed_ms * 0.3
+                prev_loc = self.local_median_ms.get(key)
+                self.local_median_ms[key] = (
+                    elapsed_ms if prev_loc is None else prev_loc * 0.7 + elapsed_ms * 0.3
+                )
 
         # opportunistic cloud sync (fire-and-forget; only when enabled)
         try:

@@ -1,0 +1,11 @@
+name = "clickshift-cloud"
+main = "src/index.js"
+compatibility_date = "2026-01-01"
+
+[[durable_objects.bindings]]
+name = "CLOUD_POOL"
+class_name = "CloudPoolDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["CloudPoolDO"]

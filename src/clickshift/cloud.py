@@ -85,6 +85,7 @@ def _opt_import(name: str) -> Any:
 np: Any = _opt_import("numpy")
 
 DEFAULT_GIST_ID = "REPLACE_WITH_YOUR_GIST_ID"
+DEFAULT_CLOUD_URL = "https://clickshift-cloud.clickshift.workers.dev"
 API_ROOT = "https://api.github.com"
 
 # ---- security limits --------------------------------------------------------
@@ -153,6 +154,18 @@ def load_cloud_config() -> dict[str, Any]:
         full = load_config()
         cfg = {k: full.get(k, DEFAULT_CONFIG.get(k)) for k in DEFAULT_CONFIG
                if k.startswith("cloud_")}
+        for extra in ("cloud_opt_out", "cloud_last_pull", "cloud_last_push", "cloud_clock", "cloud_last_sha256", "cloud_client_id"):
+            if extra in full:
+                cfg[extra] = full[extra]
+        if (
+            DEFAULT_CLOUD_URL
+            and not cfg.get("cloud_opt_out")
+            and not cfg.get("cloud_url")
+            and (cfg.get("cloud_gist_id") or DEFAULT_GIST_ID) in ("", DEFAULT_GIST_ID)
+        ):
+            cfg["cloud_mode"] = "url"
+            cfg["cloud_url"] = DEFAULT_CLOUD_URL
+            cfg["cloud_enabled"] = True
     except Exception:
         pass
     return cfg
@@ -360,7 +373,7 @@ class CloudSync:
         cfg = cfg if cfg is not None else load_cloud_config()
         self.cfg: dict[str, Any] = cfg
         self.mode = str(cfg.get("cloud_mode") or "url").lower()
-        self.url = str(cfg.get("cloud_url") or "").strip()
+        self.url = str(cfg.get("cloud_url") or DEFAULT_CLOUD_URL).strip()
         self.gist_id = str(cfg.get("cloud_gist_id") or DEFAULT_GIST_ID).strip()
         self._token: Optional[str] = token() if cfg.get("cloud_enabled") else None
         self.interval = float(cfg.get("cloud_interval_s", 900))
@@ -382,6 +395,8 @@ class CloudSync:
 
     # -- enabled? ----------------------------------------------------------- #
     def enabled(self) -> bool:
+        if os.environ.get("CLICKSHIFT_DISABLE_CLOUD") == "1":
+            return False
         if not self.cfg.get("cloud_enabled"):
             return False
         if self.mode == "gist":
@@ -392,10 +407,18 @@ class CloudSync:
 
     # -- payload ------------------------------------------------------------ #
     def build_payload(self) -> dict[str, Any]:
-        return {"version": 1,
-                "clock": int(self.cfg.get("cloud_clock", 0)) + 1,
-                "bandit": self.selector.bandit.export(),
-                "median_ms": dict(self.selector.median_ms)}
+        if hasattr(self.selector, "export_local_payload"):
+            arms, medians = self.selector.export_local_payload()
+        else:
+            arms = self.selector.bandit.export()
+            medians = dict(self.selector.median_ms)
+        return {
+            "version": 1,
+            "clock": int(self.cfg.get("cloud_clock", 0)) + 1,
+            "client_id": _contributor_id(self.cfg),
+            "bandit": arms,
+            "median_ms": medians,
+        }
 
     # -- pull --------------------------------------------------------------- #
     def pull(self) -> bool:
@@ -414,18 +437,23 @@ class CloudSync:
             try:
                 digest = hashlib.sha256(
                     json.dumps(state, sort_keys=True).encode("utf-8")).hexdigest()[:16]
-                self.selector.bandit.import_state(state["bandit"])
-                for pair, ms in itertools.islice((state.get("median_ms") or {}).items(), 2048):
-                    try:
-                        ms_val = float(ms)
-                    except (TypeError, ValueError):
-                        continue
-                    if not (0.0 < ms_val <= MAX_LATENCY_MS):
-                        continue
-                    cur = self.selector.median_ms.get(pair)
-                    if cur is None or ms_val < cur:
-                        self.selector.median_ms[pair] = ms_val
-                self.selector._save_state()
+                if hasattr(self.selector, "merge_remote_state"):
+                    self.selector.merge_remote_state(
+                        state["bandit"], state.get("median_ms")
+                    )
+                else:
+                    self.selector.bandit.import_state(state["bandit"])
+                    for pair, ms in itertools.islice((state.get("median_ms") or {}).items(), 2048):
+                        try:
+                            ms_val = float(ms)
+                        except (TypeError, ValueError):
+                            continue
+                        if not (0.0 < ms_val <= MAX_LATENCY_MS):
+                            continue
+                        cur = self.selector.median_ms.get(pair)
+                        if cur is None or ms_val < cur:
+                            self.selector.median_ms[pair] = ms_val
+                    self.selector._save_state()
                 self._set_meta_many({
                     "cloud_last_pull": time.time(),
                     "cloud_clock": int(state.get("clock", 0)),
@@ -471,6 +499,8 @@ class CloudSync:
             return False
         with self._lock:
             payload = self.build_payload()
+            if not payload.get("bandit"):
+                return False
             if self.mode == "gist":
                 ok = self._push_gist(payload)
             else:
@@ -484,9 +514,9 @@ class CloudSync:
             return ok
 
     def _gh_headers(self) -> dict[str, str]:
-        h = {"Authorization": f"Bearer {self.token}"}
+        h: dict[str, str] = {"Accept": "application/vnd.github+json"}
         if self.token:
-            h["Accept"] = "application/vnd.github+json"
+            h["Authorization"] = f"Bearer {self.token}"
         return h
 
     def _push_gist(self, payload: dict[str, Any]) -> bool:

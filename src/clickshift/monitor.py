@@ -152,10 +152,10 @@ DEFAULT_CONFIG = {
     "debug_reports": "off",         # off | onerror | always
     "debug_keep": 200,              # central reports kept in ~/.clickshift/debug/
     # --- shared-learnings cloud sync (opt-in, aggregate stats only) ------ #
-    "cloud_enabled": False,         # enable with: clickshift config cloud_sync=on
-    "cloud_mode": "gist",           # "gist" (zero-backend) or "url" (own server)
+    "cloud_enabled": True,          # shared community ML pool (disable with: cloud_sync=off)
+    "cloud_mode": "url",            # "url" (shared Cloudflare pool) or "gist" (GitHub Gist)
     "cloud_gist_id": "REPLACE_WITH_YOUR_GIST_ID",
-    "cloud_url": "",                # used when cloud_mode=url
+    "cloud_url": "https://clickshift-cloud.clickshift.workers.dev",
     "cloud_interval_s": 900,        # background push/pull cadence
     "cloud_debounce_s": 60,         # min seconds between uploads
     "cloud_pull_on_start": True,

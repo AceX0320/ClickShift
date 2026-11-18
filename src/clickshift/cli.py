@@ -395,18 +395,17 @@ def cmd_stats(args) -> int:
           f"(toggle with `clickshift config ml=off` or CLICKSHIFT_DISABLE_ML=1)")
     # cloud sync status
     try:
-        from .cloud import CloudSync, DEFAULT_GIST_ID
-        cfg = monitor.load_config()
+        from .cloud import CloudSync, DEFAULT_GIST_ID, load_cloud_config
+        cfg = load_cloud_config()
         sel_stub = _StubSelector()
         cs = CloudSync(sel_stub, cfg)
         gist_cfgured = (cfg.get("cloud_gist_id") or "") not in ("", DEFAULT_GIST_ID)
         print(f"Cloud learnings sync: {'ON' if cs.enabled() else 'off'}  "
               f"(mode={cs.mode}, endpoint={'set' if cs.enabled() else 'not configured'})")
-        if not cs.enabled() and not gist_cfgured and not cfg.get("cloud_url"):
+        if not cs.enabled() and not gist_cfgured and not cs.url:
             print("  -> share your ML improvements with other users:")
-            print("     ClickShift.exe config cloud_gist=<your-gist-id>")
-            print("     setx CLICKSHIFT_CLOUD_TOKEN <github-pat-with-gist-scope>")
-            print("     ClickShift.exe config cloud_sync=on   (see README: Shared learnings)")
+            print("     ClickShift.exe config cloud_url=https://<your-cloud-worker-url> cloud_sync=on")
+            print("     (or Gist mode: cloud_gist=<id> + CLICKSHIFT_CLOUD_TOKEN + cloud_sync=on)")
         elif cs.cfg.get("cloud_last_pull"):
             print(f"  last pull: {time.strftime('%Y-%m-%d %H:%M', time.localtime(cs.cfg['cloud_last_pull']))} "
                   f" | last push: "
@@ -468,7 +467,17 @@ def cmd_config(args) -> int:
         elif k == "debug_keep":
             cfg["debug_keep"] = max(10, int(float(v)))
         elif k in ("cloud_sync", "cloud", "cloud_enabled"):
-            cfg["cloud_enabled"] = v.lower() in ("1", "on", "true", "yes")
+            on = v.lower() in ("1", "on", "true", "yes")
+            cfg["cloud_enabled"] = on
+            cfg["cloud_opt_out"] = not on
+            if on:
+                from .cloud import DEFAULT_CLOUD_URL, DEFAULT_GIST_ID
+                has_url = bool((cfg.get("cloud_url") or DEFAULT_CLOUD_URL).strip())
+                has_gist = (cfg.get("cloud_gist_id") or "") not in ("", DEFAULT_GIST_ID)
+                if not has_url and not has_gist:
+                    print("note: cloud_sync=on saved, but no endpoint is set yet. "
+                          "Run `ClickShift.exe config cloud_url=https://...` "
+                          "or `cloud_gist=<id>` to activate syncing.")
         elif k == "cloud_gist":
             cfg["cloud_gist_id"] = v.strip()
             cfg["cloud_mode"] = "gist"

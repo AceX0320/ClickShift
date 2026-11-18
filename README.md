@@ -47,39 +47,35 @@ ClickShift.exe stats
 
 Cold start falls back to static weights; exploration bonus guarantees the model keeps testing alternatives, but a failing arm is demoted instantly and the engine transparently retries the next backend — so results stay correct even mid-learning.
 
-## Shared learnings (optional cloud sync) — "send the improvements somewhere"
+## Shared learnings (community ML cloud sync)
 
-ClickShift can **pool everyone's ML learnings** so that a person who downloads the
-tool later starts with an already-trained model instead of a cold one. This is
-**opt-in and privacy-safe**: only aggregate numbers are exchanged (learned
-weight matrices + median latencies per format pair). *Never* file names, paths
-or contents. The conversion itself always stays 100% local.
+ClickShift **pools everyone's aggregate ML learnings** automatically so a brand-new
+install starts warm with already-learned backend rankings instead of exploring cold.
+This is **privacy-safe**: only aggregate numbers are exchanged (learned weight matrices
++ median latencies per format pair). *Never* file names, paths, or document contents.
+The conversion itself always runs 100% locally.
 
-### Recommended setup: a community GitHub Gist (zero backend needed)
+By default, ClickShift connects automatically to the shared community Cloudflare endpoint
+(`https://clickshift-cloud.clickshift.workers.dev`) with zero tokens or configuration
+required. Every conversion (debounced to <=1 upload/minute) contributes your anonymous
+aggregate stats, and the background daemon pulls updated community rankings back into
+your local bandit. Check state anytime with `ClickShift.exe stats`, or turn it off
+anytime with `ClickShift.exe config cloud_sync=off`.
 
-1. **Owner (you), once:** create a secret gist containing one small JSON file
-   (`merged.json` = `{"version":1,"clock":0,"bandit":{},"median_ms":{}}`),
-   note its ID from the URL, then in repo settings add two GitHub Secrets:
-   `CLICKSHIFT_GIST_ID` and `CLICKSHIFT_CLOUD_TOKEN` (fine-grained PAT with `gist`
-   scope). The included workflow `.github/workflows/cloud-merge-cron.yml`
-   runs every 6 h and merges all `contrib-*.json` files into `merged.json`.
-2. Ship the EXE with defaults baked in, or let each user configure it:
+### Self-hosting (optional)
 
-```bat
-ClickShift.exe config cloud_gist=<the-gist-id>
-setx CLICKSHIFT_CLOUD_TOKEN <your-pat-with-gist-scope>
-ClickShift.exe config cloud_sync=on
-```
-
-That's it. Every conversion now (debounced to ≤1 upload/minute) pushes your
-aggregate learning as `contrib-<clientid>.json`, and periodically pulls the
-pooled `merged.json` back into your local bandit — so you also benefit from
-everyone else's machines. Check state any time with `ClickShift.exe stats`
-("Cloud learnings sync: ON/OFF, last pull/push").
-
-Alternative: run any tiny REST endpoint speaking `GET /state` + `PUT /state`
-(Cloudflare Worker/KV, S3, nginx+file…) and use `config cloud_url=https://...`
-instead of the gist.
+1. **Cloudflare Worker + Durable Object (multi-user):** deploy [`cloud_worker/`](cloud_worker/README.md)
+   to your own Cloudflare account (`npx wrangler deploy`) and point ClickShift at it:
+   ```bat
+   ClickShift.exe config cloud_url=https://<your-worker>.workers.dev cloud_sync=on
+   ```
+2. **GitHub Gist (single-owner/personal sync):** create a secret gist with `merged.json`,
+   optionally schedule `.github/workflows/cloud-merge-cron.yml`, and run:
+   ```bat
+   ClickShift.exe config cloud_gist=<the-gist-id>
+   setx CLICKSHIFT_CLOUD_TOKEN <your-pat-with-gist-scope>
+   ClickShift.exe config cloud_sync=on
+   ```
 
 Merge rules (`src/clickshift/cloud.py::merge_states`): sample counts sum, both
 covariance matrices `A` and reward vectors `b` average across contributors

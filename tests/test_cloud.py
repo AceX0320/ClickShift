@@ -66,14 +66,20 @@ def test_selector_records_and_warms(tmp_path, monkeypatch):
     assert sel2.bandit.n["pdf>docx|pdf2docx"] == 20   # starts warm, no cold exploration
 
 
-def test_cloudsync_disabled_by_default(tmp_path, monkeypatch):
+def test_cloudsync_enabled_by_default_with_opt_out(tmp_path, monkeypatch):
     monkeypatch.setenv("CLICKSHIFT_HOME", str(tmp_path))
+    monkeypatch.setattr(cloud, "_request", lambda *a, **k: {})
     from clickshift.monitor import load_config
     sel = BanditSelector(history_file=tmp_path / "history.jsonl")
     cs = cloud.CloudSync(sel, load_config())
-    assert not cs.enabled()               # opt-in only
-    cs.start()                            # must be a harmless no-op
+    assert cs.enabled()                   # shared pool active by default
+    assert cs.mode == "url"
+    assert cs.url == cloud.DEFAULT_CLOUD_URL
+    cs.start()
     cs.stop()
+
+    monkeypatch.setenv("CLICKSHIFT_DISABLE_CLOUD", "1")
+    assert not cs.enabled()               # env kill-switch disables sync cleanly
 
 
 def test_cloudsync_pull_merges_local(tmp_path, monkeypatch):
@@ -116,11 +122,12 @@ def test_push_payload_has_no_filenames(tmp_path, monkeypatch):
 
 def test_engine_attaches_cloud(tmp_path, monkeypatch):
     monkeypatch.setenv("CLICKSHIFT_HOME", str(tmp_path))
+    monkeypatch.setattr(cloud, "_request", lambda *a, **k: {})
     from clickshift.engine import ConversionEngine
     eng = ConversionEngine(enable_ml=True, history_file=tmp_path / "history.jsonl")
     assert eng._selector is not None
-    assert eng.cloud is not None               # CloudSync object exists...
-    assert not eng.cloud.enabled()             # ...but stays off unless configured
+    assert eng.cloud is not None               # CloudSync object attached & enabled
+    assert eng.cloud.enabled()
     eng.shutdown()
 
 
@@ -228,3 +235,56 @@ def test_merge_preserves_accumulated_reward_scale():
     st["bandit"]["pdf>docx|pdf2docx"]["b"][0] = 15.0  # 20 runs with ~0.75 avg reward
     m = cloud.merge_states([st])
     assert m["bandit"]["pdf>docx|pdf2docx"]["b"][0] == 15.0
+
+
+def test_pull_caps_remote_prior_and_push_never_echoes_remote(tmp_path, monkeypatch):
+    """Pulling large remote state preserves local observations and never re-uploads remote counts."""
+    monkeypatch.setenv("CLICKSHIFT_HOME", str(tmp_path))
+    sel = BanditSelector(history_file=tmp_path / "history.jsonl")
+    src = tmp_path / "local.pptx"
+    src.write_bytes(b"PK\x03\x04local")
+    sel.record(src, ".pdf", "office-com", 200.0, True)
+    sel.record(src, ".pdf", "office-com", 220.0, True)
+
+    cs = cloud.CloudSync(
+        sel,
+        {"cloud_enabled": True, "cloud_mode": "url", "cloud_url": "https://example.invalid"},
+    )
+    # _gh_headers must never attach an empty Bearer token when unauthenticated
+    assert "Authorization" not in cs._gh_headers()
+
+    large_remote = _mk_state(seed=99, n_updates=500, arm="pptx>pdf|office-com")
+    monkeypatch.setattr(cloud, "_request", lambda *a, **k: large_remote)
+    assert cs.pull() is True
+
+    # Remote prior capped at 24 + 2 local = 26 (not 502)
+    assert sel.bandit.n["pptx>pdf|office-com"] == 26
+    # Push payload must only contain our 2 genuine local updates + random client_id
+    payload = cs.build_payload()
+    assert payload["bandit"]["pptx>pdf|office-com"]["n"] == 2
+    assert len(payload["client_id"]) >= 8
+
+
+def test_default_cloud_url_enables_uncustomized_and_honors_opt_out(tmp_path, monkeypatch):
+    """When DEFAULT_CLOUD_URL is configured, uncustomized installs opt in while explicit off stays off."""
+    monkeypatch.setenv("CLICKSHIFT_HOME", str(tmp_path))
+    monkeypatch.setattr(cloud, "DEFAULT_CLOUD_URL", "https://pool.example.workers.dev")
+    from clickshift.monitor import DEFAULT_CONFIG, save_config
+
+    cfg_legacy = dict(DEFAULT_CONFIG)
+    cfg_legacy["cloud_enabled"] = False
+    cfg_legacy["cloud_mode"] = "gist"
+    cfg_legacy["cloud_url"] = ""
+    save_config(cfg_legacy)
+    loaded = cloud.load_cloud_config()
+    assert loaded["cloud_enabled"] is True
+    assert loaded["cloud_mode"] == "url"
+    assert loaded["cloud_url"] == "https://pool.example.workers.dev"
+
+    cfg_opt_out = dict(DEFAULT_CONFIG)
+    cfg_opt_out["cloud_opt_out"] = True
+    cfg_opt_out["cloud_enabled"] = False
+    save_config(cfg_opt_out)
+    loaded_off = cloud.load_cloud_config()
+    assert loaded_off["cloud_enabled"] is False
+
