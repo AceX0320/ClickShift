@@ -2,13 +2,13 @@
 
 **One EXE. Right-click any document → converted. Learns to get faster.**
 
-> **📥 Direct EXE Download (Latest — v1.0.19):** [**Download `ClickShift-v1.0.19.exe`**](https://github.com/AceX0320/ClickShift/releases/download/v1.0.19/ClickShift-v1.0.19.exe) · [**Latest Release Page**](https://github.com/AceX0320/ClickShift/releases/latest)  
+> **📥 Direct EXE Download (Latest):** [**Download `ClickShift.exe`**](https://github.com/AceX0320/ClickShift/releases/latest/download/ClickShift.exe) · [**Latest Release Page**](https://github.com/AceX0320/ClickShift/releases/latest)
 > *(Or grab the latest CI artifact from [GitHub Actions](https://github.com/AceX0320/ClickShift/actions/workflows/build.yml) / browse [Releases](https://github.com/AceX0320/ClickShift/releases))*
 
 ClickShift is a 100 % local, offline document conversion tool:
 
 * **Both Windows 11 & Classic right-click menus** in Explorer — *"Convert with ClickShift"* cascading submenu + *"Open with"* quick target picker (`--choose`) exposing **all compatible conversion targets** on every document/image type.
-* **Always running** — after the first double-click it registers itself in **Task Manager → Startup apps** and lives in the system tray forever, delegating right-click conversions to a warm local IPC daemon (`127.0.0.1:45829`) for zero cold-start overhead.
+* **Always running & Start Menu ready** — after the first double-click it registers itself in **Task Manager → Startup apps** (`Run` + `StartupApproved\Run`), provides a Start Menu launcher, and lives in the system tray via a Win32 singleton daemon + authenticated loopback IPC (`127.0.0.1`) for minimal cold-start overhead.
 * **Latest-generation output only** — `.doc` never produces legacy Word 97; you get `.docx` (OOXML 2007+), `.xlsx`, `.pptx`, modern image codecs (WebP/AVIF/JPEG XL), UTF-8 text…
 * **Adaptive ML routing** *(the "trick")* — a lightweight contextual bandit (LinUCB) learns from every conversion which backend is fastest/most reliable **on your machine for files like yours**, and re-orders the fallback chain accordingly. Speed improves with use; correctness can never degrade (fallbacks are always kept). If you don't want it: `clickshift config ml=off` or `CLICKSHIFT_DISABLE_ML=1`.
 
@@ -120,27 +120,23 @@ ordering — so concurrent users can never corrupt the pool.
 
 ## Download the EXE (no clone, no build)
 
-The direct permanent download link for the latest release page is:
+Permanent links that **always point to the newest version** without changing with each release:
 
-```
-https://github.com/AceX0320/ClickShift/releases/latest
-```
-
-* **Direct Download (Latest Release Page):** [https://github.com/AceX0320/ClickShift/releases/latest](https://github.com/AceX0320/ClickShift/releases/latest)
-* **Direct Download (v1.0.19 Pinned):** [https://github.com/AceX0320/ClickShift/releases/download/v1.0.19/ClickShift-v1.0.19.exe](https://github.com/AceX0320/ClickShift/releases/download/v1.0.19/ClickShift-v1.0.19.exe)
+* **Direct EXE Download (Always Latest):** [https://github.com/AceX0320/ClickShift/releases/latest/download/ClickShift.exe](https://github.com/AceX0320/ClickShift/releases/latest/download/ClickShift.exe)
+* **Latest Release Page (Versioned EXE, Checksums & Notes):** [https://github.com/AceX0320/ClickShift/releases/latest](https://github.com/AceX0320/ClickShift/releases/latest)
 * **All Releases:** [https://github.com/AceX0320/ClickShift/releases](https://github.com/AceX0320/ClickShift/releases)
 * **CI Build Artifacts (`ClickShift-windows-exe`):** [https://github.com/AceX0320/ClickShift/actions/workflows/build.yml](https://github.com/AceX0320/ClickShift/actions/workflows/build.yml)
-* `/releases/latest` **always points to the newest published versioned EXE** (`ClickShift-v<version>.exe`). ClickShift checks for new GitHub releases automatically every **12 hours** in the background, updates silently, and leaves a Windows notification showing the old → new version when it restarts.
+* Every release attaches both the versioned `ClickShift-v<version>.exe` and an unversioned `ClickShift.exe` alias so `/releases/latest/download/ClickShift.exe` always downloads the latest build. ClickShift also checks for new GitHub releases automatically every **12 hours** in the background, updates silently, and leaves a Windows notification showing the old → new version when it restarts.
 
 Publishing public releases happens on version tags (`v*`) via `.github/workflows/release.yml`, while `.github/workflows/build.yml` runs tests and builds downloadable CI test artifacts (`ClickShift-windows-exe`) on every push/PR:
 
-1. Tag and push a version → CI runs the full test suite, compiles the shell extension and `ClickShift-v<version>.exe`, generates `SHA256SUMS.txt` (plus optional ECDSA `.sig`), and publishes assets to the GitHub Release after `release` environment approval:
+1. Tag and push a version → CI runs the full test suite, compiles the shell extension and `ClickShift-v<version>.exe` (plus `ClickShift.exe`), generates `SHA256SUMS.txt` (plus optional ECDSA `.sig`), and publishes assets to the GitHub Release after `release` environment approval:
    ```bat
-   git tag v1.0.19
-   git push origin v1.0.19
+   git tag v<version>
+   git push origin v<version>
    ```
-2. Share `/releases/latest`. Anyone who downloads and double-clicks the
-   EXE gets the self-install (both Windows right-click menus + Task Manager Startup entry).
+2. Share `/releases/latest/download/ClickShift.exe` or `/releases/latest`. Anyone who downloads and double-clicks the
+   EXE gets the self-install (both Windows right-click menus + Start Menu launcher + Task Manager Startup entry).
 
 **"Each EXE downloaded with the latest improvements":** ML learnings are
 deliberately *not* baked into the binary (that would force a re-download every
@@ -197,19 +193,21 @@ ClickShift.exe uninstall                              REM removes startup entry 
 
 ## Repository layout
 ```
-src/clickshift/engine.py     conversion engine + 5-stage PDF->DOCX & newest-gen backend routing
+src/clickshift/formats.py    lightweight format tables & ConversionResult (fast CLI/IPC imports)
+src/clickshift/engine.py     conversion engine + lazy backends, route cache & LibreOffice batching
 src/clickshift/learning.py   10-dim content-aware LinUCB bandit (Sherman-Morrison + discounting)
 src/clickshift/cloud.py      opt-in privacy-safe pooled learnings sync (GitHub Gist / HTTPS)
-src/clickshift/monitor.py    tray daemon, warm IPC, 12h auto-update loop, watch folder, menu installer
+src/clickshift/monitor.py    tray daemon, Win32 singleton, IPC, StartupApproved handling, watch folder
 src/clickshift/cli.py        command line / right-click entry point + native format picker popup
-src/clickshift/updater.py    GitHub silent background & interactive updater + update notifications
+src/clickshift/updater.py    GitHub silent background & interactive updater + ECDSA/SHA256 verification
 src/clickshift/debuglog.py   opt-in per-conversion diagnostic report writer
+src/shell_ext/               Win11 IExplorerCommand shell extension (ClickShiftShell.cpp) & Start launcher
 entry_point.py               frozen-EXE entry (double-click = install + run forever)
 build.py / clickshift.spec   PyInstaller single-file EXE build configuration
 scripts/install.ps1          one-shot Windows setup
 scripts/make_icon.py         generates assets/clickshift.ico
 tests/                       cross-platform tests (engine, ML, cloud sync, daemon, updater, debuglog)
-.github/workflows/           CI: build.yml (tests + EXE artifact + latest release) & release.yml
+.github/workflows/           CI: build.yml (tests + EXE artifact) & release.yml (versioned + latest EXE)
 ```
 
 ## Requirements

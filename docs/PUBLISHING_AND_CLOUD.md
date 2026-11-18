@@ -14,7 +14,7 @@ This guide covers the external configuration steps outside this repository that 
 3. On GitHub (**Settings -> Environments -> New environment -> `release`**):
    * Enable **Required reviewers** (add yourself) so no branch/PR or rogue workflow run can ever sign a release without manual approval.
    * Add an Environment Secret named **`CLICKSHIFT_SIGNING_KEY_B64`** containing the **PRIVATE** key printed by `keygen` (and store a backup offline in a password manager).
-4. Whenever you push a tag (`git tag v1.0.19 && git push origin v1.0.19`), `release.yml` builds the EXE, generates `SHA256SUMS.txt`, signs `ClickShift-v*.exe.sig` after your Environment approval, and attaches all assets cleanly.
+4. Whenever you push a version tag (e.g. `git tag v1.0.23 && git push origin v1.0.23` -> `git tag v<version>`), `release.yml` builds `ClickShift-v<version>.exe` plus the stable `ClickShift.exe` latest alias, generates `SHA256SUMS.txt`, signs `.exe.sig` after your Environment approval, and attaches all assets cleanly.
 
 ---
 

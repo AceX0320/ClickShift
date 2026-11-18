@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to publish (e.g. v1.0.22)"
+        description: "Release tag to publish (e.g. v1.0.23)"
         required: true
-        default: "v1.0.22"
+        default: "v1.0.23"
 
 permissions:
   contents: read
@@ -48,8 +48,14 @@ jobs:
         run: powershell -ExecutionPolicy Bypass -File scripts/build_shell_ext.ps1
       - name: Build versioned ClickShift EXE
         run: python build.py
+      - name: Create unversioned ClickShift.exe alias for permanent latest download URL
+        shell: pwsh
+        run: |
+          $built = Get-ChildItem dist/ClickShift-v*.exe | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $built) { throw "No ClickShift-v*.exe found in dist/" }
+          Copy-Item $built.FullName dist/ClickShift.exe -Force
       - name: Compute SHA256SUMS.txt
-        run: python scripts/sign_release.py sums dist/ClickShift-v*.exe --out dist/SHA256SUMS.txt
+        run: python scripts/sign_release.py sums dist/ClickShift*.exe --out dist/SHA256SUMS.txt
       - name: Record build commit + timestamp
         shell: pwsh
         run: |
@@ -62,7 +68,7 @@ jobs:
         with:
           name: release-staging
           path: |
-            dist/ClickShift-v*.exe
+            dist/ClickShift*.exe
             dist/SHA256SUMS.txt
             dist/build-info.txt
 
@@ -88,7 +94,7 @@ jobs:
           CLICKSHIFT_SIGNING_KEY_B64: ${{ secrets.CLICKSHIFT_SIGNING_KEY_B64 }}
         run: |
           if ($env:CLICKSHIFT_SIGNING_KEY_B64) {
-            Get-ChildItem release-out -Recurse -Filter "ClickShift-v*.exe" | ForEach-Object {
+            Get-ChildItem release-out -Recurse -Filter "ClickShift*.exe" | ForEach-Object {
               python scripts/sign_release.py sign $_.FullName
               if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             }
@@ -100,12 +106,15 @@ jobs:
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: |
-            release-out/**/ClickShift-v*.exe
-            release-out/**/ClickShift-v*.exe.sig
+            release-out/**/ClickShift*.exe
+            release-out/**/ClickShift*.exe.sig
             release-out/**/SHA256SUMS.txt
             release-out/**/build-info.txt
           body: |
             ## ClickShift Windows EXE
+
+            Direct download (always latest):
+            https://github.com/${{ github.repository }}/releases/latest/download/ClickShift.exe
 
             Latest release page:
             https://github.com/${{ github.repository }}/releases/latest
