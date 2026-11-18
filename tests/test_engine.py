@@ -733,6 +733,255 @@ def test_convert_many_batches_libreoffice_and_falls_back(tmp_path, monkeypatch):
     assert Path(results[1].target).suffix == ".html"
 
 
+def test_pptx_odp_and_text_routes_and_conversions(tmp_path, engine):
+    """PPTX -> ODP, TXT, MD, HTML routes exist and produce valid non-empty outputs."""
+    import io
+    import zipfile
+    import pptx
+    from pptx.util import Inches
+    from PIL import Image
+    from clickshift.engine import conv_pptx_to_odp
+
+    assert "python-pptx-odp" in [r.name for r in _routes_for(".pptx", ".odp")]
+    for ext in (".txt", ".md", ".html"):
+        assert "python-pptx-text" in [r.name for r in _routes_for(".pptx", ext)]
+
+    img_buf = io.BytesIO()
+    Image.new("RGB", (60, 40), (40, 120, 200)).save(img_buf, format="PNG")
+
+    prs = pptx.Presentation()
+    s1 = prs.slides.add_slide(prs.slide_layouts[0])
+    s1.shapes.title.text = "Deck Heading"
+    s1.placeholders[1].text = "Key takeaway"
+    tshape = s1.shapes.add_table(2, 2, Inches(1.0), Inches(3.0), Inches(4.0), Inches(1.2))
+    tshape.table.cell(0, 0).text = "Col1"
+    tshape.table.cell(0, 1).text = "Col2"
+    tshape.table.cell(1, 0).text = "Alpha"
+    tshape.table.cell(1, 1).text = "Beta"
+    s1.shapes.add_picture(img_buf, Inches(5.5), Inches(3.0), width=Inches(1.5))
+    s1.notes_slide.notes_text_frame.text = "Speaker cue"
+
+    src = tmp_path / "deck.pptx"
+    prs.save(src)
+
+    # Pure-Python ODP validator (OASIS ODF 1.2 package structure)
+    odp_pure = tmp_path / "pure.odp"
+    conv_pptx_to_odp(src, odp_pure)
+    assert odp_pure.exists() and zipfile.is_zipfile(odp_pure)
+    with zipfile.ZipFile(odp_pure, "r") as zf:
+        names = zf.namelist()
+        assert names[0] == "mimetype"
+        info0 = zf.getinfo("mimetype")
+        assert info0.compress_type == zipfile.ZIP_STORED
+        assert zf.read("mimetype") == b"application/vnd.oasis.opendocument.presentation"
+        assert "META-INF/manifest.xml" in names
+        content = zf.read("content.xml").decode("utf-8")
+        assert "Deck Heading" in content
+        assert "Alpha" in content and "Speaker cue" in content
+        assert any(n.startswith("Pictures/") for n in names)
+
+    # Router conversion to ODP, TXT, MD, HTML
+    for ext in ("odp", "txt", "md", "html"):
+        res = engine.convert(src, ext)
+        assert res.ok, f"pptx -> {ext} failed: {res.error}"
+        out = Path(res.target)
+        assert out.exists() and out.stat().st_size > 0
+        if ext in ("txt", "md", "html"):
+            body = out.read_text(encoding="utf-8-sig" if ext == "txt" else "utf-8")
+            assert "Deck Heading" in body
+            assert "Alpha" in body
+            assert "Speaker cue" in body
+            if ext == "html":
+                assert "data:image/png;base64," in body
+
+
+def test_pptx_to_pdf_theme_contrast_unicode_tight_and_groups(tmp_path):
+    """conv_pptx_to_pdf preserves tight boxes, moved groups, white-on-theme fills, and Arabic/Unicode."""
+    import fitz
+    import pptx
+    from pptx.dml.color import RGBColor
+    from pptx.enum.dml import MSO_THEME_COLOR
+    from pptx.util import Inches, Pt
+    from clickshift.engine import conv_pptx_to_pdf
+
+    prs = pptx.Presentation()
+    prs.slide_width = Inches(10.0)
+    prs.slide_height = Inches(5.625)
+    sl = prs.slides.add_slide(prs.slide_layouts[6])
+
+    # 1. White text on theme-colored filled box -> fill drawn, text kept white/visible
+    sh_theme = sl.shapes.add_textbox(Inches(0.5), Inches(0.4), Inches(4.0), Inches(0.8))
+    sh_theme.fill.solid()
+    sh_theme.fill.fore_color.theme_color = MSO_THEME_COLOR.ACCENT_1
+    r_theme = sh_theme.text_frame.paragraphs[0].add_run()
+    r_theme.text = "ThemeBoxLabel"
+    r_theme.font.color.rgb = RGBColor(255, 255, 255)
+    r_theme.font.size = Pt(16)
+
+    # 2. Explicit white text with NO fill on plain white slide -> contrast guard prevents white-on-white
+    sh_ghost = sl.shapes.add_textbox(Inches(0.5), Inches(1.4), Inches(4.0), Inches(0.6))
+    r_ghost = sh_ghost.text_frame.paragraphs[0].add_run()
+    r_ghost.text = "ContrastGuardedText"
+    r_ghost.font.color.rgb = RGBColor(255, 255, 255)
+    r_ghost.font.size = Pt(14)
+
+    # 3. Tight small textbox (< 9pt) -> must never be silently dropped
+    sh_tight = sl.shapes.add_textbox(Inches(0.5), Inches(2.2), Inches(0.6), Inches(0.16))
+    r_tight = sh_tight.text_frame.paragraphs[0].add_run()
+    r_tight.text = "TightBoxLabel"
+    r_tight.font.size = Pt(8.5)
+
+    # 4. Moved group shape -> child renders near group x=6in (~432pt), not origin
+    grp = sl.shapes.add_group_shape()
+    g_tb = grp.shapes.add_textbox(Inches(0.0), Inches(0.0), Inches(3.0), Inches(0.7))
+    g_tb.text_frame.text = "MovedGroupText"
+    grp.left = Inches(6.0)
+    grp.top = Inches(1.0)
+
+    # 5. Multi-run with empty leading run + Unicode bullet + Arabic
+    sh_uni = sl.shapes.add_textbox(Inches(0.5), Inches(3.2), Inches(5.0), Inches(0.8))
+    p_uni = sh_uni.text_frame.paragraphs[0]
+    p_uni.add_run().text = ""
+    r_u2 = p_uni.add_run()
+    r_u2.text = "\u2022 \u0645\u0631\u062d\u0628\u0627 Hello"
+    r_u2.font.size = Pt(15)
+
+    src = tmp_path / "edge.pptx"
+    out_pdf = tmp_path / "edge.pdf"
+    prs.save(src)
+    conv_pptx_to_pdf(src, out_pdf)
+
+    doc = fitz.open(str(out_pdf))
+    try:
+        pg = doc[0]
+        txt = pg.get_text("text")
+        assert "ThemeBoxLabel" in txt
+        assert "ContrastGuardedText" in txt
+        assert "TightBoxLabel" in txt
+        assert "MovedGroupText" in txt
+        assert "Hello" in txt and "?" not in txt
+        assert any("\u0600" <= ch <= "\u06FF" or "\uFE70" <= ch <= "\uFEFF" for ch in txt)
+        assert len(pg.get_drawings()) >= 1  # theme fill rectangle drawn
+
+        # Verify contrast-guarded span is NOT 0xffffff and MovedGroupText is shifted right
+        for blk in pg.get_text("dict")["blocks"]:
+            for ln in blk.get("lines", []):
+                for sp in ln.get("spans", []):
+                    if "ContrastGuardedText" in sp["text"]:
+                        assert sp["color"] != 0xFFFFFF
+                    if "MovedGroupText" in sp["text"]:
+                        assert sp["bbox"][0] >= 380.0
+    finally:
+        doc.close()
+
+
+def test_pptx_office_com_powerpoint_options(tmp_path, monkeypatch):
+    """PowerPoint COM uses DisplayAlerts=1 (ppAlertsNone), ReadOnly=-1, ODP=35, and joins on shutdown."""
+    import sys
+    import types
+    from typing import Any
+    import clickshift.engine as eng_mod
+
+    src = tmp_path / "sample.pptx"
+    src.write_bytes(b"PK\x03\x04dummy")
+    calls: dict[str, Any] = {"attrs": [], "open": None, "saveas": [], "closed": 0, "quit": 0}
+
+    class FakePres:
+        def SaveAs(self, path: str, fmt: int) -> None:
+            calls["saveas"].append((path, fmt))
+            Path(path).write_bytes(b"fake_office_out")
+
+        def Close(self) -> None:
+            calls["closed"] += 1
+
+    class FakePresentations:
+        def Open(self, path: str, **kwargs: Any) -> FakePres:
+            calls["open"] = (path, kwargs)
+            return FakePres()
+
+    class FakePptApp:
+        Presentations = FakePresentations()
+
+        def __setattr__(self, name: str, val: Any) -> None:
+            calls["attrs"].append((name, val))
+            if name in ("Visible", "ScreenUpdating"):
+                raise RuntimeError(f"PowerPoint rejects {name}")
+            object.__setattr__(self, name, val)
+
+        def Quit(self) -> None:
+            calls["quit"] += 1
+
+    fake_win32_client: Any = types.ModuleType("win32com.client")
+    fake_win32_client.DispatchEx = lambda progid: FakePptApp()
+    fake_win32: Any = types.ModuleType("win32com")
+    fake_win32.client = fake_win32_client
+    fake_pythoncom: Any = types.ModuleType("pythoncom")
+    fake_pythoncom.CoInitialize = lambda: None
+    fake_pythoncom.CoUninitialize = lambda: None
+
+    monkeypatch.setitem(sys.modules, "win32com", fake_win32)
+    monkeypatch.setitem(sys.modules, "win32com.client", fake_win32_client)
+    monkeypatch.setitem(sys.modules, "pythoncom", fake_pythoncom)
+    monkeypatch.setattr(eng_mod, "IS_WINDOWS", True)
+    monkeypatch.setattr(eng_mod.BACKENDS, "office_app", {"powerpoint": "PowerPoint.Application"})
+
+    worker = eng_mod._OfficeStaWorker("powerpoint", "PowerPoint.Application")
+    pool = eng_mod._OfficeComPool()
+    pool._workers["powerpoint"] = worker
+    monkeypatch.setattr(eng_mod, "_OFFICE_POOL", pool)
+
+    try:
+        eng_mod.conv_office_com(src, tmp_path / "out.odp")
+        eng_mod.conv_office_com(src, tmp_path / "out.pdf")
+        eng_mod.conv_office_com(src, tmp_path / "out.ppt")
+    finally:
+        pool.shutdown()
+
+    assert ("DisplayAlerts", 1) in calls["attrs"]
+    assert ("DisplayAlerts", 0) not in calls["attrs"]
+    assert calls["open"] is not None
+    assert calls["open"][1] == {"ReadOnly": -1, "Untitled": 0, "WithWindow": 0}
+    assert [fmt for _, fmt in calls["saveas"]] == [35, 32, 1]
+    assert calls["closed"] == 3
+    assert calls["quit"] == 1
+
+
+def test_paged_images_uses_ranked_pdf_routes(tmp_path, monkeypatch):
+    """PPTX -> PNG conversion must consult ML ranking instead of retrying a slow failed PDF backend."""
+    import clickshift.engine as eng_mod
+    import pptx
+
+    prs = pptx.Presentation()
+    prs.slides.add_slide(prs.slide_layouts[0]).shapes.title.text = "Ranked PNG Slide"
+    src = tmp_path / "ranked.pptx"
+    prs.save(src)
+
+    monkeypatch.setenv("CLICKSHIFT_HOME", str(tmp_path / "cs_home"))
+    monkeypatch.setattr(eng_mod.BACKENDS, "office_app", {})
+    monkeypatch.setattr(eng_mod.BACKENDS, "libreoffice", None)
+
+    eng = eng_mod.ConversionEngine(
+        enable_ml=True,
+        history_file=tmp_path / "cs_home" / "history.jsonl",
+    )
+    ranked_seen: list[str] = []
+    orig_rank = eng._selector.rank
+
+    def spy_rank(s, dst, routes, **kw):
+        ranked_seen.append(dst)
+        return orig_rank(s, dst, routes, **kw)
+
+    monkeypatch.setattr(eng._selector, "rank", spy_rank)
+    try:
+        res = eng.convert(src, "png")
+    finally:
+        eng.shutdown()
+
+    assert res.ok, res.error
+    assert ".pdf" in ranked_seen
+    assert (tmp_path / "ranked" / "page_001.png").exists()
+
+
 
 
 
