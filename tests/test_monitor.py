@@ -324,5 +324,98 @@ def test_load_config_stat_cache_and_cli_tail_lines(tmp_path, monkeypatch):
     assert cli._tail_lines(big, 25) == lines[-25:]
 
 
+def test_startup_approved_re_enabled_and_singleton_mutex(tmp_path, monkeypatch):
+    import sys
+
+    store: dict[str, dict[str, tuple[object, int]]] = {
+        monitor.RUN_KEY: {"ClickShift": ("C:\\old\\ClickShift.exe run", 1), "ConFas": ("C:\\old\\ConFas.exe run", 1)},
+        monitor.STARTUP_APPROVED_KEY: {
+            "ClickShift": (b"\x03" + b"\x00" * 11, 3),
+            "ConFas": (b"\x02" + b"\x00" * 11, 3),
+        },
+    }
+
+    class FakeKey:
+        def __init__(self, path: str):
+            self.path = path
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+    class FakeWinReg:
+        HKEY_CURRENT_USER = 1
+        REG_SZ = 1
+        REG_BINARY = 3
+        KEY_SET_VALUE = 2
+
+        def OpenKey(self, _root, subkey, *_a):
+            if subkey not in store:
+                raise FileNotFoundError(subkey)
+            return FakeKey(subkey)
+
+        def CreateKeyEx(self, _root, subkey, *_a):
+            store.setdefault(subkey, {})
+            return FakeKey(subkey)
+
+        def QueryValueEx(self, key, name):
+            if name not in store[key.path]:
+                raise FileNotFoundError(name)
+            return store[key.path][name]
+
+        def SetValueEx(self, key, name, _res, typ, val):
+            store[key.path][name] = (val, typ)
+
+        def DeleteValue(self, key, name):
+            if name not in store[key.path]:
+                raise FileNotFoundError(name)
+            del store[key.path][name]
+
+    monkeypatch.setattr(monitor, "IS_WINDOWS", True)
+    monkeypatch.setattr(monitor, "winreg", FakeWinReg())
+
+    # Disabled in StartupApproved\Run must report False
+    assert monitor.is_startup_registered() is False
+
+    # register_startup writes Run + clears disabled StartupApproved\Run + removes ConFas
+    assert monitor.register_startup() is True
+    assert store[monitor.STARTUP_APPROVED_KEY]["ClickShift"][0][0] == 2
+    assert "ConFas" not in store[monitor.RUN_KEY]
+    assert "ConFas" not in store[monitor.STARTUP_APPROVED_KEY]
+    assert monitor.is_startup_registered() is True
+
+    # Frozen path mismatch/missing target triggers re-registration check
+    fake_exe = tmp_path / "ClickShift-v1.0.21.exe"
+    fake_exe.write_bytes(b"MZ")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(fake_exe))
+    assert monitor.is_startup_registered() is False  # Run still points to non-frozen python cmd
+    assert monitor.register_startup() is True
+    assert monitor.is_startup_registered() is True
+
+    # unregister_startup removes both Run and StartupApproved entries
+    assert monitor.unregister_startup() is True
+    assert store[monitor.RUN_KEY] == {}
+    assert store[monitor.STARTUP_APPROVED_KEY] == {}
+
+    # Single-instance mutex ignores stale reused daemon.pid on Windows
+    monkeypatch.setattr(sys, "frozen", False, raising=False)
+    monkeypatch.setenv("CLICKSHIFT_HOME", str(tmp_path / "singleton_home"))
+    monkeypatch.setattr(monitor, "DATA_DIR", tmp_path / "singleton_home")
+    if sys.platform == "win32":
+        (tmp_path / "singleton_home").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "singleton_home" / "daemon.pid").write_text(str(os.getpid()), encoding="utf-8")
+        try:
+            assert monitor.acquire_single_instance() is True
+            assert monitor.acquire_single_instance() is False
+        finally:
+            monitor._release_single_instance()
+        assert monitor.acquire_single_instance() is True
+        monitor._release_single_instance()
+
+
+
 
 

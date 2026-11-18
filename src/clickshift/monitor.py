@@ -365,21 +365,55 @@ def _log(msg: str) -> None:
 # --------------------------------------------------------------------------- #
 
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+STARTUP_APPROVED_KEY = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
+_STARTUP_ENABLED_BIN = b"\x02" + b"\x00" * 11
+
+
+def _extract_exe_from_cmd(raw: str) -> str:
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    if s[0] == '"':
+        end_q = s.find('"', 1)
+        if end_q != -1:
+            return s[1:end_q]
+    low = s.lower()
+    idx = 0
+    while True:
+        pos = low.find(".exe", idx)
+        if pos == -1:
+            break
+        end_exe = pos + 4
+        if end_exe == len(s) or s[end_exe] in (" ", "\t"):
+            return s[:end_exe]
+        idx = end_exe
+    return s.split()[0]
 
 
 def register_startup() -> bool:
-    """Add ClickShift to the current user's Run key -> shows up in Task Manager."""
+    """Add ClickShift to the current user's Run key and ensure StartupApproved is enabled."""
     if not IS_WINDOWS or winreg is None:
         return False
     try:
         cmd = subprocess.list2cmdline(launch_command(["run"]))
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
-                            winreg.KEY_SET_VALUE) as k:
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
+                                winreg.KEY_SET_VALUE) as k:
             winreg.SetValueEx(k, APP_NAME, 0, winreg.REG_SZ, cmd)
             try:
                 winreg.DeleteValue(k, "ConFas")
             except OSError:
                 pass
+        # Windows 10/11 blocks Run entries whose StartupApproved\Run byte0 is odd (e.g. 0x03).
+        try:
+            with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, STARTUP_APPROVED_KEY, 0,
+                                    winreg.KEY_SET_VALUE) as ak:
+                winreg.SetValueEx(ak, APP_NAME, 0, winreg.REG_BINARY, _STARTUP_ENABLED_BIN)
+                try:
+                    winreg.DeleteValue(ak, "ConFas")
+                except OSError:
+                    pass
+        except OSError:
+            pass
         _log(f"startup registered: {cmd}")
         return True
     except Exception as exc:
@@ -390,19 +424,22 @@ def register_startup() -> bool:
 def unregister_startup() -> bool:
     if not IS_WINDOWS or winreg is None:
         return False
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
-                            winreg.KEY_SET_VALUE) as k:
-            for name in (APP_NAME, "ConFas"):
-                try:
-                    winreg.DeleteValue(k, name)
-                except FileNotFoundError:
-                    pass
-        return True
-    except FileNotFoundError:
-        return True
-    except Exception:
-        return False
+    ok = True
+    for key_path in (RUN_KEY, STARTUP_APPROVED_KEY):
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0,
+                                winreg.KEY_SET_VALUE) as k:
+                for name in (APP_NAME, "ConFas"):
+                    try:
+                        winreg.DeleteValue(k, name)
+                    except FileNotFoundError:
+                        pass
+        except FileNotFoundError:
+            pass
+        except Exception:
+            if key_path == RUN_KEY:
+                ok = False
+    return ok
 
 
 def is_startup_registered() -> bool:
@@ -410,7 +447,29 @@ def is_startup_registered() -> bool:
         return False
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
-            winreg.QueryValueEx(k, APP_NAME)
+            val, _ = winreg.QueryValueEx(k, APP_NAME)
+        if not isinstance(val, str) or not val.strip():
+            return False
+        if getattr(sys, "frozen", False):
+            target = _extract_exe_from_cmd(val)
+            if not target:
+                return False
+            try:
+                if os.path.normcase(os.path.abspath(target)) != os.path.normcase(os.path.abspath(sys.executable)):
+                    return False
+                if not Path(target).exists():
+                    return False
+            except Exception:
+                return False
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_APPROVED_KEY) as ak:
+                raw, _ = winreg.QueryValueEx(ak, APP_NAME)
+            if isinstance(raw, (bytes, bytearray)) and len(raw) >= 1 and (raw[0] & 1) != 0:
+                return False
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
         return True
     except Exception:
         return False
@@ -1269,15 +1328,57 @@ class WatchFolder(threading.Thread):
 #  Single-instance guard
 # --------------------------------------------------------------------------- #
 
+_INSTANCE_MUTEX_HANDLE: Any = None
+
+
+def _release_single_instance() -> None:
+    """Release the Win32 singleton mutex and remove stale daemon.pid on clean exit."""
+    global _INSTANCE_MUTEX_HANDLE
+    h = _INSTANCE_MUTEX_HANDLE
+    _INSTANCE_MUTEX_HANDLE = None
+    if h and IS_WINDOWS:
+        try:
+            k32 = ctypes.WinDLL("kernel32")
+            k32.CloseHandle.argtypes = [ctypes.c_void_p]
+            k32.CloseHandle(h)
+        except Exception:
+            pass
+    try:
+        (_active_data_dir() / "daemon.pid").unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def acquire_single_instance() -> bool:
     """Return True if this process is the only ClickShift daemon."""
+    global _INSTANCE_MUTEX_HANDLE
+    d = _active_data_dir()
+    pid_file = d / "daemon.pid"
     try:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        if PID_FILE.exists():
-            pid = int(PID_FILE.read_text().strip() or "0")
-            if pid and _pid_alive(pid):
+        d.mkdir(parents=True, exist_ok=True)
+        if IS_WINDOWS and getattr(ctypes, "WinDLL", None) is not None:
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
+            k32.CreateMutexW.restype = ctypes.c_void_p
+            k32.CloseHandle.argtypes = [ctypes.c_void_p]
+            norm_dir = os.path.normcase(os.path.abspath(str(d)))
+            tag = hashlib.sha256(norm_dir.encode("utf-8")).hexdigest()[:16]
+            mutex_name = f"Local\\ClickShiftDaemon_{tag}"
+            handle = k32.CreateMutexW(None, False, mutex_name)
+            last_err = ctypes.get_last_error()
+            if handle:
+                ERROR_ALREADY_EXISTS = 183
+                if last_err == ERROR_ALREADY_EXISTS:
+                    k32.CloseHandle(handle)
+                    return False
+                _INSTANCE_MUTEX_HANDLE = handle
+                pid_file.write_text(str(os.getpid()), encoding="utf-8")
+                return True
+        if pid_file.exists():
+            pid = int(pid_file.read_text().strip() or "0")
+            if pid and pid != os.getpid() and _pid_alive(pid):
                 return False
-        PID_FILE.write_text(str(os.getpid()))
+        pid_file.write_text(str(os.getpid()), encoding="utf-8")
         return True
     except Exception:
         return True
@@ -1627,25 +1728,30 @@ def run_daemon(headless: bool = False) -> int:
         finally:
             if ipc:
                 ipc.stop()
+            _release_single_instance()
         return 0
 
     # ---- pystray tray icon ------------------------------------------------ #
     update_stop = threading.Event()
     update_lock = threading.Lock()
+    stopped_cleanly = {"v": False}
     try:
         pystray: Any = importlib.import_module("pystray")
         from . import __version__ as _ver
         from . import updater as _updater
 
         paused = {"v": False}
+        auto_loop_started = {"v": False}
         icon_holder: dict[str, Any] = {"icon": None}
 
         def _stop_for_update() -> None:
+            stopped_cleanly["v"] = True
             update_stop.set()
             if watch:
                 watch.stop_event.set()
             if ipc:
                 ipc.stop()
+            _release_single_instance()
             ic = icon_holder.get("icon")
             if ic is not None:
                 try:
@@ -1722,6 +1828,7 @@ def run_daemon(headless: bool = False) -> int:
             ).start()
 
         def quit_app(icon, item):
+            stopped_cleanly["v"] = True
             update_stop.set()
             if watch:
                 watch.stop_event.set()
@@ -1740,7 +1847,8 @@ def run_daemon(headless: bool = False) -> int:
                     ic.notify(msg, title)
                 except Exception:
                     pass
-            if os.environ.get("CLICKSHIFT_NO_POPUP") != "1":
+            if not auto_loop_started["v"] and os.environ.get("CLICKSHIFT_NO_POPUP") != "1":
+                auto_loop_started["v"] = True
                 threading.Thread(target=_auto_update_loop, daemon=True).start()
 
         menu = pystray.Menu(
@@ -1752,19 +1860,37 @@ def run_daemon(headless: bool = False) -> int:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit ClickShift", quit_app),
         )
-        icon = pystray.Icon(APP_NAME, _make_tray_icon_image(), f"ClickShift v{_ver} - document converter", menu)
-        icon_holder["icon"] = icon
-        _log("tray daemon started")
-        icon.run(setup=_on_tray_ready)
+        icon_img = _make_tray_icon_image()
+        last_exc: Optional[Exception] = None
+        for attempt, delay_s in enumerate((2.0, 4.0, 8.0, 0.0)):
+            try:
+                icon = pystray.Icon(APP_NAME, icon_img, f"ClickShift v{_ver} - document converter", menu)
+                icon_holder["icon"] = icon
+                _log("tray daemon started" if attempt == 0 else f"tray daemon started (retry {attempt})")
+                icon.run(setup=_on_tray_ready)
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                if stopped_cleanly["v"] or delay_s <= 0:
+                    raise
+                _log(f"tray startup retry after delay ({exc})")
+                if update_stop.wait(delay_s):
+                    break
+        if last_exc is not None and not stopped_cleanly["v"]:
+            raise last_exc
+        _release_single_instance()
         return 0
     except Exception as exc:
         update_stop.set()
         _log(f"tray unavailable ({exc}); falling back to headless loop")
         try:
-            while True:
+            while not stopped_cleanly["v"]:
                 time.sleep(3600)
         except KeyboardInterrupt:
-            return 0
+            pass
         finally:
             if ipc:
                 ipc.stop()
+            _release_single_instance()
+        return 0
