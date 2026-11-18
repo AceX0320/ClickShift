@@ -25,7 +25,7 @@ if ($gpp) {
     Write-Host "Compiling ClickShiftShell.dll and ClickShiftStub.exe with $($gpp.Source)..."
     & $gpp.Source -shared -O2 -std=c++17 "$srcExt\ClickShiftShell.cpp" "$srcExt\ClickShiftShell.def" -o "$assets\ClickShiftShell.dll" -lole32 -luuid -lshlwapi -lshell32 -ladvapi32 -static
     if ($LASTEXITCODE -ne 0) { throw "Failed compiling ClickShiftShell.dll" }
-    & $gpp.Source -O2 -municode -mwindows "$srcExt\ClickShiftStub.cpp" -o "$assets\ClickShiftStub.exe" -static
+    & $gpp.Source -O2 -std=c++17 -municode -mwindows "$srcExt\ClickShiftStub.cpp" -o "$assets\ClickShiftStub.exe" -lshlwapi -ladvapi32 -static
     if ($LASTEXITCODE -ne 0) { throw "Failed compiling ClickShiftStub.exe" }
 } elseif ($env:GITHUB_ACTIONS -eq "true") {
     throw "g++.exe not found in CI environment; refusing to ship prebuilt native binaries."

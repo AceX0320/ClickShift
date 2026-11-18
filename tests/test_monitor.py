@@ -292,6 +292,7 @@ def test_load_config_stat_cache_and_cli_tail_lines(tmp_path, monkeypatch):
     class FakeEngine:
         def convert(self, src_path, dst_ext, out_path=None):
             converts.append(str(src_path))
+            assert out_path is not None
             out_p = Path(out_path)
             out_p.write_text("converted", encoding="utf-8")
             from clickshift.formats import ConversionResult
@@ -381,7 +382,8 @@ def test_startup_approved_re_enabled_and_singleton_mutex(tmp_path, monkeypatch):
 
     # register_startup writes Run + clears disabled StartupApproved\Run + removes ConFas
     assert monitor.register_startup() is True
-    assert store[monitor.STARTUP_APPROVED_KEY]["ClickShift"][0][0] == 2
+    reg_val = store[monitor.STARTUP_APPROVED_KEY]["ClickShift"][0]
+    assert isinstance(reg_val, (bytes, bytearray)) and reg_val[0] == 2
     assert "ConFas" not in store[monitor.RUN_KEY]
     assert "ConFas" not in store[monitor.STARTUP_APPROVED_KEY]
     assert monitor.is_startup_registered() is True

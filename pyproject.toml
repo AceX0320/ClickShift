@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "clickshift"
-version = "1.0.21"
+version = "1.0.22"
 description = "Ultra-fast local document converter with right-click menu, startup daemon and adaptive ML backend routing"
 requires-python = ">=3.10"
 dependencies = [

@@ -414,6 +414,7 @@ def register_startup() -> bool:
                     pass
         except OSError:
             pass
+        _save_exe_path_registry()
         _log(f"startup registered: {cmd}")
         return True
     except Exception as exc:
@@ -826,7 +827,7 @@ def _shell_ext_pkg_registered() -> bool:
 
 def _shell_assets_digest(shell_dir: Path) -> str:
     h = hashlib.sha256()
-    for fname in ("ClickShiftShell.msix", "ClickShiftShell.dll", "AppxManifest.xml"):
+    for fname in ("ClickShiftShell.msix", "ClickShiftShell.dll", "ClickShiftStub.exe", "AppxManifest.xml"):
         p = shell_dir / fname
         if p.exists():
             h.update(fname.encode("ascii"))

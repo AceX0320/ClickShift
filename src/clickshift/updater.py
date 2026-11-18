@@ -112,7 +112,11 @@ def is_packaged_store_app() -> bool:
         if rc2 != 0:
             _STORE_IDENTITY_CACHE = False
             return False
-        _STORE_IDENTITY_CACHE = buf.value.lower().startswith(("clickshift", "confas"))
+        pkg_low = buf.value.lower()
+        _STORE_IDENTITY_CACHE = (
+            pkg_low.startswith(("clickshift", "confas"))
+            and not pkg_low.startswith(("clickshift.shellextension_", "confas.shellextension_"))
+        )
         return _STORE_IDENTITY_CACHE
     except Exception:
         _STORE_IDENTITY_CACHE = False

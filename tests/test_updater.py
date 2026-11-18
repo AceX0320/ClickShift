@@ -415,3 +415,43 @@ def test_sign_release_sums_expands_globs_and_fails_on_empty(tmp_path, monkeypatc
     missing_pattern = str(dist_dir / "NoSuch-v*.exe")
     assert sign_release.cmd_sums([missing_pattern], missing_out) == 1
     assert not missing_out.exists()
+
+
+def test_shell_extension_identity_not_treated_as_store_app(monkeypatch):
+    import ctypes
+
+    pkg_holder = {"name": "ClickShift.ShellExtension_1.0.22.0_x64__5g5shzxksyewg"}
+
+    def fake_get_pkg_full_name(len_ptr, buf):
+        val = pkg_holder["name"]
+        need = len(val) + 1
+        cur = len_ptr._obj.value
+        len_ptr._obj.value = need
+        if buf is None or cur < need:
+            return 122  # ERROR_INSUFFICIENT_BUFFER
+        buf.value = val
+        return 0
+
+    class FakeK32:
+        GetCurrentPackageFullName = staticmethod(fake_get_pkg_full_name)
+
+    class FakeWindll:
+        kernel32 = FakeK32()
+
+    class FakeCtypes:
+        windll = FakeWindll()
+
+        def __getattr__(self, name):
+            return getattr(ctypes, name)
+
+    monkeypatch.setattr(updater.sys, "platform", "win32")
+    monkeypatch.delenv("CLICKSHIFT_ALLOW_SELF_UPDATE", raising=False)
+    monkeypatch.setattr(updater, "ctypes", FakeCtypes())
+
+    monkeypatch.setattr(updater, "_STORE_IDENTITY_CACHE", None)
+    assert updater.is_packaged_store_app() is False
+
+    pkg_holder["name"] = "ClickShift.Converter_1.0.22.0_x64__abcdef"
+    monkeypatch.setattr(updater, "_STORE_IDENTITY_CACHE", None)
+    assert updater.is_packaged_store_app() is True
+    monkeypatch.setattr(updater, "_STORE_IDENTITY_CACHE", None)
