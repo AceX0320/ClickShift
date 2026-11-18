@@ -12,7 +12,7 @@
   xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
   xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10">
   <!-- Replace Name and Publisher with values assigned in Microsoft Partner Center before uploading -->
-  <Identity Name="ClickShift.Converter" ProcessorArchitecture="x64" Publisher="CN=ClickShift" Version="1.0.25.0" />
+  <Identity Name="ClickShift.Converter" ProcessorArchitecture="x64" Publisher="CN=ClickShift" Version="1.0.26.0" />
   <Properties>
     <DisplayName>ClickShift</DisplayName>
     <PublisherDisplayName>ClickShift</PublisherDisplayName>

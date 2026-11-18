@@ -139,6 +139,21 @@ def cmd_verify(target: Path, sig: Path, pubkey_b64: str) -> int:
     return 0 if ok else 1
 
 
+def cmd_blockmap(files: Sequence[Path | str]) -> int:
+    from clickshift import updater
+
+    resolved = _resolve_input_files(files)
+    if not resolved:
+        print(f"Error: no matching files found for blockmap ({[str(x) for x in files]})", file=sys.stderr)
+        return 1
+    for f in resolved:
+        bm_bytes = updater.build_blockmap(f)
+        out = f.with_name(f.name + ".blockmap")
+        out.write_bytes(bm_bytes)
+        print(f"Wrote blockmap ({len(bm_bytes) / 1024:.1f} KiB) -> {out}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="ClickShift release checksum & ECDSA signer")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -148,6 +163,9 @@ def main() -> int:
     sp_sums = sub.add_parser("sums", help="Write SHA256SUMS.txt")
     sp_sums.add_argument("files", nargs="+", type=str)
     sp_sums.add_argument("--out", type=Path, required=True)
+
+    sp_bm = sub.add_parser("blockmap", help="Write gzipped SHA-256 chunk .blockmap files for delta updates")
+    sp_bm.add_argument("files", nargs="+", type=str)
 
     sp_sign = sub.add_parser("sign", help="Create <file>.sig using CLICKSHIFT_SIGNING_KEY_B64")
     sp_sign.add_argument("target", type=Path)
@@ -164,6 +182,8 @@ def main() -> int:
         return cmd_keygen()
     if ns.cmd == "sums":
         return cmd_sums(ns.files, ns.out)
+    if ns.cmd == "blockmap":
+        return cmd_blockmap(ns.files)
     if ns.cmd == "sign":
         return cmd_sign(ns.target, ns.out, ns.key)
     return cmd_verify(ns.target, ns.sig, ns.pubkey)

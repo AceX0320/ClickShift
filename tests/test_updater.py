@@ -455,3 +455,395 @@ def test_shell_extension_identity_not_treated_as_store_app(monkeypatch):
     monkeypatch.setattr(updater, "_STORE_IDENTITY_CACHE", None)
     assert updater.is_packaged_store_app() is True
     monkeypatch.setattr(updater, "_STORE_IDENTITY_CACHE", None)
+
+
+def _make_synthetic_pyi_exe(chunks: list[tuple[str, bytes]]) -> bytes:
+    """Build a minimal PE + PyInstaller CArchive binary for delta tests."""
+    import struct
+    import zlib
+
+    # DOS header ("MZ") + padding up to payload
+    pe_stub = b"MZ" + b"\x90" * 4094
+    body = bytearray(pe_stub)
+
+    toc_entries = bytearray()
+    for name, raw_data in chunks:
+        comp = zlib.compress(raw_data, level=1)
+        pos = len(body)
+        body.extend(comp)
+        name_bytes = name.encode("utf-8") + b"\x00"
+        # Entry struct: !IIIIBc + padded name (16-byte aligned)
+        unpadded_len = 18 + len(name_bytes)
+        entry_size = (unpadded_len + 15) & ~15
+        pad = b"\x00" * (entry_size - unpadded_len)
+        toc_entries.extend(
+            struct.pack("!IIIIBc", entry_size, pos, len(comp), len(raw_data), 1, b"x")
+            + name_bytes
+            + pad
+        )
+
+    toc_pos = len(body)
+    body.extend(toc_entries)
+    toc_len = len(toc_entries)
+
+    # PyInstaller 88-byte COOKIE: !8sIIII64s (pkg_len counts from start of stub here)
+    cookie_magic = b"MEI\014\013\012\013\016"
+    cookie_size = 88
+    pkg_len = len(body) + cookie_size
+    cookie = struct.pack("!8sIIII64s", cookie_magic, pkg_len, toc_pos, toc_len, 312, b"python312.dll")
+    body.extend(cookie)
+    return bytes(body)
+
+
+def _install_delta_http_mock(
+    monkeypatch,
+    routes: dict[str, bytes],
+    full_fetches: list[str],
+    range_fetches: list[tuple[int, int]],
+    force_200_on_range: bool = False,
+):
+    """Install a urllib.request opener mock supporting HTTP 206 Range requests."""
+    import email.message
+    import io
+    import urllib.request
+
+    class _Resp(io.BytesIO):
+        def __init__(self, payload: bytes, status: int, url: str, extra_headers: dict[str, str] | None = None):
+            super().__init__(payload)
+            self.status = status
+            self._url = url
+            self.headers = email.message.Message()
+            self.headers["Content-Length"] = str(len(payload))
+            for k, v in (extra_headers or {}).items():
+                self.headers[k] = v
+
+        def getcode(self):
+            return self.status
+
+        def geturl(self):
+            return self._url
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            self.close()
+            return False
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            url = req.full_url if hasattr(req, "full_url") else str(req)
+            if url not in routes:
+                raise AssertionError(f"Unexpected URL requested: {url}")
+            data = routes[url]
+            headers = {k.lower(): v for k, v in getattr(req, "headers", {}).items()}
+            range_hdr = headers.get("range", "")
+            if range_hdr and not force_200_on_range:
+                assert range_hdr.startswith("bytes=")
+                start_s, end_s = range_hdr[len("bytes="):].split("-", 1)
+                start = int(start_s)
+                end = int(end_s)
+                assert 0 <= start <= end < len(data)
+                slice_bytes = data[start : end + 1]
+                range_fetches.append((start, end))
+                return _Resp(
+                    slice_bytes,
+                    206,
+                    url,
+                    {"Content-Range": f"bytes {start}-{end}/{len(data)}"},
+                )
+            full_fetches.append(url)
+            return _Resp(data, 200, url)
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *a, **kw: _Opener())
+
+
+def test_parse_release_payload_detects_blockmap():
+    base = f"{updater.RELEASES_PAGE_URL}/download/v1.0.27"
+    payload = {
+        "tag_name": "v1.0.27",
+        "html_url": f"{updater.RELEASES_PAGE_URL}/tag/v1.0.27",
+        "body": "Delta update release",
+        "assets": [
+            {
+                "name": "ClickShift-v1.0.27.exe",
+                "browser_download_url": f"{base}/ClickShift-v1.0.27.exe",
+                "size": 150_000_000,
+            },
+            {
+                "name": "ClickShift-v1.0.27.exe.blockmap",
+                "browser_download_url": f"{base}/ClickShift-v1.0.27.exe.blockmap",
+                "size": 85_000,
+            },
+            {
+                "name": "SHA256SUMS.txt",
+                "browser_download_url": f"{base}/SHA256SUMS.txt",
+            },
+            {
+                "name": "SHA256SUMS.txt.sig",
+                "browser_download_url": f"{base}/SHA256SUMS.txt.sig",
+            },
+        ],
+    }
+    info = updater.parse_release_payload(payload)
+    assert info is not None
+    assert info.download_url == f"{base}/ClickShift-v1.0.27.exe"
+    assert info.blockmap_url == f"{base}/ClickShift-v1.0.27.exe.blockmap"
+
+    # Untrusted host on .blockmap must be dropped while keeping trusted .exe
+    untrusted_payload = {
+        **payload,
+        "assets": [
+            payload["assets"][0],
+            {
+                "name": "ClickShift-v1.0.27.exe.blockmap",
+                "browser_download_url": "https://evil.example.com/ClickShift-v1.0.27.exe.blockmap",
+            },
+        ],
+    }
+    info2 = updater.parse_release_payload(untrusted_payload)
+    assert info2 is not None
+    assert info2.download_url == f"{base}/ClickShift-v1.0.27.exe"
+    assert info2.blockmap_url == ""
+
+
+def test_delta_download_uses_local_basis_and_range_requests(tmp_path, monkeypatch):
+    import hashlib
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    def _pseudorand(tag: str, size: int) -> bytes:
+        out = bytearray()
+        counter = 0
+        while len(out) < size:
+            out.extend(hashlib.sha256(f"{tag}:{counter}".encode()).digest())
+            counter += 1
+        return bytes(out[:size])
+
+    shared_chunks = [
+        (f"mod_{i}.pyc", _pseudorand(f"shared-{i}", 8192))
+        for i in range(12)
+    ]
+    old_exe = _make_synthetic_pyi_exe(
+        [("header.dat", _pseudorand("hdr-old", 4096)), *shared_chunks, ("app.pyc", _pseudorand("app-old", 8192))]
+    )
+    # Shift offsets via header change and modify app.pyc only
+    new_exe = _make_synthetic_pyi_exe(
+        [("header.dat", _pseudorand("hdr-new", 4608)), *shared_chunks, ("app.pyc", _pseudorand("app-new", 8192))]
+    )
+    assert len(old_exe) > 4096
+    assert len(new_exe) > 4096
+
+    basis_path = tmp_path / "basis.exe"
+    basis_path.write_bytes(old_exe)
+    new_path_src = tmp_path / "new_build.exe"
+    new_path_src.write_bytes(new_exe)
+
+    blockmap_bytes = updater.build_blockmap(new_path_src)
+    parsed = updater.parse_blockmap(blockmap_bytes)
+    new_sha = hashlib.sha256(new_exe).hexdigest()
+    assert parsed["size"] == len(new_exe)
+    assert parsed["sha256"] == new_sha
+    assert len(parsed["chunks"]) > 4
+
+    import base64
+
+    sums_bytes = f"{new_sha}  ClickShift-v1.0.27.exe\n".encode("utf-8")
+    priv_key = ec.generate_private_key(ec.SECP256R1())
+    sig_bytes = priv_key.sign(new_exe, ec.ECDSA(hashes.SHA256()))
+    pub_b64 = base64.b64encode(
+        priv_key.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    ).decode("ascii")
+
+    base = f"{updater.RELEASES_PAGE_URL}/download/v1.0.27"
+    exe_url = f"{base}/ClickShift-v1.0.27.exe"
+    blockmap_url = f"{base}/ClickShift-v1.0.27.exe.blockmap"
+    sha_url = f"{base}/SHA256SUMS.txt"
+    sig_url = f"{base}/ClickShift-v1.0.27.exe.sig"
+
+    full_fetches: list[str] = []
+    range_fetches: list[tuple[int, int]] = []
+    _install_delta_http_mock(
+        monkeypatch,
+        routes={
+            exe_url: new_exe,
+            blockmap_url: blockmap_bytes,
+            sha_url: sums_bytes,
+            sig_url: sig_bytes,
+        },
+        full_fetches=full_fetches,
+        range_fetches=range_fetches,
+    )
+
+    dest = tmp_path / "downloaded.exe"
+    monkeypatch.delenv("CLICKSHIFT_NO_DELTA", raising=False)
+    updater.download_update(
+        exe_url,
+        dest,
+        min_bytes=1024,
+        sha256_url=sha_url,
+        sig_url=sig_url,
+        trusted_pubkeys=[pub_b64],
+        require_signature=True,
+        blockmap_url=blockmap_url,
+        basis_exe=basis_path,
+    )
+
+    assert dest.read_bytes() == new_exe
+    assert exe_url not in full_fetches
+    downloaded_range_bytes = sum((end - start + 1) for start, end in range_fetches)
+    assert downloaded_range_bytes > 0
+    assert downloaded_range_bytes < len(new_exe) // 2
+
+
+def test_delta_download_falls_back_cleanly_on_http_200_or_bad_blockmap(tmp_path, monkeypatch):
+    import hashlib
+
+    shared_chunks = [
+        (f"mod_{i}.pyc", (f"shared-module-{i}-" * 400).encode("utf-8"))
+        for i in range(6)
+    ]
+    old_exe = _make_synthetic_pyi_exe([*shared_chunks, ("app.pyc", b"old" * 1000)])
+    new_exe = _make_synthetic_pyi_exe([*shared_chunks, ("app.pyc", b"new" * 1000)])
+
+    basis_path = tmp_path / "basis.exe"
+    basis_path.write_bytes(old_exe)
+    new_src = tmp_path / "new.exe"
+    new_src.write_bytes(new_exe)
+
+    blockmap_bytes = updater.build_blockmap(new_src)
+    new_sha = hashlib.sha256(new_exe).hexdigest()
+    sums_bytes = f"{new_sha}  ClickShift.exe\n".encode("utf-8")
+
+    base = f"{updater.RELEASES_PAGE_URL}/download/v1.0.27"
+    exe_url = f"{base}/ClickShift.exe"
+    blockmap_url = f"{base}/ClickShift.exe.blockmap"
+    sha_url = f"{base}/SHA256SUMS.txt"
+
+    # Case 1: Server ignores Range header and returns HTTP 200
+    full_fetches: list[str] = []
+    range_fetches: list[tuple[int, int]] = []
+    _install_delta_http_mock(
+        monkeypatch,
+        routes={exe_url: new_exe, blockmap_url: blockmap_bytes, sha_url: sums_bytes},
+        full_fetches=full_fetches,
+        range_fetches=range_fetches,
+        force_200_on_range=True,
+    )
+    dest1 = tmp_path / "out1.exe"
+    updater.download_update(
+        exe_url,
+        dest1,
+        min_bytes=1024,
+        sha256_url=sha_url,
+        trusted_pubkeys=(),
+        blockmap_url=blockmap_url,
+        basis_exe=basis_path,
+    )
+    assert dest1.read_bytes() == new_exe
+    assert exe_url in full_fetches
+
+    # Case 2: Corrupt blockmap triggers clean fallback to full download
+    full_fetches.clear()
+    range_fetches.clear()
+    _install_delta_http_mock(
+        monkeypatch,
+        routes={exe_url: new_exe, blockmap_url: b"corrupt-blockmap-payload", sha_url: sums_bytes},
+        full_fetches=full_fetches,
+        range_fetches=range_fetches,
+    )
+    dest2 = tmp_path / "out2.exe"
+    updater.download_update(
+        exe_url,
+        dest2,
+        min_bytes=1024,
+        sha256_url=sha_url,
+        trusted_pubkeys=(),
+        blockmap_url=blockmap_url,
+        basis_exe=basis_path,
+    )
+    assert dest2.read_bytes() == new_exe
+    assert exe_url in full_fetches
+
+    # Case 3: Stale blockmap SHA mismatch in SHA256SUMS.txt triggers fallback
+    stale_sums = (
+        f"{new_sha}  ClickShift.exe\n"
+        f"{'0' * 64}  ClickShift.exe.blockmap\n"
+    ).encode("utf-8")
+    full_fetches.clear()
+    range_fetches.clear()
+    _install_delta_http_mock(
+        monkeypatch,
+        routes={exe_url: new_exe, blockmap_url: blockmap_bytes, sha_url: stale_sums},
+        full_fetches=full_fetches,
+        range_fetches=range_fetches,
+    )
+    dest3 = tmp_path / "out3.exe"
+    updater.download_update(
+        exe_url,
+        dest3,
+        min_bytes=1024,
+        sha256_url=sha_url,
+        trusted_pubkeys=(),
+        blockmap_url=blockmap_url,
+        basis_exe=basis_path,
+    )
+    assert dest3.read_bytes() == new_exe
+    assert exe_url in full_fetches
+    assert range_fetches == []
+
+    # Case 4: CLICKSHIFT_NO_DELTA=1 opts out of delta transfer
+    full_fetches.clear()
+    range_fetches.clear()
+    _install_delta_http_mock(
+        monkeypatch,
+        routes={exe_url: new_exe, blockmap_url: blockmap_bytes, sha_url: sums_bytes},
+        full_fetches=full_fetches,
+        range_fetches=range_fetches,
+    )
+    monkeypatch.setenv("CLICKSHIFT_NO_DELTA", "1")
+    dest4 = tmp_path / "out4.exe"
+    updater.download_update(
+        exe_url,
+        dest4,
+        min_bytes=1024,
+        sha256_url=sha_url,
+        trusted_pubkeys=(),
+        blockmap_url=blockmap_url,
+        basis_exe=basis_path,
+    )
+    assert dest4.read_bytes() == new_exe
+    assert exe_url in full_fetches
+    assert range_fetches == []
+
+
+def test_sign_release_blockmap_subcommand(tmp_path):
+    import hashlib
+    import sys
+    from pathlib import Path
+
+    scripts_dir = str(Path(__file__).resolve().parent.parent / "scripts")
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    import sign_release
+
+    exe_bytes = _make_synthetic_pyi_exe([("main.pyc", b"hello-clickshift" * 500)])
+    exe_path = tmp_path / "ClickShift-v1.0.27.exe"
+    exe_path.write_bytes(exe_bytes)
+
+    rc = sign_release.cmd_blockmap([str(tmp_path / "ClickShift*.exe")])
+    assert rc == 0
+
+    blockmap_path = tmp_path / "ClickShift-v1.0.27.exe.blockmap"
+    assert blockmap_path.is_file()
+    parsed = updater.parse_blockmap(blockmap_path.read_bytes())
+    assert parsed["size"] == len(exe_bytes)
+    assert parsed["sha256"] == hashlib.sha256(exe_bytes).hexdigest()
+    assert len(parsed["chunks"]) >= 2
+
+    # Unmatched glob fails closed
+    assert sign_release.cmd_blockmap([str(tmp_path / "DoesNotExist*.exe")]) == 1
+

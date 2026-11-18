@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import base64
 import ctypes
+import gzip
 import hashlib
 import hmac
 import json
+import marshal
 import os
 import queue
 import re
@@ -49,8 +51,11 @@ RELEASE_BY_TAG_API = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}
 RELEASES_PAGE_URL = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
 
 MAX_JSON_BYTES = 2 * 1024 * 1024
+MAX_BLOCKMAP_GZ_BYTES = 4 * 1024 * 1024
+MAX_BLOCKMAP_RAW_BYTES = 16 * 1024 * 1024
 MAX_EXE_BYTES = 512 * 1024 * 1024
 DEFAULT_MIN_EXE_BYTES = 1024 * 1024
+_PYI_COOKIE_MAGIC = b"MEI\014\013\012\013\016"
 
 _ALLOWED_API_HOSTS = {"api.github.com"}
 _ALLOWED_DOWNLOAD_HOSTS = {
@@ -89,6 +94,7 @@ class ReleaseInfo:
     sha256_url: str = ""
     sig_url: str = ""
     expected_sha256: str = ""
+    blockmap_url: str = ""
 
 
 _STORE_IDENTITY_CACHE: Optional[bool] = None
@@ -250,6 +256,7 @@ def parse_release_payload(data: object) -> Optional[ReleaseInfo]:
     asset_size = 0
     sha256_url = ""
     sig_url = ""
+    blockmap_url = ""
     assets = data.get("assets")
     if isinstance(assets, list):
         # Single pass over assets while preserving strict priority ordering
@@ -261,6 +268,7 @@ def parse_release_payload(data: object) -> Optional[ReleaseInfo]:
         pref_rank = {n: i for i, n in enumerate(preferred)}
         best_rank = len(preferred) + 1
         sig_by_lower: dict[str, str] = {}
+        blockmap_by_lower: dict[str, str] = {}
         for asset in assets:
             if not isinstance(asset, dict):
                 continue
@@ -275,6 +283,10 @@ def parse_release_payload(data: object) -> Optional[ReleaseInfo]:
                 if is_allowed_download_url(url):
                     sig_by_lower[nl] = url
                 continue
+            if nl.endswith(".blockmap"):
+                if is_allowed_download_url(url):
+                    blockmap_by_lower[nl] = url
+                continue
             rank = pref_rank.get(nl)
             if rank is None and nl.startswith(("clickshift", "confas")) and nl.endswith(".exe"):
                 rank = len(preferred)
@@ -285,6 +297,10 @@ def parse_release_payload(data: object) -> Optional[ReleaseInfo]:
                 asset_size = int(asset.get("size") or 0)
         if matched_asset_name:
             sig_url = sig_by_lower.get(f"{matched_asset_name.lower()}.sig", "")
+            blockmap_url = (
+                blockmap_by_lower.get(f"{matched_asset_name.lower()}.blockmap", "")
+                or blockmap_by_lower.get("clickshift.exe.blockmap", "")
+            )
 
     if not download_url:
         return None
@@ -302,6 +318,7 @@ def parse_release_payload(data: object) -> Optional[ReleaseInfo]:
         asset_size=asset_size,
         sha256_url=sha256_url,
         sig_url=sig_url,
+        blockmap_url=blockmap_url,
     )
 
 
@@ -532,6 +549,442 @@ def check_for_update(
     return None
 
 
+class _DeltaFallback(Exception):
+    """Signal delta patching could not complete and should fall back to full download."""
+
+
+def _split_span(out: list[tuple[int, int]], start: int, length: int, max_len: int) -> None:
+    cur = start
+    end = start + length
+    while cur < end:
+        cl = min(max_len, end - cur)
+        out.append((cur, cl))
+        cur += cl
+
+
+def _iter_exe_chunk_spans(exe_path: Path, fallback_chunk: int = 65_536) -> list[tuple[int, int]]:
+    """Return contiguous (offset, length) spans covering ``exe_path``, aligned to PyInstaller entries."""
+    total_size = exe_path.stat().st_size
+    if total_size <= 0:
+        return []
+    raw_spans: list[tuple[int, int]] = []
+    try:
+        with open(exe_path, "rb") as fh:
+            tail_off = max(0, total_size - 4096)
+            fh.seek(tail_off)
+            tail = fh.read(total_size - tail_off)
+            idx = tail.rfind(_PYI_COOKIE_MAGIC)
+            if idx != -1 and len(tail) - idx >= 88:
+                cookie_off = tail_off + idx
+                _magic, pkg_len, toc_off, toc_len, _pyvers, _pylib = struct.unpack(
+                    "!8sIIII64s", tail[idx : idx + 88]
+                )
+                pkg_start = cookie_off - (toc_off + toc_len)
+                if (
+                    0 <= pkg_start < cookie_off
+                    and pkg_len > 0
+                    and toc_len > 0
+                    and toc_off + toc_len <= pkg_len
+                ):
+                    fh.seek(pkg_start + toc_off)
+                    toc_raw = fh.read(toc_len)
+                    c_entries: list[tuple[int, int, int]] = []
+                    pos = 0
+                    while pos + 18 <= len(toc_raw):
+                        entry_len, dpos, dlen, _ulen, _cmpflag, typecd = struct.unpack(
+                            "!IIIIBB", toc_raw[pos : pos + 18]
+                        )
+                        if entry_len < 18 or pos + entry_len > len(toc_raw):
+                            break
+                        abs_off = pkg_start + dpos
+                        if dlen > 0 and abs_off >= pkg_start and abs_off + dlen <= cookie_off:
+                            c_entries.append((abs_off, dlen, typecd))
+                        pos += entry_len
+                    c_entries.sort()
+                    prev_end = 0
+                    for off, dlen, typecd in c_entries:
+                        if off < prev_end:
+                            continue
+                        if off > prev_end:
+                            _split_span(raw_spans, prev_end, off - prev_end, fallback_chunk)
+                        if typecd == ord("z") and dlen > 16:
+                            # Sub-chunk PYZ bytecode archive by individual module offsets (trusted local file)
+                            mod_ranges: list[tuple[int, int]] = []
+                            try:
+                                fh.seek(off)
+                                hdr = fh.read(16)
+                                if hdr[:4] == b"PYZ\x00":
+                                    _pm, _pv, ptoc_off = struct.unpack("!4s4sI", hdr[:12])
+                                    if 12 <= ptoc_off < dlen:
+                                        fh.seek(off + ptoc_off)
+                                        ptoc = marshal.loads(fh.read(dlen - ptoc_off))
+                                        vals = ptoc.values() if isinstance(ptoc, dict) else (x[1] for x in ptoc)
+                                        mod_ranges = sorted(
+                                            (off + int(v[1]), int(v[2]))
+                                            for v in vals
+                                            if len(v) >= 3 and int(v[2]) > 0
+                                            and off <= off + int(v[1])
+                                            and off + int(v[1]) + int(v[2]) <= off + dlen
+                                        )
+                            except Exception:
+                                mod_ranges = []
+                            if mod_ranges:
+                                pcur = off
+                                for moff, mlen in mod_ranges:
+                                    if moff < pcur:
+                                        continue
+                                    if moff > pcur:
+                                        _split_span(raw_spans, pcur, moff - pcur, fallback_chunk)
+                                    _split_span(raw_spans, moff, mlen, 262_144)
+                                    pcur = moff + mlen
+                                if pcur < off + dlen:
+                                    _split_span(raw_spans, pcur, off + dlen - pcur, fallback_chunk)
+                            else:
+                                _split_span(raw_spans, off, dlen, 262_144)
+                        else:
+                            _split_span(raw_spans, off, dlen, 262_144)
+                        prev_end = off + dlen
+                    if prev_end < total_size:
+                        _split_span(raw_spans, prev_end, total_size - prev_end, fallback_chunk)
+    except Exception:
+        raw_spans = []
+
+    if not raw_spans or sum(ln for _off, ln in raw_spans) != total_size:
+        out: list[tuple[int, int]] = []
+        _split_span(out, 0, total_size, fallback_chunk)
+        return out
+    return raw_spans
+
+
+def build_blockmap(exe_path: Path) -> bytes:
+    """Create a gzipped SHA-256 chunk blockmap describing ``exe_path`` for delta updates."""
+    exe_path = Path(exe_path)
+    total_size = exe_path.stat().st_size
+    spans = _iter_exe_chunk_spans(exe_path)
+    chunks_out: list[list[Any]] = []
+    full_sha = hashlib.sha256()
+    with open(exe_path, "rb") as fh:
+        for off, length in spans:
+            fh.seek(off)
+            data = fh.read(length)
+            if len(data) != length:
+                raise RuntimeError(f"Short read building blockmap at offset {off}")
+            full_sha.update(data)
+            b64 = base64.b64encode(hashlib.sha256(data).digest()).decode("ascii")
+            chunks_out.append([length, b64])
+    payload = json.dumps(
+        {
+            "v": 1,
+            "size": total_size,
+            "sha256": full_sha.hexdigest(),
+            "chunks": chunks_out,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return gzip.compress(payload, compresslevel=9)
+
+
+def parse_blockmap(raw_or_gz: bytes) -> dict[str, Any]:
+    """Decode and strictly validate a remote ``.blockmap`` manifest."""
+    if not raw_or_gz or len(raw_or_gz) > MAX_BLOCKMAP_GZ_BYTES:
+        raise ValueError("Blockmap missing or exceeds compressed size cap")
+    if raw_or_gz[:2] == b"\x1f\x8b":
+        raw = gzip.decompress(raw_or_gz)
+    else:
+        raw = raw_or_gz
+    if len(raw) > MAX_BLOCKMAP_RAW_BYTES:
+        raise ValueError("Decompressed blockmap exceeds safety size limit")
+    doc = json.loads(raw.decode("utf-8"))
+    if not isinstance(doc, dict) or doc.get("v") != 1:
+        raise ValueError("Unsupported blockmap version")
+    size = int(doc.get("size") or 0)
+    full_hex = str(doc.get("sha256") or "").strip().lower()
+    if size <= 0 or size > MAX_EXE_BYTES or not re.fullmatch(r"[0-9a-f]{64}", full_hex):
+        raise ValueError("Invalid blockmap target size or SHA-256")
+    raw_chunks = doc.get("chunks")
+    if not isinstance(raw_chunks, list) or not raw_chunks:
+        raise ValueError("Blockmap contains no chunks")
+    parsed_chunks: list[tuple[int, int, bytes]] = []
+    cursor = 0
+    for item in raw_chunks:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise ValueError("Malformed blockmap chunk entry")
+        clen = int(item[0])
+        if clen <= 0 or clen > 4 * 1024 * 1024:
+            raise ValueError("Invalid blockmap chunk length")
+        digest = base64.b64decode(str(item[1]).encode("ascii"), validate=True)
+        if len(digest) != 32:
+            raise ValueError("Invalid blockmap chunk digest")
+        parsed_chunks.append((cursor, clen, digest))
+        cursor += clen
+    if cursor != size:
+        raise ValueError("Blockmap chunk sizes do not match target file size")
+    return {"size": size, "sha256": full_hex, "chunks": parsed_chunks}
+
+
+def _verify_downloaded_exe_integrity(
+    url: str,
+    sha: Any,
+    downloaded: int,
+    magic: bytes,
+    min_bytes: int,
+    expected_sha256: str,
+    sha256_url: str,
+    sig_url: str,
+    trusted_pubkeys: Optional[Sequence[str]],
+    require_signature: bool,
+    sums_txt: Optional[str] = None,
+) -> None:
+    if downloaded < min_bytes:
+        raise ValueError(f"Downloaded binary too small ({downloaded} bytes)")
+    if magic != b"MZ":
+        raise ValueError("Downloaded file is not a valid Windows executable")
+
+    actual_hex = sha.hexdigest().lower()
+    want_hex = (expected_sha256 or "").strip().lower()
+    if not want_hex and sha256_url:
+        txt = sums_txt if sums_txt is not None else _fetch_text_asset(sha256_url).decode("utf-8", errors="replace")
+        asset_name = Path(urllib.parse.urlparse(url).path).name
+        parsed_hex = parse_sha256sums(txt, asset_name)
+        if not parsed_hex:
+            raise ValueError(f"SHA256SUMS.txt missing entry for {asset_name}")
+        want_hex = parsed_hex
+    if want_hex and not hmac.compare_digest(actual_hex, want_hex):
+        raise ValueError("Downloaded binary SHA-256 mismatch")
+
+    pubkeys = tuple(trusted_pubkeys) if trusted_pubkeys is not None else active_trusted_pubkeys()
+    if pubkeys or require_signature:
+        if not sig_url:
+            raise ValueError("Missing cryptographic signature (.sig) for release")
+        sig_bytes = _fetch_text_asset(sig_url, max_bytes=16384)
+        if not verify_ecdsa_p256_sha256(sha.digest(), sig_bytes, pubkeys):
+            raise ValueError("Downloaded binary failed ECDSA signature verification")
+
+
+def _download_with_blockmap(
+    url: str,
+    dest: Path,
+    part: Path,
+    blockmap_url: str,
+    basis_exe: Path,
+    progress_cb: Optional[Callable[[int, int], None]],
+    timeout: float,
+    min_bytes: int,
+    expected_sha256: str,
+    sha256_url: str,
+    sig_url: str,
+    trusted_pubkeys: Optional[Sequence[str]],
+    require_signature: bool,
+) -> Path:
+    """Reconstruct target EXE from ``basis_exe`` + HTTP Range fetches for changed chunks only."""
+    if not is_allowed_download_url(blockmap_url):
+        raise _DeltaFallback("Untrusted blockmap URL")
+    if not basis_exe.is_file():
+        raise _DeltaFallback("Basis EXE missing")
+
+    sums_txt: Optional[str] = None
+    if sha256_url:
+        sums_txt = _fetch_text_asset(sha256_url).decode("utf-8", errors="replace")
+
+    try:
+        bm_bytes = _fetch_text_asset(blockmap_url, max_bytes=MAX_BLOCKMAP_GZ_BYTES, timeout=min(timeout, 30.0))
+        if sums_txt is not None:
+            bm_name = Path(urllib.parse.urlparse(blockmap_url).path).name
+            bm_want = parse_sha256sums(sums_txt, bm_name)
+            if bm_want and not hmac.compare_digest(hashlib.sha256(bm_bytes).hexdigest().lower(), bm_want):
+                raise _DeltaFallback("Blockmap SHA-256 mismatch against SHA256SUMS.txt")
+        bm = parse_blockmap(bm_bytes)
+    except _DeltaFallback:
+        raise
+    except Exception as exc:
+        raise _DeltaFallback(f"Blockmap unavailable or invalid: {exc}") from exc
+    target_size: int = bm["size"]
+    chunks: list[tuple[int, int, bytes]] = bm["chunks"]
+
+    # Index installed basis EXE chunks in one fast pass (~120 ms on ~150 MB)
+    local_index: dict[bytes, tuple[int, int]] = {}
+    basis_spans = _iter_exe_chunk_spans(basis_exe)
+    with open(basis_exe, "rb") as bf:
+        for off, clen in basis_spans:
+            bf.seek(off)
+            raw = bf.read(clen)
+            if len(raw) == clen:
+                local_index.setdefault(hashlib.sha256(raw).digest(), (off, clen))
+
+    # Determine which chunks match locally vs need downloading
+    missing_flags: list[bool] = []
+    missing_bytes = 0
+    for _off, clen, digest in chunks:
+        loc = local_index.get(digest)
+        if loc is not None and loc[1] == clen:
+            missing_flags.append(False)
+        else:
+            missing_flags.append(True)
+            missing_bytes += clen
+
+    if missing_bytes == 0 or missing_bytes > int(target_size * 0.75):
+        raise _DeltaFallback(
+            f"Delta savings insufficient ({missing_bytes}/{target_size} bytes missing)"
+        )
+
+    # Coalesce adjacent missing chunks (merging tiny <=32 KB gaps to minimize HTTP round-trips)
+    MAX_RANGE_BYTES = 8 * 1024 * 1024
+    MERGE_GAP_BYTES = 32_768
+    is_remote = list(missing_flags)
+    i = 0
+    while i < len(is_remote):
+        if not is_remote[i]:
+            i += 1
+            continue
+        # Look ahead for next missing chunk within gap threshold
+        j = i + 1
+        gap = 0
+        while j < len(is_remote) and not is_remote[j]:
+            gap += chunks[j][1]
+            if gap > MERGE_GAP_BYTES:
+                break
+            j += 1
+        if j < len(is_remote) and is_remote[j] and gap <= MERGE_GAP_BYTES:
+            for k in range(i + 1, j):
+                is_remote[k] = True
+            i = j
+        else:
+            i += 1
+
+    # Build contiguous segment plan: ("local", chunk_idx) or ("remote", first_idx, end_idx_excl, start_byte, end_byte)
+    segments: list[tuple[Any, ...]] = []
+    idx = 0
+    while idx < len(chunks):
+        if not is_remote[idx]:
+            segments.append(("local", idx))
+            idx += 1
+            continue
+        r_first = idx
+        r_start = chunks[idx][0]
+        r_bytes = 0
+        while idx < len(chunks) and is_remote[idx] and (r_bytes == 0 or r_bytes + chunks[idx][1] <= MAX_RANGE_BYTES):
+            r_bytes += chunks[idx][1]
+            idx += 1
+        segments.append(("remote", r_first, idx, r_start, r_start + r_bytes))
+
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=_get_ssl_context()),
+        _SafeRedirectHandler(),
+    )
+
+    reused_total = 0
+    fetched_total = 0
+    written_total = 0
+    magic = b""
+    full_sha = hashlib.sha256()
+    last_cb_bytes = -1
+    last_cb_ts = 0.0
+    resolved_url = url
+
+    def _emit_prog(force: bool = False) -> None:
+        nonlocal last_cb_bytes, last_cb_ts
+        if progress_cb is None:
+            return
+        now = time.monotonic()
+        if force or written_total - last_cb_bytes >= 262_144 or (now - last_cb_ts) >= 0.05:
+            last_cb_bytes = written_total
+            last_cb_ts = now
+            progress_cb(written_total, target_size)
+
+    def _fetch_range(r_start: int, r_end_excl: int) -> bytes:
+        nonlocal resolved_url
+        need = r_end_excl - r_start
+        for target_url in ((resolved_url, url) if resolved_url != url else (url,)):
+            req = urllib.request.Request(
+                target_url,
+                headers={
+                    "User-Agent": f"{APP_NAME}/{__version__}",
+                    "Range": f"bytes={r_start}-{r_end_excl - 1}",
+                },
+                method="GET",
+            )
+            try:
+                with opener.open(req, timeout=timeout) as resp:
+                    if not is_allowed_download_url(resp.geturl()):
+                        raise ValueError(f"Blocked redirected URL: {resp.geturl()}")
+                    status = getattr(resp, "status", None)
+                    if status is not None and status != 206:
+                        raise _DeltaFallback(f"HTTP {status} for Range request (expected 206)")
+                    body = resp.read(need + 1)
+                    if len(body) != need:
+                        raise _DeltaFallback(f"Range length mismatch ({len(body)} != {need})")
+                    resolved_url = resp.geturl()
+                    return body
+            except _DeltaFallback:
+                raise
+            except Exception as exc:
+                if target_url == url:
+                    raise _DeltaFallback(f"Range fetch failed: {exc}") from exc
+                resolved_url = url
+        raise _DeltaFallback("Range fetch failed")
+
+    with open(basis_exe, "rb") as bf, open(part, "wb") as out_fh:
+        for seg in segments:
+            if seg[0] == "local":
+                _, cidx = seg
+                _coff, clen, want_digest = chunks[cidx]
+                old_off, _olen = local_index[want_digest]
+                bf.seek(old_off)
+                buf = bf.read(clen)
+                if len(buf) != clen or hashlib.sha256(buf).digest() != want_digest:
+                    raise _DeltaFallback(f"Local basis chunk mismatch at idx {cidx}")
+                if len(magic) < 2:
+                    magic = (magic + buf)[:2 - 0]
+                out_fh.write(buf)
+                full_sha.update(buf)
+                reused_total += clen
+                written_total += clen
+                _emit_prog()
+            else:
+                _, r_first, r_end_idx, r_start, r_end = seg
+                range_bytes = _fetch_range(r_start, r_end)
+                pos_in_buf = 0
+                for cidx in range(r_first, r_end_idx):
+                    _coff, clen, want_digest = chunks[cidx]
+                    cbytes = range_bytes[pos_in_buf : pos_in_buf + clen]
+                    if hashlib.sha256(cbytes).digest() != want_digest:
+                        raise _DeltaFallback(f"Remote range chunk SHA mismatch at idx {cidx}")
+                    pos_in_buf += clen
+                if len(magic) < 2:
+                    magic = (magic + range_bytes)[:2]
+                out_fh.write(range_bytes)
+                full_sha.update(range_bytes)
+                fetched_total += len(range_bytes)
+                written_total += len(range_bytes)
+                _emit_prog()
+
+    _emit_prog(force=True)
+    if written_total != target_size:
+        raise _DeltaFallback(f"Assembled size mismatch ({written_total} != {target_size})")
+    if not hmac.compare_digest(full_sha.hexdigest().lower(), bm["sha256"]):
+        raise _DeltaFallback("Assembled file SHA-256 did not match blockmap")
+
+    _log_info(
+        f"updater: delta reused {reused_total / (1024 * 1024):.2f} MB locally, "
+        f"downloaded {fetched_total / (1024 * 1024):.2f} MB / {target_size / (1024 * 1024):.2f} MB"
+    )
+    _verify_downloaded_exe_integrity(
+        url=url,
+        sha=full_sha,
+        downloaded=written_total,
+        magic=magic,
+        min_bytes=min_bytes,
+        expected_sha256=expected_sha256,
+        sha256_url=sha256_url,
+        sig_url=sig_url,
+        trusted_pubkeys=trusted_pubkeys,
+        require_signature=require_signature,
+        sums_txt=sums_txt,
+    )
+    os.replace(part, dest)
+    return dest
+
+
 def download_update(
     url: str,
     dest: Path,
@@ -543,14 +996,56 @@ def download_update(
     sig_url: str = "",
     trusted_pubkeys: Optional[Sequence[str]] = None,
     require_signature: bool = False,
+    blockmap_url: str = "",
+    basis_exe: Optional[Path] = None,
 ) -> Path:
-    """Download and verify a Windows PE executable from GitHub Releases to dest."""
+    """Download and verify a Windows PE executable from GitHub Releases to dest (using delta ranges when available)."""
     if not is_allowed_download_url(url):
         raise ValueError(f"Refusing download from non-GitHub URL: {url}")
 
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = dest.with_suffix(dest.suffix + ".part")
+
+    eff_basis = basis_exe
+    if eff_basis is None and getattr(sys, "frozen", False):
+        eff_basis = Path(sys.executable)
+    if (
+        blockmap_url
+        and eff_basis is not None
+        and eff_basis.is_file()
+        and os.environ.get("CLICKSHIFT_NO_DELTA") != "1"
+    ):
+        try:
+            return _download_with_blockmap(
+                url=url,
+                dest=dest,
+                part=part,
+                blockmap_url=blockmap_url,
+                basis_exe=eff_basis,
+                progress_cb=progress_cb,
+                timeout=timeout,
+                min_bytes=min_bytes,
+                expected_sha256=expected_sha256,
+                sha256_url=sha256_url,
+                sig_url=sig_url,
+                trusted_pubkeys=trusted_pubkeys,
+                require_signature=require_signature,
+            )
+        except _DeltaFallback as exc:
+            _log_info(f"updater: delta fallback to full download ({exc})")
+            try:
+                if part.exists():
+                    part.unlink()
+            except Exception:
+                pass
+        except Exception:
+            try:
+                if part.exists():
+                    part.unlink()
+            except Exception:
+                pass
+            raise
 
     req = urllib.request.Request(
         url,
@@ -597,31 +1092,18 @@ def download_update(
         if progress_cb is not None and downloaded != last_cb_bytes:
             progress_cb(downloaded, total)
 
-        if downloaded < min_bytes:
-            raise ValueError(f"Downloaded binary too small ({downloaded} bytes)")
-        if magic != b"MZ":
-            raise ValueError("Downloaded file is not a valid Windows executable")
-
-        actual_hex = sha.hexdigest().lower()
-        want_hex = (expected_sha256 or "").strip().lower()
-        if not want_hex and sha256_url:
-            sums_txt = _fetch_text_asset(sha256_url).decode("utf-8", errors="replace")
-            asset_name = Path(urllib.parse.urlparse(url).path).name
-            parsed_hex = parse_sha256sums(sums_txt, asset_name)
-            if not parsed_hex:
-                raise ValueError(f"SHA256SUMS.txt missing entry for {asset_name}")
-            want_hex = parsed_hex
-        if want_hex and not hmac.compare_digest(actual_hex, want_hex):
-            raise ValueError("Downloaded binary SHA-256 mismatch")
-
-        pubkeys = tuple(trusted_pubkeys) if trusted_pubkeys is not None else active_trusted_pubkeys()
-        if pubkeys or require_signature:
-            if not sig_url:
-                raise ValueError("Missing cryptographic signature (.sig) for release")
-            sig_bytes = _fetch_text_asset(sig_url, max_bytes=16384)
-            if not verify_ecdsa_p256_sha256(sha.digest(), sig_bytes, pubkeys):
-                raise ValueError("Downloaded binary failed ECDSA signature verification")
-
+        _verify_downloaded_exe_integrity(
+            url=url,
+            sha=sha,
+            downloaded=downloaded,
+            magic=magic,
+            min_bytes=min_bytes,
+            expected_sha256=expected_sha256,
+            sha256_url=sha256_url,
+            sig_url=sig_url,
+            trusted_pubkeys=trusted_pubkeys,
+            require_signature=require_signature,
+        )
         os.replace(part, dest)
         return dest
     except Exception:
@@ -1174,9 +1656,10 @@ def _download_verified_release(
     info: ReleaseInfo,
     dest: Path,
     progress_cb: Optional[Callable[[int, int], None]] = None,
+    basis_exe: Optional[Path] = None,
 ) -> Path:
     """Call download_update with typed arguments (avoids **dict unpacking and preserves stubbed callbacks)."""
-    if info.expected_sha256 or info.sha256_url or info.sig_url:
+    if info.expected_sha256 or info.sha256_url or info.sig_url or info.blockmap_url:
         return download_update(
             info.download_url,
             dest,
@@ -1184,6 +1667,8 @@ def _download_verified_release(
             expected_sha256=info.expected_sha256,
             sha256_url=info.sha256_url,
             sig_url=info.sig_url,
+            blockmap_url=info.blockmap_url,
+            basis_exe=basis_exe,
         )
     if progress_cb is not None:
         return download_update(info.download_url, dest, progress_cb=progress_cb)
@@ -1217,7 +1702,11 @@ def run_background_update(
 
     try:
         _log_info(f"updater: silently downloading {info.tag_name} in background")
-        _download_verified_release(info, staging_exe)
+        _download_verified_release(
+            info,
+            staging_exe,
+            basis_exe=dest_exe if dest_exe.is_file() else None,
+        )
         write_update_notice(current_version, info.tag_name, silent=True, data_dir=data_dir)
         apply_windows_update(
             staging_exe,
@@ -1289,7 +1778,12 @@ def run_interactive_update(
                     detail=f"{done / (1024 * 1024):.1f} MB downloaded",
                 )
 
-        _download_verified_release(info, staging_exe, progress_cb=on_progress)
+        _download_verified_release(
+            info,
+            staging_exe,
+            progress_cb=on_progress,
+            basis_exe=dest_exe if dest_exe.is_file() else None,
+        )
         popup.update("Installing update and restarting...", progress=98.0, detail="Replacing executable")
         write_update_notice(current_version, info.tag_name, silent=False, data_dir=data_dir)
         apply_windows_update(
