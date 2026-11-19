@@ -698,6 +698,21 @@ def test_delta_download_uses_local_basis_and_range_requests(tmp_path, monkeypatc
     assert downloaded_range_bytes > 0
     assert downloaded_range_bytes < len(new_exe) // 2
 
+    # Regression check: raw DER signatures whose final byte of s is ASCII whitespace
+    # (0x20 space or 0x0a newline) must never have their trailing byte stripped,
+    # and the Linux cryptography verifier fallback must accept all valid DER signatures.
+    from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
+    r_ws = int.from_bytes(b"\x11" * 31 + b"\x20", "big")
+    s_ws = int.from_bytes(b"\x22" * 31 + b"\x0a", "big")
+    der_ws = encode_dss_signature(r_ws, s_ws)
+    assert updater._decode_ecdsa_sig_raw64(der_ws) == (b"\x11" * 31 + b"\x20" + b"\x22" * 31 + b"\x0a")
+
+    digest32 = hashlib.sha256(new_exe).digest()
+    monkeypatch.setattr(updater.sys, "platform", "linux")
+    for _ in range(50):
+        s_try = priv_key.sign(new_exe, ec.ECDSA(hashes.SHA256()))
+        assert updater.verify_ecdsa_p256_sha256(digest32, s_try, [pub_b64]) is True
+
 
 def test_delta_download_falls_back_cleanly_on_http_200_or_bad_blockmap(tmp_path, monkeypatch):
     import hashlib

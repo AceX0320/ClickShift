@@ -370,33 +370,47 @@ def _to_bcrypt_p256_blob(raw_or_b64: str) -> bytes:
     raise ValueError("Unsupported ECDSA P-256 public key format")
 
 
+def _parse_asn1_der_p256(cand: bytes) -> Optional[bytes]:
+    """Parse an exact ASN.1 DER ECDSA P-256 signature into 64-byte (r||s)."""
+    if len(cand) >= 8 and cand[0] == 0x30:
+        idx = 2 if cand[1] < 0x80 else 3
+        seq_len = cand[1] if cand[1] < 0x80 else cand[2]
+        if idx + seq_len == len(cand) and idx + 2 <= len(cand) and cand[idx] == 0x02:
+            rlen = cand[idx + 1]
+            pos = idx + 2 + rlen
+            if pos + 2 <= len(cand) and cand[pos] == 0x02:
+                slen = cand[pos + 1]
+                if pos + 2 + slen == len(cand):
+                    r = cand[idx + 2 : pos].lstrip(b"\x00")
+                    s = cand[pos + 2 : pos + 2 + slen].lstrip(b"\x00")
+                    if len(r) <= 32 and len(s) <= 32:
+                        return r.rjust(32, b"\x00") + s.rjust(32, b"\x00")
+    return None
+
+
 def _decode_ecdsa_sig_raw64(sig_bytes: bytes) -> bytes:
     """Accept raw 64-byte (r||s), base64-encoded, or ASN.1 DER ECDSA P-256 signatures."""
+    if len(sig_bytes) == 64:
+        return sig_bytes
+    der_raw = _parse_asn1_der_p256(sig_bytes)
+    if der_raw is not None:
+        return der_raw
     data = sig_bytes.strip()
-    if len(data) == 64:
-        return data
     if data and data.isascii():
         try:
             decoded = base64.b64decode(data, validate=True)
             if len(decoded) == 64:
                 return decoded
-            data = decoded
+            der_b64 = _parse_asn1_der_p256(decoded)
+            if der_b64 is not None:
+                return der_b64
         except Exception:
             pass
-    # ASN.1 DER: 0x30 <len> 0x02 <rlen> <r> 0x02 <slen> <s>
-    if len(data) >= 8 and data[0] == 0x30:
-        idx = 2 if data[1] < 0x80 else 3
-        if idx < len(data) and data[idx] == 0x02:
-            rlen = data[idx + 1]
-            r = data[idx + 2:idx + 2 + rlen].lstrip(b"\x00")
-            pos = idx + 2 + rlen
-            if pos + 2 <= len(data) and data[pos] == 0x02:
-                slen = data[pos + 1]
-                s = data[pos + 2:pos + 2 + slen].lstrip(b"\x00")
-                if len(r) <= 32 and len(s) <= 32:
-                    return r.rjust(32, b"\x00") + s.rjust(32, b"\x00")
-    if len(sig_bytes) == 64:
-        return sig_bytes
+    der_stripped = _parse_asn1_der_p256(data)
+    if der_stripped is not None:
+        return der_stripped
+    if len(data) == 64:
+        return data
     raise ValueError("Invalid ECDSA P-256 signature encoding")
 
 
