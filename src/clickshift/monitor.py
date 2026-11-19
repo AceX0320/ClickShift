@@ -73,7 +73,7 @@ def _can_write_system_registry() -> bool:
     """Allow registry writes unless pytest is running against the real Windows winreg module."""
     if not IS_WINDOWS or winreg is None:
         return False
-    if _is_pytest_running() and winreg is _REAL_WINREG:
+    if _is_pytest_running() and _REAL_WINREG is not None and winreg is _REAL_WINREG:
         return False
     return True
 
@@ -81,7 +81,7 @@ def _can_write_system_registry() -> bool:
 def _is_python_interpreter(path_str: str) -> bool:
     if not path_str:
         return True
-    name = Path(path_str).name.lower()
+    name = path_str.replace("\\", "/").rsplit("/", 1)[-1].lower()
     return (
         name in {"python.exe", "pythonw.exe", "python", "python3", "python3.exe"}
         or name.startswith("python3.")
@@ -1180,7 +1180,7 @@ def install_context_menu(
     """
     if not IS_WINDOWS:
         return 0
-    if _is_pytest_running() and winreg is _REAL_WINREG:
+    if _is_pytest_running() and _REAL_WINREG is not None and winreg is _REAL_WINREG:
         return 0
 
     def _report(status: str, pct: float) -> None:

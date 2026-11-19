@@ -13,5 +13,6 @@ assets/ClickShiftShell.cer
 tests/_tmp_home/
 logs_118368604049/
 logs_*/
+logs_*.zip
 cloud_worker/.wrangler/
 cloud_worker/node_modules/
