@@ -27,15 +27,57 @@ def _app_version() -> str:
     return __version__
 
 
+def _write_version_file(ver: str) -> Path:
+    parts = [int(p) if p.isdigit() else 0 for p in (ver.split(".") + ["0", "0", "0"])[:4]]
+    vtup = f"({parts[0]}, {parts[1]}, {parts[2]}, {parts[3]})"
+    vstr = f"{parts[0]}.{parts[1]}.{parts[2]}.{parts[3]}"
+    content = f"""# UTF-8
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers={vtup},
+    prodvers={vtup},
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo([
+      StringTable(
+        '040904B0',
+        [
+          StringStruct('CompanyName', 'ClickShift'),
+          StringStruct('FileDescription', 'ClickShift'),
+          StringStruct('FileVersion', '{vstr}'),
+          StringStruct('InternalName', 'ClickShift'),
+          StringStruct('OriginalFilename', 'ClickShift.exe'),
+          StringStruct('ProductName', 'ClickShift'),
+          StringStruct('ProductVersion', '{ver}')
+        ])
+    ]),
+    VarFileInfo([VarStruct('Translation', [1033, 1200])])
+  ]
+)
+"""
+    out = ROOT / "build" / "version_info.txt"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(content, encoding="utf-8")
+    return out
+
+
 def build() -> int:
     ver = _app_version()
     exe_name = f"ClickShift-v{ver}"
+    ver_file = _write_version_file(ver)
     args = [
         sys.executable, "-m", "PyInstaller",
         "--noconfirm", "--clean",
         "--name", exe_name,
         "--onefile",
         "--noconsole",                      # GUI subsystem: no black console window
+        "--version-file", str(ver_file),
         "--specpath", str(ROOT),
         "--paths", str(SRC),
         "--collect-all", "pdf2docx",

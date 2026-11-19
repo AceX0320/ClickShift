@@ -26,7 +26,42 @@ static bool IsValidExeFile(const std::wstring& path) {
     if (path.size() < 5) return false;
     DWORD attrs = GetFileAttributesW(path.c_str());
     if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) return false;
-    return ToLower(path.substr(path.size() - 4)) == L".exe";
+    if (ToLower(path.substr(path.size() - 4)) != L".exe") return false;
+    LPCWSTR fname = PathFindFileNameW(path.c_str());
+    if (fname) {
+        std::wstring lowName = ToLower(fname);
+        if (lowName == L"python.exe" || lowName == L"pythonw.exe" || lowName.rfind(L"python3", 0) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static std::wstring FindLatestDownloadsExe() {
+    wchar_t userProfile[MAX_PATH];
+    userProfile[0] = 0;
+    if (GetEnvironmentVariableW(L"USERPROFILE", userProfile, MAX_PATH) == 0) return L"";
+    std::wstring dir = std::wstring(userProfile) + L"\\Downloads";
+    std::wstring pattern = dir + L"\\ClickShift*.exe";
+    WIN32_FIND_DATAW fd = {};
+    HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
+    if (hFind == INVALID_HANDLE_VALUE) return L"";
+    std::wstring bestPath;
+    ULARGE_INTEGER bestTime = {};
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        std::wstring candidate = dir + L"\\" + fd.cFileName;
+        if (!IsValidExeFile(candidate)) continue;
+        ULARGE_INTEGER cur = {};
+        cur.LowPart = fd.ftLastWriteTime.dwLowDateTime;
+        cur.HighPart = fd.ftLastWriteTime.dwHighDateTime;
+        if (bestPath.empty() || cur.QuadPart >= bestTime.QuadPart) {
+            bestTime = cur;
+            bestPath = candidate;
+        }
+    } while (FindNextFileW(hFind, &fd));
+    FindClose(hFind);
+    return bestPath;
 }
 
 static std::wstring ReadRegString(HKEY root, const wchar_t* subkey, const wchar_t* valueName) {
@@ -121,6 +156,9 @@ static std::wstring FindClickShiftExe() {
         std::wstring fallback = std::wstring(localApp) + L"\\ClickShift\\ClickShift.exe";
         if (IsValidExeFile(fallback)) return fallback;
     }
+    // 5. Latest ClickShift*.exe in %USERPROFILE%\Downloads.
+    std::wstring dlExe = FindLatestDownloadsExe();
+    if (!dlExe.empty()) return dlExe;
     return L"";
 }
 

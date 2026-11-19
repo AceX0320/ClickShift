@@ -57,7 +57,73 @@ def _opt_import(name: str) -> Any:
 
 
 winreg: Any = _opt_import("winreg") if IS_WINDOWS else None
+_REAL_WINREG: Any = winreg
+_REAL_SUBPROCESS_RUN: Any = subprocess.run
 APP_NAME = "ClickShift"
+
+
+def _is_pytest_running() -> bool:
+    return (
+        ("PYTEST_CURRENT_TEST" in os.environ or "pytest" in sys.modules)
+        and os.environ.get("CLICKSHIFT_ALLOW_PYTEST_REGISTRY") != "1"
+    )
+
+
+def _can_write_system_registry() -> bool:
+    """Allow registry writes unless pytest is running against the real Windows winreg module."""
+    if not IS_WINDOWS or winreg is None:
+        return False
+    if _is_pytest_running() and winreg is _REAL_WINREG:
+        return False
+    return True
+
+
+def _is_python_interpreter(path_str: str) -> bool:
+    if not path_str:
+        return True
+    name = Path(path_str).name.lower()
+    return (
+        name in {"python.exe", "pythonw.exe", "python", "python3", "python3.exe"}
+        or name.startswith("python3.")
+    )
+
+
+def _find_installed_clickshift_exe() -> Optional[Path]:
+    """Find a real frozen ClickShift*.exe binary (never python.exe)."""
+    if getattr(sys, "frozen", False) and not _is_python_interpreter(sys.executable):
+        p = Path(sys.executable)
+        if p.is_file():
+            return p
+    if IS_WINDOWS and winreg is not None:
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\ClickShift") as k:
+                val, _ = winreg.QueryValueEx(k, "ExePath")
+            if isinstance(val, str) and val.strip() and not _is_python_interpreter(val):
+                p = Path(val.strip())
+                if p.is_file() and p.suffix.lower() == ".exe":
+                    return p
+        except Exception:
+            pass
+    local_app = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
+    cand_local = local_app / "ClickShift" / "ClickShift.exe"
+    if cand_local.is_file():
+        return cand_local
+    downloads = Path.home() / "Downloads"
+    if downloads.is_dir():
+        try:
+            exes = sorted(
+                (
+                    p for p in downloads.glob("ClickShift*.exe")
+                    if p.is_file() and not p.name.lower().endswith(".old")
+                ),
+                key=lambda x: x.stat().st_mtime,
+                reverse=True,
+            )
+            if exes:
+                return exes[0]
+        except Exception:
+            pass
+    return None
 
 DATA_DIR = Path(os.environ.get("CLICKSHIFT_HOME", str(Path.home() / ".clickshift")))
 
@@ -392,10 +458,17 @@ def _extract_exe_from_cmd(raw: str) -> str:
 
 def register_startup() -> bool:
     """Add ClickShift to the current user's Run key and ensure StartupApproved is enabled."""
-    if not IS_WINDOWS or winreg is None:
+    if not _can_write_system_registry():
         return False
     try:
-        cmd = subprocess.list2cmdline(launch_command(["run"]))
+        if not getattr(sys, "frozen", False) and winreg is _REAL_WINREG:
+            frozen_exe = _find_installed_clickshift_exe()
+            if frozen_exe is not None:
+                cmd = subprocess.list2cmdline([str(frozen_exe), "run"])
+            else:
+                cmd = subprocess.list2cmdline(launch_command(["run"]))
+        else:
+            cmd = subprocess.list2cmdline(launch_command(["run"]))
         with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
                                 winreg.KEY_SET_VALUE) as k:
             winreg.SetValueEx(k, APP_NAME, 0, winreg.REG_SZ, cmd)
@@ -423,7 +496,7 @@ def register_startup() -> bool:
 
 
 def unregister_startup() -> bool:
-    if not IS_WINDOWS or winreg is None:
+    if not _can_write_system_registry():
         return False
     ok = True
     for key_path in (RUN_KEY, STARTUP_APPROVED_KEY):
@@ -451,8 +524,8 @@ def is_startup_registered() -> bool:
             val, _ = winreg.QueryValueEx(k, APP_NAME)
         if not isinstance(val, str) or not val.strip():
             return False
+        target = _extract_exe_from_cmd(val)
         if getattr(sys, "frozen", False):
-            target = _extract_exe_from_cmd(val)
             if not target:
                 return False
             try:
@@ -462,6 +535,8 @@ def is_startup_registered() -> bool:
                     return False
             except Exception:
                 return False
+        elif winreg is _REAL_WINREG and _is_python_interpreter(target) and _find_installed_clickshift_exe() is not None:
+            return False
         try:
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_APPROVED_KEY) as ak:
                 raw, _ = winreg.QueryValueEx(ak, APP_NAME)
@@ -720,7 +795,7 @@ def _unregister_openwith(ext: str) -> None:
 
 def _set_win11_both_menus(enable: bool) -> None:
     """Ensure Windows 11 surfaces full shell context menu verbs on primary right-click too."""
-    if not IS_WINDOWS or winreg is None:
+    if not _can_write_system_registry():
         return
     try:
         if enable:
@@ -743,13 +818,48 @@ def _assets_dir() -> Path:
     return Path(__file__).resolve().parents[2] / "assets"
 
 
-def _save_exe_path_registry() -> None:
-    """Store the current ClickShift executable path in HKCU\\Software\\ClickShift for ClickShiftShell.dll."""
-    if not IS_WINDOWS or winreg is None:
+def _sync_localappdata_copy(src_exe: Path) -> None:
+    """Maintain a resilient backup copy at %LOCALAPPDATA%\\ClickShift\\ClickShift.exe."""
+    if not IS_WINDOWS or _is_pytest_running():
         return
     try:
-        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\ClickShift") as k:
-            winreg.SetValueEx(k, "ExePath", 0, winreg.REG_SZ, exe_path())
+        import shutil
+        local_app = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
+        dst_exe = local_app / "ClickShift" / "ClickShift.exe"
+        dst_exe.parent.mkdir(parents=True, exist_ok=True)
+        if src_exe.resolve() == dst_exe.resolve() or _files_identical(src_exe, dst_exe):
+            return
+        tmp = dst_exe.with_suffix(".exe.stage")
+        shutil.copy2(src_exe, tmp)
+        try:
+            os.replace(tmp, dst_exe)
+        except OSError:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
+def _save_exe_path_registry() -> None:
+    """Store the active frozen ClickShift executable path in HKCU\\Software\\ClickShift for ClickShiftShell.dll."""
+    if not _can_write_system_registry():
+        return
+    try:
+        if getattr(sys, "frozen", False) and not _is_python_interpreter(sys.executable):
+            target_path = exe_path()
+            _sync_localappdata_copy(Path(target_path))
+        else:
+            found = _find_installed_clickshift_exe()
+            if found is None:
+                return
+            target_path = str(found)
+        create_fn = getattr(winreg, "CreateKey", None) or getattr(winreg, "CreateKeyEx", None)
+        if create_fn is None:
+            return
+        with create_fn(winreg.HKEY_CURRENT_USER, r"Software\ClickShift") as k:
+            winreg.SetValueEx(k, "ExePath", 0, winreg.REG_SZ, target_path)
         _delete_key_tree(winreg.HKEY_CURRENT_USER, r"Software\ConFas")
     except Exception as exc:
         _log(f"save ExePath registry failed: {exc}")
@@ -840,6 +950,8 @@ def _install_win11_shell_extension() -> bool:
     the expandable 'Convert with ClickShift >' submenu appears in the Windows 11 main menu.
     """
     if not IS_WINDOWS:
+        return False
+    if _is_pytest_running() and subprocess.run is _REAL_SUBPROCESS_RUN:
         return False
     try:
         import shutil
@@ -974,6 +1086,8 @@ def _install_win11_shell_extension() -> bool:
 def _remove_win11_shell_extension() -> None:
     if not IS_WINDOWS:
         return
+    if _is_pytest_running() and subprocess.run is _REAL_SUBPROCESS_RUN:
+        return
     try:
         local_app = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
         shell_dir = local_app / "ClickShift" / "win11_shell"
@@ -1066,6 +1180,8 @@ def install_context_menu(
     """
     if not IS_WINDOWS:
         return 0
+    if _is_pytest_running() and winreg is _REAL_WINREG:
+        return 0
 
     def _report(status: str, pct: float) -> None:
         if progress_cb is not None:
@@ -1153,7 +1269,7 @@ def _is_win11() -> bool:
 
 
 def remove_context_menu(extensions: Optional[list[str]] = None) -> int:
-    if not IS_WINDOWS or winreg is None:
+    if not _can_write_system_registry():
         return 0
     exts = extensions or MENU_EXTENSIONS
     n = 0
@@ -1705,6 +1821,10 @@ def run_daemon(headless: bool = False) -> int:
     if not acquire_single_instance():
         _log("another instance already running; exiting")
         return 0
+    if IS_WINDOWS and getattr(sys, "frozen", False):
+        _save_exe_path_registry()
+        if not is_startup_registered():
+            register_startup()
     DROP_DIR.mkdir(parents=True, exist_ok=True)
     Path(cfg["watch_folder"]).mkdir(parents=True, exist_ok=True)
     ipc = None

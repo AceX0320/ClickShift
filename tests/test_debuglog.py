@@ -13,10 +13,12 @@ import pytest  # noqa: E402
 def home(tmp_path, monkeypatch):
     h = tmp_path / ".clickshift"
     monkeypatch.setenv("CLICKSHIFT_HOME", str(h))
-    # reload monitor so DATA_DIR picks up env var
-    for m in ("clickshift.monitor", "clickshift.engine", "clickshift.debuglog"):
-        sys.modules.pop(m, None)
     from clickshift import monitor, debuglog
+    monkeypatch.setattr(monitor, "DATA_DIR", h)
+    monkeypatch.setattr(monitor, "CONFIG_FILE", h / "config.json")
+    monkeypatch.setattr(monitor, "LOG_FILE", h / "daemon.log")
+    monkeypatch.setattr(monitor, "PID_FILE", h / "daemon.pid")
+    monkeypatch.setattr(monitor, "_CONFIG_CACHE", None)
     return h, monitor, debuglog
 
 

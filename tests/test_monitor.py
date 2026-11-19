@@ -418,6 +418,25 @@ def test_startup_approved_re_enabled_and_singleton_mutex(tmp_path, monkeypatch):
         monitor._release_single_instance()
 
 
+def test_pytest_guard_blocks_real_registry_and_rejects_python_exe_path(tmp_path, monkeypatch):
+    # 1. Under pytest, real system winreg writes must always be refused
+    monkeypatch.setattr(monitor, "IS_WINDOWS", True)
+    monkeypatch.setattr(monitor, "winreg", monitor._REAL_WINREG)
+    if monitor._REAL_WINREG is not None:
+        assert monitor._can_write_system_registry() is False
+        assert monitor.register_startup() is False
+        assert monitor.unregister_startup() is False
+        assert monitor.install_context_menu(extensions=["pdf"]) == 0
+        assert monitor.remove_context_menu(extensions=["pdf"]) == 0
+
+    # 2. _is_python_interpreter rejects python.exe / pythonw.exe and accepts ClickShift.exe
+    assert monitor._is_python_interpreter(r"C:\Python311\python.exe") is True
+    assert monitor._is_python_interpreter(r"C:\Python311\pythonw.exe") is True
+    assert monitor._is_python_interpreter(r"C:\Users\user\Downloads\ClickShift-v1.0.25.exe") is False
+    assert monitor._is_python_interpreter(r"C:\Users\user\AppData\Local\ClickShift\ClickShift.exe") is False
+
+
+
 
 
 
