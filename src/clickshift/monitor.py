@@ -1104,7 +1104,8 @@ def _install_win11_shell_extension() -> bool:
                 pass
             _log("Win11 IExplorerCommand shell extension registered after one-time trust setup")
             return True
-        _log(f"Win11 shell extension registration stderr: {r2.stderr.strip() or r.stderr.strip()}")
+        r_err = r.stderr.strip() if (r is not None and getattr(r, "stderr", None)) else ""
+        _log(f"Win11 shell extension registration stderr: {(r2.stderr or '').strip() or r_err}")
     except Exception as exc:
         _log(f"Win11 shell extension install error: {exc}")
     return False
