@@ -967,6 +967,28 @@ def _install_win11_shell_extension() -> bool:
         shell_dir = local_app / "ClickShift" / "win11_shell"
         shell_dir.mkdir(parents=True, exist_ok=True)
 
+        msix_path = shell_dir / "ClickShiftShell.msix"
+        cer_path = shell_dir / "ClickShiftShell.cer"
+        manifest_path = shell_dir / "AppxManifest.xml"
+        thumb_file = shell_dir / "installed_cert.thumbprint"
+        stamp_file = shell_dir / ".installed_sha256"
+
+        # If ClickShift.ShellExtension is already registered in Windows 11 and the native
+        # C++ binaries (ClickShiftShell.dll / ClickShiftStub.exe) haven't changed, keep the
+        # active registration intact instead of tearing down the package for a new CI cert.
+        already_reg = _shell_ext_pkg_registered()
+        if already_reg and (shell_dir / "ClickShiftShell.dll").exists():
+            dll_dst = shell_dir / "ClickShiftShell.dll"
+            stub_dst = shell_dir / "ClickShiftStub.exe"
+            stub_src = src_assets / "ClickShiftStub.exe"
+            if _files_identical(dll_src, dll_dst) and (not stub_src.exists() or _files_identical(stub_src, stub_dst)):
+                return True
+            src_cer = src_assets / "ClickShiftShell.cer"
+            prev_tp = thumb_file.read_text(encoding="utf-8", errors="ignore").strip().upper() if thumb_file.exists() else ""
+            new_tp = _cer_thumbprint(src_cer).upper() if src_cer.exists() else ""
+            if prev_tp and new_tp and prev_tp != new_tp:
+                return True
+
         for fname in ("ClickShiftShell.dll", "ClickShiftStub.exe", "AppxManifest.xml",
                       "clickshift.png", "clickshift.ico", "ClickShiftShell.msix", "ClickShiftShell.cer"):
             s = src_assets / fname
@@ -977,11 +999,6 @@ def _install_win11_shell_extension() -> bool:
                 except Exception:
                     pass
 
-        msix_path = shell_dir / "ClickShiftShell.msix"
-        cer_path = shell_dir / "ClickShiftShell.cer"
-        manifest_path = shell_dir / "AppxManifest.xml"
-        thumb_file = shell_dir / "installed_cert.thumbprint"
-        stamp_file = shell_dir / ".installed_sha256"
         cur_digest = _shell_assets_digest(shell_dir)
 
         try:
@@ -994,24 +1011,33 @@ def _install_win11_shell_extension() -> bool:
         except Exception:
             pass
 
-        # 1. Remove any stale version (or legacy ConFas extension) and try direct registration
+        # 1. Try direct in-place Add-AppxPackage registration (without removing ClickShift.ShellExtension first,
+        # so an untrusted cert or slow AppXSvc never destroys an already-installed working shell extension).
         msix_lit = str(msix_path).replace("'", "''")
         manifest_lit = str(manifest_path).replace("'", "''")
+        add_pkg_expr = (
+            f"Add-AppxPackage -Path '{msix_lit}' -ForceApplicationShutdown -ErrorAction Stop"
+            if msix_path.exists()
+            else f"Add-AppxPackage -Register '{manifest_lit}' -ForceApplicationShutdown -ErrorAction Stop"
+        )
         direct_cmd = (
-            "Get-AppxPackage -Name 'ClickShift.ShellExtension' -ErrorAction SilentlyContinue | Remove-AppxPackage -ErrorAction SilentlyContinue; "
             "Get-AppxPackage -Name 'ConFas.ShellExtension' -ErrorAction SilentlyContinue | Remove-AppxPackage -ErrorAction SilentlyContinue; "
-            + (
-                f"Add-AppxPackage -Path '{msix_lit}' -ForceApplicationShutdown -ErrorAction Stop"
-                if msix_path.exists()
-                else f"Add-AppxPackage -Register '{manifest_lit}' -ForceApplicationShutdown -ErrorAction Stop"
+            f"try {{ {add_pkg_expr} }} catch {{ "
+            "Get-AppxPackage -Name 'ClickShift.ShellExtension' -ErrorAction SilentlyContinue | Remove-AppxPackage -ErrorAction SilentlyContinue; "
+            f"{add_pkg_expr} }}"
+        )
+        r = None
+        try:
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", _ps_encoded(direct_cmd)],
+                capture_output=True, text=True, timeout=60,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
-        )
-        r = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", _ps_encoded(direct_cmd)],
-            capture_output=True, text=True, timeout=25,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-        if r.returncode == 0:
+        except subprocess.TimeoutExpired:
+            _log("Win11 direct Add-AppxPackage timed out after 60s; proceeding to trust verification")
+            if _shell_ext_pkg_registered():
+                return True
+        if r is not None and r.returncode == 0:
             try:
                 stamp_file.write_text(cur_digest, encoding="utf-8")
             except Exception:
@@ -1068,7 +1094,7 @@ def _install_win11_shell_extension() -> bool:
 
         r2 = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", _ps_encoded(direct_cmd)],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=60,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         if r2.returncode == 0:

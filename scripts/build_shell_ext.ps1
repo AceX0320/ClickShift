@@ -73,22 +73,39 @@ if ($makeappx -and $signtool) {
         Copy-Item "$assets\clickshift.ico"   "$stageDir\clickshift.ico"       -Force
     }
 
-    $cert = New-SelfSignedCertificate -Type Custom -Subject "CN=ClickShift" -KeyUsage DigitalSignature -FriendlyName "ClickShift Shell Extension" -CertStoreLocation "Cert:\CurrentUser\My" -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3", "2.5.29.19={text}")
+    $persistentPfx = Join-Path $srcExt "ClickShiftShell.pfx"
+    $persistentCer = Join-Path $srcExt "ClickShiftShell.cer"
     $cerPath = Join-Path $assets "ClickShiftShell.cer"
-    $pfxPath = Join-Path $env:TEMP "ClickShiftShell.pfx"
     $pwd = ConvertTo-SecureString -String "clickshift-local" -Force -AsPlainText
-    Export-Certificate -Cert $cert -FilePath $cerPath -Force | Out-Null
-    Export-PfxCertificate -Cert $cert -FilePath $pfxPath -Password $pwd -Force | Out-Null
 
-    & $signtool.FullName sign /fd SHA256 /f $pfxPath /p "clickshift-local" "$stageDir\ClickShiftShell.dll"
-    & $signtool.FullName sign /fd SHA256 /f $pfxPath /p "clickshift-local" "$stageDir\ClickShiftStub.exe"
+    if ((Test-Path $persistentPfx) -and (Test-Path $persistentCer)) {
+        Write-Host "Using persistent shell extension certificate ($persistentCer)..."
+        Copy-Item $persistentCer $cerPath -Force
+        $pfxToUse = $persistentPfx
+        $cleanupPfx = $false
+    } else {
+        Write-Host "Generating persistent shell extension certificate..."
+        $notAfter = (Get-Date).AddYears(25)
+        $cert = New-SelfSignedCertificate -Type Custom -Subject "CN=ClickShift" -KeyUsage DigitalSignature -FriendlyName "ClickShift Shell Extension" -CertStoreLocation "Cert:\CurrentUser\My" -NotAfter $notAfter -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3", "2.5.29.19={text}")
+        Export-Certificate -Cert $cert -FilePath $persistentCer -Force | Out-Null
+        Export-PfxCertificate -Cert $cert -FilePath $persistentPfx -Password $pwd -Force | Out-Null
+        Copy-Item $persistentCer $cerPath -Force
+        Remove-Item "Cert:\CurrentUser\My\$($cert.Thumbprint)" -Force -ErrorAction SilentlyContinue
+        $pfxToUse = $persistentPfx
+        $cleanupPfx = $false
+    }
+
+    & $signtool.FullName sign /fd SHA256 /f $pfxToUse /p "clickshift-local" "$stageDir\ClickShiftShell.dll"
+    & $signtool.FullName sign /fd SHA256 /f $pfxToUse /p "clickshift-local" "$stageDir\ClickShiftStub.exe"
 
     $msixPath = Join-Path $assets "ClickShiftShell.msix"
     if (Test-Path $msixPath) { Remove-Item $msixPath -Force }
     & $makeappx.FullName pack /d $stageDir /p $msixPath /o
-    & $signtool.FullName sign /fd SHA256 /f $pfxPath /p "clickshift-local" $msixPath
+    & $signtool.FullName sign /fd SHA256 /f $pfxToUse /p "clickshift-local" $msixPath
 
-    Remove-Item $pfxPath -Force -ErrorAction SilentlyContinue
+    if ($cleanupPfx) {
+        Remove-Item $pfxToUse -Force -ErrorAction SilentlyContinue
+    }
     Remove-Item $stageDir -Recurse -Force -ErrorAction SilentlyContinue
     Write-Host "Built and signed $msixPath"
 } else {
