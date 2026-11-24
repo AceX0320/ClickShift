@@ -9,5 +9,5 @@ cli         : command line / right-click entry point
 __main__    : `python -m clickshift ...`
 """
 
-__version__ = "1.0.27"
+__version__ = "1.0.28"
 APP_NAME = "ClickShift"

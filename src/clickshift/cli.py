@@ -200,9 +200,38 @@ def cmd_convert(args) -> int:
         jobs.append((str(f.resolve()), t))
     # (progress printed per file as conversions finish)
     results = []
+    combine_target = (chosen_target or "").lower().lstrip(".")
+    combine_mode = (
+        len(files) > 1
+        and combine_target in ("pdf", "docx", "pptx")
+        and all(f.suffix.lstrip(".").lower() in IMAGE_EXTS for f in files)
+    )
+
+    conv_popup: Any = None
+    try:
+        from .updater import ConversionProgressPopup
+        conv_popup = ConversionProgressPopup(
+            jobs,
+            combine_target=combine_target if combine_mode else None,
+        ).start()
+    except Exception:
+        conv_popup = None
+
+    def on_step(info: dict) -> None:
+        if conv_popup is not None and isinstance(info, dict):
+            conv_popup.on_step(
+                file_path=str(info.get("file") or info.get("src") or ""),
+                dst_ext=str(info.get("dst_ext") or ""),
+                file_idx=info.get("file_idx"),
+                total_files=info.get("total_files"),
+                sub_frac=info.get("sub_frac"),
+                detail=str(info.get("detail") or ""),
+            )
 
     def on_done(res):
         results.append(res)
+        if conv_popup is not None:
+            conv_popup.on_file_done(res)
         mark = OK if res.ok else _errsign()
         ms = f"{res.elapsed_ms:.0f} ms"
         line = f"  {mark} {Path(res.source).name} -> {Path(res.target).name}" \
@@ -216,34 +245,54 @@ def cmd_convert(args) -> int:
             print(f"      debug report: {rep}")
 
     t0 = time.perf_counter()
-    combine_target = (chosen_target or "").lower().lstrip(".")
-    combine_mode = (
-        len(files) > 1
-        and combine_target in ("pdf", "docx", "pptx")
-        and all(f.suffix.lstrip(".").lower() in IMAGE_EXTS for f in files)
-    )
-    if combine_mode:
-        ordered = [str(f.resolve()) for f in files]
-        ipc_res = monitor.try_daemon_combine(
-            ordered, combine_target, enable_ml=not args.no_ml, progress=on_done
-        )
-        if ipc_res is None:
-            from .engine import get_engine
+    try:
+        if combine_mode:
+            ordered = [str(f.resolve()) for f in files]
+            try:
+                ipc_res = monitor.try_daemon_combine(
+                    ordered, combine_target, enable_ml=not args.no_ml, progress=on_done, step_progress=on_step
+                )
+            except TypeError:
+                ipc_res = monitor.try_daemon_combine(
+                    ordered, combine_target, enable_ml=not args.no_ml, progress=on_done
+                )
+            if ipc_res is None:
+                from .engine import get_engine
 
-            results.clear()
-            engine = get_engine(enable_ml=not args.no_ml)
-            on_done(engine.combine_images(ordered, combine_target))
-    else:
-        ipc_res = monitor.try_daemon_convert(jobs, enable_ml=not args.no_ml, progress=on_done)
-        if ipc_res is None:
-            from .engine import get_engine
+                results.clear()
+                engine = get_engine(enable_ml=not args.no_ml)
+                try:
+                    on_done(engine.combine_images(ordered, combine_target, step_progress=on_step))
+                except TypeError:
+                    on_done(engine.combine_images(ordered, combine_target))
+        else:
+            try:
+                ipc_res = monitor.try_daemon_convert(
+                    jobs, enable_ml=not args.no_ml, progress=on_done, step_progress=on_step
+                )
+            except TypeError:
+                ipc_res = monitor.try_daemon_convert(jobs, enable_ml=not args.no_ml, progress=on_done)
+            if ipc_res is None:
+                from .engine import get_engine
 
-            results.clear()
-            engine = get_engine(enable_ml=not args.no_ml)
-            engine.convert_many(jobs, progress=on_done)
-    total_ms = (time.perf_counter() - t0) * 1000
-    ok_n = sum(1 for r in results if r.ok)
-    fail_n = len(results) - ok_n
+                results.clear()
+                engine = get_engine(enable_ml=not args.no_ml)
+                try:
+                    engine.convert_many(jobs, progress=on_done, step_progress=on_step)
+                except TypeError:
+                    engine.convert_many(jobs, progress=on_done)
+        total_ms = (time.perf_counter() - t0) * 1000
+        ok_n = sum(1 for r in results if r.ok)
+        fail_n = len(results) - ok_n
+        if conv_popup is not None:
+            if fail_n == 0:
+                conv_popup.complete(delay_s=0.45)
+            else:
+                conv_popup.error(f"{fail_n} conversion(s) failed", delay_s=1.2)
+    except Exception as exc:
+        if conv_popup is not None:
+            conv_popup.error(str(exc), delay_s=1.2)
+        raise
     print(f"\n{ok_n} converted, {fail_n} failed - total {total_ms:.0f} ms")
     # Visual feedback policy: successes stay SILENT (the converted file
     # appearing next to the original is the confirmation); only failures pop.
@@ -289,8 +338,14 @@ def cmd_install(args) -> int:
     try:
         popup.update("Preparing ClickShift configuration...", progress=10, detail="Creating data and watch folders")
         monitor.DATA_DIR.mkdir(parents=True, exist_ok=True)
-        monitor.save_config(monitor.load_config())
-        Path(monitor.DEFAULT_CONFIG["watch_folder"]).mkdir(exist_ok=True)
+        cfg_init = monitor.load_config()
+        try:
+            from .cloud import _contributor_id, register_download_id
+            register_download_id(_contributor_id(cfg_init), cfg=cfg_init)
+        except Exception:
+            pass
+        monitor.save_config(cfg_init)
+        Path(str(monitor.DEFAULT_CONFIG["watch_folder"])).mkdir(parents=True, exist_ok=True)
 
         if monitor.IS_WINDOWS:
             n = monitor.install_context_menu(
@@ -395,13 +450,16 @@ def cmd_stats(args) -> int:
           f"(toggle with `clickshift config ml=off` or CLICKSHIFT_DISABLE_ML=1)")
     # cloud sync status
     try:
-        from .cloud import CloudSync, DEFAULT_GIST_ID, load_cloud_config
+        from .cloud import CloudSync, DEFAULT_GIST_ID, _contributor_id, load_cloud_config
         cfg = load_cloud_config()
         sel_stub = _StubSelector()
         cs = CloudSync(sel_stub, cfg)
+        cid = _contributor_id(cfg)
+        auth_ok = cs.is_client_authorized(cid)
         gist_cfgured = (cfg.get("cloud_gist_id") or "") not in ("", DEFAULT_GIST_ID)
         print(f"Cloud learnings sync: {'ON' if cs.enabled() else 'off'}  "
               f"(mode={cs.mode}, endpoint={'set' if cs.enabled() else 'not configured'})")
+        print(f"  download client ID: {cid}  (verified download: {'YES' if auth_ok else 'NO - blocked'})")
         if not cs.enabled() and not gist_cfgured and not cs.url:
             print("  -> share your ML improvements with other users:")
             print("     ClickShift.exe config cloud_url=https://<your-cloud-worker-url> cloud_sync=on")
@@ -496,6 +554,42 @@ def cmd_config(args) -> int:
                   f"in your environment so tokens never sit in shell history.")
         elif k in ("cloud_interval", "cloud_interval_s"):
             cfg["cloud_interval_s"] = max(60, int(float(v)))
+        elif k in ("cloud_require_registered", "require_registered"):
+            cfg["cloud_require_registered"] = v.lower() in ("1", "on", "true", "yes")
+        elif k in ("cloud_register", "register_download"):
+            from .cloud import CloudSync, _contributor_id, register_download_id
+            cid = _contributor_id(cfg)
+            reg_info = register_download_id(cid, cfg=cfg)
+            cs = CloudSync(_StubSelector(), cfg)
+            cs.register_download()
+            print(f"registered download client_id={cid} (proof={reg_info['download_proof']})")
+        elif k in ("cloud_allow_id", "allow_client_id"):
+            from .cloud import is_valid_client_id, register_download_id
+            cid = v.strip().lower()
+            if not is_valid_client_id(cid):
+                print(f"error: invalid client_id '{v}' (expected 12-64 hex chars)", file=sys.stderr)
+                return 1
+            allowed = list(cfg.get("cloud_allowed_client_ids") or [])
+            if cid not in allowed:
+                allowed.append(cid)
+            cfg["cloud_allowed_client_ids"] = allowed
+            revoked = [x for x in (cfg.get("cloud_revoked_client_ids") or []) if str(x).lower() != cid]
+            cfg["cloud_revoked_client_ids"] = revoked
+            register_download_id(cid, cfg=cfg)
+        elif k in ("cloud_allowed_ids", "allowed_client_ids"):
+            from .cloud import is_valid_client_id, register_download_id
+            raw_ids = [x.strip().lower() for x in v.split(",") if x.strip()]
+            if any(not is_valid_client_id(x) for x in raw_ids):
+                print("error: all client IDs in cloud_allowed_ids must be 12-64 hex chars", file=sys.stderr)
+                return 1
+            cfg["cloud_allowed_client_ids"] = raw_ids
+            for x in raw_ids:
+                register_download_id(x, cfg=cfg)
+        elif k in ("cloud_revoke_id", "revoke_client_id"):
+            from .cloud import revoke_download_id
+            cid = v.strip().lower()
+            revoke_download_id(cid, cfg=cfg)
+            print(f"revoked client_id={cid} (its data will not be added to the cloud)")
         elif k in ("auto_update", "auto_update_check"):
             cfg["auto_update_check"] = v.lower() in ("1", "on", "true", "yes")
         elif k in ("update_interval", "update_check_interval_s"):

@@ -116,6 +116,30 @@ def _ensure_stdio() -> None:
 _ensure_stdio()
 
 
+_PROGRESS_TLS = threading.local()
+
+
+@contextlib.contextmanager
+def subprogress_scope(cb: Optional[Callable[[int, int, str], None]]):
+    """Install a thread-local sub-progress callback ``cb(done, total, detail)``."""
+    prev = getattr(_PROGRESS_TLS, "cb", None)
+    _PROGRESS_TLS.cb = cb
+    try:
+        yield
+    finally:
+        _PROGRESS_TLS.cb = prev
+
+
+def _report_subprogress(done: int, total: int, detail: str = "") -> None:
+    """Emit fine-grained page/slide/image progress to the active thread-local listener."""
+    cb = getattr(_PROGRESS_TLS, "cb", None)
+    if cb is not None and total > 0:
+        try:
+            cb(int(done), int(total), detail)
+        except Exception:
+            pass
+
+
 # --------------------------------------------------------------------------- #
 #  Backend discovery (lazy per-attribute probing; zero cold import overhead)
 # --------------------------------------------------------------------------- #
@@ -1565,6 +1589,7 @@ def conv_images_to_docx(srcs: list[Path], dst: Path) -> None:
     max_h_in = float(sec.page_height.inches - sec.top_margin.inches - sec.bottom_margin.inches) - 0.15
 
     for idx, src in enumerate(srcs):
+        _report_subprogress(idx + 1, len(srcs), f"Image {idx + 1} of {len(srcs)}")
         p = doc.add_paragraph()
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         p.paragraph_format.space_before = Pt(0)
@@ -1603,7 +1628,8 @@ def conv_images_to_pptx(srcs: list[Path], dst: Path) -> None:
     avail_w = SLIDE_W - 2 * MARGIN
     avail_h = SLIDE_H - 2 * MARGIN
 
-    for src in srcs:
+    for idx, src in enumerate(srcs, 1):
+        _report_subprogress(idx, len(srcs), f"Image {idx} of {len(srcs)}")
         slide = prs.slides.add_slide(blank_layout)
         stream, w_px, h_px = _image_to_embed_stream(src)
         scale = min(avail_w / max(1, w_px), avail_h / max(1, h_px))
@@ -1649,6 +1675,7 @@ def conv_pdf_to_html_fidelity(src: Path, dst: Path) -> None:
                 "</style></head><body>\n"
             )
             for i, page in enumerate(doc, start=1):
+                _report_subprogress(i, len(doc), f"Page {i} of {len(doc)}")
                 svg = page.get_svg_image(matrix=fitz.Identity, text_as_path=True)
                 head = _SVG_HDR_RE.sub("", svg[:512], count=1)
                 svg = head + svg[512:] if len(svg) > 512 else head
@@ -1772,7 +1799,10 @@ def _md_analyze_typography(doc: Any, text_flags: int = 0) -> tuple[float, list[f
     size_counts: Counter[float] = Counter()
     words: set[str] = set()
     cached_blocks: dict[int, list] = {}
-    for i in range(min(len(doc), 60)):
+    n_analyze = min(len(doc), 60)
+    total_md_steps = max(1, n_analyze + len(doc))
+    for i in range(n_analyze):
+        _report_subprogress(i + 1, total_md_steps, f"Analyzing page {i + 1} of {len(doc)}")
         page = doc[i]
         pdict = page.get_text("dict", flags=text_flags) if text_flags else page.get_text("dict")
         text_blocks = [b for b in pdict.get("blocks", ()) if b.get("type") == 0]
@@ -1991,7 +2021,10 @@ def conv_pdf_to_md_structured(src: Path, dst: Path) -> None:
         body_size, tiers, doc_words, cached_blocks = _md_analyze_typography(doc, text_flags=text_flags)
         items_all: list[tuple[str, str]] = []
 
+        n_analyze_done = min(len(doc), 60)
+        total_md_steps = max(1, n_analyze_done + len(doc))
         for page_idx, page in enumerate(doc):
+            _report_subprogress(n_analyze_done + page_idx + 1, total_md_steps, f"Page {page_idx + 1} of {len(doc)}")
             ph = page.rect.height
             diag_boxes = _md_diagram_boxes(page)
             tables = _md_real_tables(page)
@@ -2453,7 +2486,8 @@ def conv_pdf_to_pptx(src: Path, dst: Path) -> None:
         blank_layout = prs.slide_layouts[min(6, len(prs.slide_layouts) - 1)]
         xref_cache: dict[int, Optional[bytes]] = {}
 
-        for page in pdf:
+        for p_idx, page in enumerate(pdf, 1):
+            _report_subprogress(p_idx, len(pdf), f"Page {p_idx} of {len(pdf)}")
             slide = prs.slides.add_slide(blank_layout)
             pw = max(1.0, float(page.rect.width))
             ph = max(1.0, float(page.rect.height))
@@ -2888,6 +2922,7 @@ def conv_pptx_to_docx(src: Path, dst: Path) -> None:
         return
 
     for s_idx, slide in enumerate(prs.slides):
+        _report_subprogress(s_idx + 1, len(prs.slides), f"Slide {s_idx + 1} of {len(prs.slides)}")
         if s_idx > 0:
             doc.add_page_break()
         title_shape = None
@@ -3268,7 +3303,8 @@ def conv_pptx_to_pdf(src: Path, dst: Path) -> None:
     try:
         if len(prs.slides) == 0:
             pdf.new_page(width=sw, height=sh)
-        for slide in prs.slides:
+        for s_idx, slide in enumerate(prs.slides, 1):
+            _report_subprogress(s_idx, len(prs.slides), f"Slide {s_idx} of {len(prs.slides)}")
             page = pdf.new_page(width=sw, height=sh)
             bg_rgb, bg_blob = _pptx_slide_bg(slide, pptx_dml, theme_map)
             if bg_rgb is not None:
@@ -3964,6 +4000,7 @@ def _render_pdf_pages(pdf_path: Path, out_dir: Path, ext: str) -> int:
         out_dir.mkdir(parents=True, exist_ok=True)
         if ext == "png":
             for i, page in enumerate(doc, start=1):
+                _report_subprogress(i, n, f"Rendering page {i} of {n}")
                 pix = page.get_pixmap(dpi=PAGE_RENDER_DPI, alpha=False)
                 pix.save(str(out_dir / f"page_{i:0{width}d}.{ext}"))
             return n
@@ -3994,6 +4031,7 @@ def _render_pdf_pages(pdf_path: Path, out_dir: Path, ext: str) -> int:
         pending: list[Any] = []
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="clickshift-imgenc") as pool:
             for i, page in enumerate(doc, start=1):
+                _report_subprogress(i, n, f"Rendering page {i} of {n}")
                 pix = page.get_pixmap(dpi=PAGE_RENDER_DPI, alpha=False)
                 target = str(out_dir / f"page_{i:0{width}d}.{ext}")
                 pending.append(pool.submit(_encode_one, pix.width, pix.height, pix.samples, target))
@@ -4477,7 +4515,8 @@ class ConversionEngine:
     # -- combine multiple images -> single pdf/docx/pptx -------------------- #
     def combine_images(self, srcs: Sequence[str | Path], dst_ext: str,
                        out_dir: Optional[str | Path] = None,
-                       out_path: Optional[str | Path] = None) -> ConversionResult:
+                       out_path: Optional[str | Path] = None,
+                       step_progress: Optional[Callable[[dict[str, Any]], None]] = None) -> ConversionResult:
         from . import debuglog
         paths = [Path(s) for s in srcs if Path(s).exists()]
         ext = _norm_ext(dst_ext)
@@ -4498,9 +4537,25 @@ class ConversionEngine:
         backend_name = {".pdf": "pillow-pdf", ".docx": "pillow-python-docx", ".pptx": "pillow-python-pptx"}[ext]
         fn = {".pdf": conv_images_to_pdf, ".docx": conv_images_to_docx, ".pptx": conv_images_to_pptx}[ext]
         t0 = time.perf_counter()
+
+        def _sub_cb(done_u: int, tot_u: int, det: str) -> None:
+            if step_progress is not None and tot_u > 0:
+                try:
+                    step_progress({
+                        "file": paths[min(max(0, done_u - 1), len(paths) - 1)].name,
+                        "dst_ext": ext.lstrip("."),
+                        "file_idx": min(max(0, done_u - 1), len(paths) - 1),
+                        "total_files": len(paths),
+                        "sub_frac": done_u / float(tot_u),
+                        "detail": det,
+                    })
+                except Exception:
+                    pass
+
         try:
             base.parent.mkdir(parents=True, exist_ok=True)
-            fn(paths, base)
+            with subprogress_scope(_sub_cb if step_progress is not None else None):
+                fn(paths, base)
             ms = (time.perf_counter() - t0) * 1000
             try:
                 bytes_out = base.stat().st_size
@@ -4527,11 +4582,54 @@ class ConversionEngine:
 
     # -- batch -------------------------------------------------------------- #
     def convert_many(self, jobs: list[tuple[str, str]],
-                     progress: Optional[Callable[[ConversionResult], None]] = None) -> list[ConversionResult]:
+                     progress: Optional[Callable[[ConversionResult], None]] = None,
+                     step_progress: Optional[Callable[[dict[str, Any]], None]] = None) -> list[ConversionResult]:
         if not jobs:
             return []
+        n_jobs = len(jobs)
+
+        def _convert_with_steps(idx: int, src_s: str, dst_e: str) -> ConversionResult:
+            if step_progress is None:
+                return self.convert(src_s, dst_e)
+            src_name = Path(src_s).name
+            clean_dst = str(dst_e).lstrip(".")
+            last_emit = [0.0]
+            try:
+                step_progress({
+                    "file": src_name,
+                    "dst_ext": clean_dst,
+                    "file_idx": idx,
+                    "total_files": n_jobs,
+                    "sub_frac": 0.0,
+                    "detail": "",
+                })
+            except Exception:
+                pass
+
+            def _sub_cb(done_u: int, tot_u: int, det: str) -> None:
+                if tot_u <= 0:
+                    return
+                now_t = time.perf_counter()
+                if done_u < tot_u and (now_t - last_emit[0]) < 0.06:
+                    return
+                last_emit[0] = now_t
+                try:
+                    step_progress({
+                        "file": src_name,
+                        "dst_ext": clean_dst,
+                        "file_idx": idx,
+                        "total_files": n_jobs,
+                        "sub_frac": done_u / float(tot_u),
+                        "detail": det,
+                    })
+                except Exception:
+                    pass
+
+            with subprogress_scope(_sub_cb):
+                return self.convert(src_s, dst_e)
+
         if len(jobs) == 1:
-            res = self.convert(jobs[0][0], jobs[0][1])
+            res = _convert_with_steps(0, jobs[0][0], jobs[0][1])
             if progress:
                 try:
                     progress(res)
@@ -4667,11 +4765,11 @@ class ConversionEngine:
 
             if len(remaining) == 1:
                 idx, s, e = remaining[0]
-                res = self.convert(s, e)
+                res = _convert_with_steps(idx, s, e)
                 results[idx] = res
                 _emit(res)
             elif remaining:
-                fut_map = {self._pool.submit(self.convert, s, e): idx for idx, s, e in remaining}
+                fut_map = {self._pool.submit(_convert_with_steps, idx, s, e): idx for idx, s, e in remaining}
                 for fut in as_completed(fut_map):
                     idx = fut_map[fut]
                     res = fut.result()

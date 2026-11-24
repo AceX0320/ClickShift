@@ -288,3 +288,107 @@ def test_default_cloud_url_enables_uncustomized_and_honors_opt_out(tmp_path, mon
     loaded_off = cloud.load_cloud_config()
     assert loaded_off["cloud_enabled"] is False
 
+
+def test_download_client_id_protection_blocks_unregistered_data(tmp_path, monkeypatch):
+    """Unregistered or revoked client IDs must never add data to the cloud pool."""
+    monkeypatch.setenv("CLICKSHIFT_HOME", str(tmp_path))
+    sel = BanditSelector(history_file=tmp_path / "history.jsonl")
+    src = tmp_path / "doc.txt"
+    src.write_bytes(b"hello world")
+    sel.record(src, ".html", "text-passthru", 5.0, True)
+
+    valid_id = "a66c09d196954a1c"
+    rogue_id = "deadbeefcafebabe"
+
+    # 1. Attestation proof verification
+    reg_info = cloud.register_download_id(valid_id, version="1.0.27", exe_sha256="abc12345")
+    assert cloud.verify_download_proof(
+        valid_id,
+        reg_info["download_proof"],
+        version="1.0.27",
+        exe_sha256="abc12345",
+    )
+    assert not cloud.verify_download_proof(
+        rogue_id,
+        reg_info["download_proof"],
+        version="1.0.27",
+        exe_sha256="abc12345",
+    )
+    assert not cloud.verify_download_proof(
+        valid_id,
+        "0" * 32,
+        version="1.0.27",
+        exe_sha256="abc12345",
+    )
+
+    # 2. merge_states rejects contributor payloads whose client_id is not in allowed_client_ids
+    s_valid = _mk_state(1, n_updates=6, arm="txt>html|text-passthru")
+    s_valid["client_id"] = valid_id
+    s_rogue = _mk_state(2, n_updates=50, arm="txt>html|text-passthru")
+    s_rogue["client_id"] = rogue_id
+    s_missing = _mk_state(3, n_updates=50, arm="txt>html|text-passthru")
+
+    merged = cloud.merge_states(
+        [s_valid, s_rogue, s_missing],
+        allowed_client_ids=[valid_id],
+    )
+    # Only the 6 samples from valid_id are merged; rogue_id (50) and missing (50) are dropped
+    assert merged["bandit"]["txt>html|text-passthru"]["n"] == 6
+
+    # Forged download_proof on an otherwise valid client_id is also rejected
+    s_forged = _mk_state(4, n_updates=20, arm="txt>html|text-passthru")
+    s_forged["client_id"] = valid_id
+    s_forged["download_proof"] = "f" * 32
+    merged_forged = cloud.merge_states([s_forged], allowed_client_ids=[valid_id])
+    assert merged_forged["bandit"] == {}
+
+    # 3. CloudSync.push() blocks upload when client_id is not in allowed download IDs
+    sent_requests = []
+
+    def fake_req(url, method="GET", body=None, headers=None, timeout=15):
+        sent_requests.append((method, url, body, headers))
+        return {"ok": True}
+
+    monkeypatch.setattr(cloud, "_request", fake_req)
+
+    cs_blocked = cloud.CloudSync(
+        sel,
+        {
+            "cloud_enabled": True,
+            "cloud_mode": "url",
+            "cloud_url": "https://example.invalid",
+            "cloud_client_id": rogue_id,
+            "cloud_allowed_client_ids": [valid_id],
+        },
+    )
+    assert cs_blocked.is_client_authorized() is False
+    assert cs_blocked.push() is False
+    assert sent_requests == []  # zero network calls made for unauthorized client_id
+
+    # 4. Authorized download client_id succeeds and sends attestation headers + proof
+    cs_allowed = cloud.CloudSync(
+        sel,
+        {
+            "cloud_enabled": True,
+            "cloud_mode": "url",
+            "cloud_url": "https://example.invalid",
+            "cloud_client_id": valid_id,
+            "cloud_allowed_client_ids": [valid_id],
+        },
+    )
+    assert cs_allowed.is_client_authorized() is True
+    assert cs_allowed.push() is True
+    assert len(sent_requests) == 1
+    _method, _url, pushed_body, pushed_headers = sent_requests[0]
+    assert pushed_body["client_id"] == valid_id
+    assert len(pushed_body["download_proof"]) == 32
+    assert pushed_headers["X-ClickShift-Client-Id"] == valid_id
+
+    # 5. Revoking a download client_id immediately blocks subsequent pushes
+    cloud.revoke_download_id(valid_id, cfg=cs_allowed.cfg)
+    sent_requests.clear()
+    assert cs_allowed.is_client_authorized() is False
+    assert cs_allowed.push() is False
+    assert sent_requests == []
+
+

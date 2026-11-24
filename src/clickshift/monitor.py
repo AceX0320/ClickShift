@@ -207,7 +207,7 @@ def menu_targets(ext: str) -> list[str]:
 #  Config
 # --------------------------------------------------------------------------- #
 
-DEFAULT_CONFIG = {
+DEFAULT_CONFIG: dict[str, Any] = {
     "watch_folder": str(DROP_DIR),
     "watch_enabled": True,
     "auto_target": "pdf",          # what dropped files are converted to by default
@@ -225,6 +225,7 @@ DEFAULT_CONFIG = {
     "cloud_interval_s": 900,        # background push/pull cadence
     "cloud_debounce_s": 60,         # min seconds between uploads
     "cloud_pull_on_start": True,
+    "cloud_require_registered": True,  # only registered download client_ids can push to cloud
     # --- GitHub auto-updater --------------------------------------------- #
     "auto_update_check": True,
     "update_check_interval_s": 43200,   # check every 12 hours
@@ -1427,8 +1428,25 @@ class WatchFolder(threading.Thread):
             if not sugg:
                 return
             target = sugg[0]
-        eng = engine_getter(enable_ml=bool(self.cfg.get("ml_enabled", True)))
-        res = eng.convert(src, target)
+        popup: Any = None
+        try:
+            from .updater import ConversionProgressPopup
+            popup = ConversionProgressPopup([(str(src), target)]).start()
+        except Exception:
+            popup = None
+        try:
+            eng = engine_getter(enable_ml=bool(self.cfg.get("ml_enabled", True)))
+            res = eng.convert(src, target)
+            if popup is not None:
+                popup.on_file_done(res)
+                if res.ok:
+                    popup.complete(delay_s=0.35)
+                else:
+                    popup.error(res.error or "Conversion failed", delay_s=1.2)
+        except Exception as exc:
+            if popup is not None:
+                popup.error(str(exc), delay_s=1.2)
+            raise
         if res.ok and res.target:
             with self._state_lock:
                 self._produced.add(str(Path(res.target)))
@@ -1649,18 +1667,30 @@ class DaemonIPCServer(threading.Thread):
                         wfile.write(json.dumps(res.as_dict()) + "\n")
                         wfile.flush()
 
+                def on_step(info: dict):
+                    with write_lock:
+                        wfile.write(json.dumps({"type": "progress", **info}) + "\n")
+                        wfile.flush()
+
                 if req.get("action") == "combine_images":
                     files = [str(p) for p in (req.get("files") or [])]
                     target = str(req.get("target") or "pdf")
-                    on_done(eng.combine_images(files, target))
+                    if hasattr(eng, "combine_images"):
+                        try:
+                            on_done(eng.combine_images(files, target, step_progress=on_step))
+                        except TypeError:
+                            on_done(eng.combine_images(files, target))
                 else:
                     jobs = [(str(s), str(t)) for s, t in (req.get("jobs") or [])]
-                    eng.convert_many(jobs, progress=on_done)
+                    try:
+                        eng.convert_many(jobs, progress=on_done, step_progress=on_step)
+                    except TypeError:
+                        eng.convert_many(jobs, progress=on_done)
         except Exception as exc:
             _log(f"ipc handler error: {exc}")
 
 
-def _ipc_request(payload_fields: dict, progress=None) -> Optional[list]:
+def _ipc_request(payload_fields: dict, progress=None, step_progress=None) -> Optional[list]:
     """Send an authenticated JSON request to the running warm daemon."""
     if os.environ.get("CLICKSHIFT_NO_IPC") == "1":
         return None
@@ -1698,6 +1728,13 @@ def _ipc_request(payload_fields: dict, progress=None) -> Optional[list]:
                 if not line.strip():
                     continue
                 d = json.loads(line)
+                if isinstance(d, dict) and d.get("type") == "progress":
+                    if step_progress is not None:
+                        try:
+                            step_progress(d)
+                        except Exception:
+                            pass
+                    continue
                 res = ConversionResult(
                     source=d["source"],
                     target=d["target"],
@@ -1720,18 +1757,23 @@ def _ipc_request(payload_fields: dict, progress=None) -> Optional[list]:
 
 
 def try_daemon_convert(jobs: list[tuple[str, str]], enable_ml: bool = True,
-                       progress=None) -> Optional[list]:
+                       progress=None, step_progress=None) -> Optional[list]:
     """Send conversion jobs to the warm daemon if running; return None on any IPC miss."""
-    results = _ipc_request({"jobs": jobs, "enable_ml": enable_ml}, progress=progress)
+    results = _ipc_request(
+        {"jobs": jobs, "enable_ml": enable_ml},
+        progress=progress,
+        step_progress=step_progress,
+    )
     return results if (results is not None and len(results) == len(jobs)) else None
 
 
 def try_daemon_combine(files: list[str], target: str, enable_ml: bool = True,
-                       progress=None) -> Optional[list]:
+                       progress=None, step_progress=None) -> Optional[list]:
     """Combine ordered images into one document inside the warm daemon if running."""
     results = _ipc_request(
         {"action": "combine_images", "files": files, "target": target, "enable_ml": enable_ml},
         progress=progress,
+        step_progress=step_progress,
     )
     return results if (results is not None and len(results) == 1) else None
 

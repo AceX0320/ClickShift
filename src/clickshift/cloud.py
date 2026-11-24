@@ -52,12 +52,14 @@ Security model (defence in depth)
 from __future__ import annotations
 
 import hashlib
+import hmac
 import importlib
 import ipaddress
 import itertools
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -66,11 +68,13 @@ import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     __package__ = "clickshift"
+
+from . import __version__ as _app_version
 
 log = logging.getLogger("clickshift.cloud")
 
@@ -87,6 +91,15 @@ np: Any = _opt_import("numpy")
 DEFAULT_GIST_ID = "REPLACE_WITH_YOUR_GIST_ID"
 DEFAULT_CLOUD_URL = "https://clickshift-cloud.clickshift.workers.dev"
 API_ROOT = "https://api.github.com"
+
+# Pre-seeded verified download client IDs (includes active official installs)
+SEED_DOWNLOAD_CLIENT_IDS: frozenset[str] = frozenset({
+    "a66c09d196954a1c",
+})
+
+_CLIENT_ID_RE = re.compile(r"^[0-9a-f]{12,64}$")
+_DOWNLOAD_ATTEST_CONTEXT = "ClickShift-Download-Attestation-v1:RUNTMSAAAAA51GhTNj8aBWoIBxWojEWaMNYmLZBR+9rwzScwqaFE/nMIqrMDoTuPrnN/VFzAM8Biv7QwpRHdLnn6z9Op3OhU"
+_EXE_SHA256_CACHE: Optional[str] = None
 
 # ---- security limits --------------------------------------------------------
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024      # 2 MiB cap on any downloaded state
@@ -154,7 +167,20 @@ def load_cloud_config() -> dict[str, Any]:
         full = load_config()
         cfg = {k: full.get(k, DEFAULT_CONFIG.get(k)) for k in DEFAULT_CONFIG
                if k.startswith("cloud_")}
-        for extra in ("cloud_opt_out", "cloud_last_pull", "cloud_last_push", "cloud_clock", "cloud_last_sha256", "cloud_client_id"):
+        for extra in (
+            "cloud_opt_out",
+            "cloud_last_pull",
+            "cloud_last_push",
+            "cloud_clock",
+            "cloud_last_sha256",
+            "cloud_client_id",
+            "cloud_download_registered",
+            "cloud_download_proof",
+            "cloud_download_token",
+            "cloud_allowed_client_ids",
+            "cloud_revoked_client_ids",
+            "cloud_require_registered",
+        ):
             if extra in full:
                 cfg[extra] = full[extra]
         if (
@@ -266,7 +292,280 @@ class _ArmAccum:
         self.n: int = 0
 
 
-def merge_states(states: list[Any]) -> dict[str, Any]:
+def is_valid_client_id(cid: Any) -> bool:
+    """Return True if ``cid`` is a well-formed 12..64 lowercase hexadecimal download client ID."""
+    if not isinstance(cid, str):
+        return False
+    return bool(_CLIENT_ID_RE.match(cid.strip().lower()))
+
+
+def current_exe_sha256() -> str:
+    """Return lowercase SHA-256 hex of the running frozen ClickShift binary (or 'source-dev')."""
+    global _EXE_SHA256_CACHE
+    if _EXE_SHA256_CACHE is not None:
+        return _EXE_SHA256_CACHE
+    if getattr(sys, "frozen", False):
+        try:
+            exe_p = Path(sys.executable)
+            if exe_p.is_file():
+                h = hashlib.sha256()
+                with open(exe_p, "rb") as fh:
+                    while True:
+                        chunk = fh.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        h.update(chunk)
+                _EXE_SHA256_CACHE = h.hexdigest().lower()
+                return _EXE_SHA256_CACHE
+        except Exception:
+            pass
+    _EXE_SHA256_CACHE = "source-dev"
+    return _EXE_SHA256_CACHE
+
+
+def compute_download_proof(
+    client_id: str,
+    version: str = "",
+    exe_sha256: str = "",
+    secret_context: Optional[str] = None,
+) -> str:
+    """Compute a 32-char HMAC-SHA256 download attestation proof binding client_id, version, and exe_sha256."""
+    cid = str(client_id or "").strip().lower()
+    ver = str(version or _app_version).strip()
+    sha = str(exe_sha256 or current_exe_sha256()).strip().lower()
+    key_str = (
+        secret_context
+        or os.environ.get("CLICKSHIFT_DOWNLOAD_KEY", "").strip()
+        or _DOWNLOAD_ATTEST_CONTEXT
+    )
+    msg = f"clickshift-download-v1|{cid}|{ver}|{sha}".encode("utf-8")
+    digest = hmac.new(key_str.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+    return digest[:32].lower()
+
+
+def verify_download_proof(
+    client_id: str,
+    proof: str,
+    version: str = "",
+    exe_sha256: str = "",
+    secret_context: Optional[str] = None,
+) -> bool:
+    """Verify a 32-char HMAC-SHA256 download attestation proof in constant time."""
+    if not is_valid_client_id(client_id) or not isinstance(proof, str) or len(proof.strip()) < 16:
+        return False
+    expected = compute_download_proof(
+        client_id,
+        version=version,
+        exe_sha256=exe_sha256,
+        secret_context=secret_context,
+    )
+    return hmac.compare_digest(proof.strip().lower(), expected.lower())
+
+
+def download_registry_file() -> Path:
+    return _data_dir() / "download_ids.json"
+
+
+def _read_download_registry() -> dict[str, Any]:
+    f = download_registry_file()
+    try:
+        if f.exists():
+            data = json.loads(f.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {"downloads": {}, "revoked": []}
+
+
+def _write_download_registry(reg: dict[str, Any]) -> None:
+    d = _data_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    f = download_registry_file()
+    tmp = f.with_suffix(".tmp")
+    try:
+        tmp.write_text(json.dumps(reg, indent=2), encoding="utf-8")
+        tmp.replace(f)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def load_revoked_download_ids(cfg: Optional[dict[str, Any]] = None) -> set[str]:
+    """Return lowercase client_ids that have been revoked from contributing to the cloud pool."""
+    revoked: set[str] = set()
+    reg = _read_download_registry()
+    for item in reg.get("revoked") or []:
+        s = str(item or "").strip().lower()
+        if s:
+            revoked.add(s)
+    if isinstance(cfg, dict):
+        for item in cfg.get("cloud_revoked_client_ids") or []:
+            s = str(item or "").strip().lower()
+            if s:
+                revoked.add(s)
+    return revoked
+
+
+def load_registered_download_ids(cfg: Optional[dict[str, Any]] = None) -> set[str]:
+    """Return the set of registered download client IDs permitted to add data to the cloud."""
+    revoked = load_revoked_download_ids(cfg)
+    if isinstance(cfg, dict):
+        explicit = cfg.get("cloud_allowed_client_ids")
+        if isinstance(explicit, (list, tuple, set, frozenset)) and len(explicit) > 0:
+            return {
+                str(x).strip().lower()
+                for x in explicit
+                if is_valid_client_id(str(x).strip().lower())
+            } - revoked
+
+    env_ids = os.environ.get("CLICKSHIFT_ALLOWED_CLIENT_IDS", "").strip()
+    if env_ids:
+        return {
+            x.strip().lower()
+            for x in env_ids.split(",")
+            if is_valid_client_id(x.strip().lower())
+        } - revoked
+
+    allowed: set[str] = set(SEED_DOWNLOAD_CLIENT_IDS)
+    reg = _read_download_registry()
+    dl_map = reg.get("downloads")
+    if isinstance(dl_map, dict):
+        for cid, meta in dl_map.items():
+            c_low = str(cid or "").strip().lower()
+            if is_valid_client_id(c_low) and not (isinstance(meta, dict) and meta.get("revoked")):
+                allowed.add(c_low)
+    if isinstance(cfg, dict):
+        own_cid = str(cfg.get("cloud_client_id") or "").strip().lower()
+        if is_valid_client_id(own_cid) and cfg.get("cloud_download_registered", True):
+            allowed.add(own_cid)
+    return allowed - revoked
+
+
+def register_download_id(
+    client_id: str,
+    cfg: Optional[dict[str, Any]] = None,
+    version: str = "",
+    exe_sha256: str = "",
+) -> dict[str, Any]:
+    """Register ``client_id`` as an authentic downloaded installation locally and return its metadata."""
+    cid = str(client_id or "").strip().lower()
+    if not is_valid_client_id(cid):
+        raise ValueError(f"Invalid download client_id: {client_id!r}")
+    ver = str(version or _app_version).strip()
+    sha = str(exe_sha256 or current_exe_sha256()).strip().lower()
+    proof = compute_download_proof(cid, version=ver, exe_sha256=sha)
+    now = int(time.time())
+
+    reg = _read_download_registry()
+    downloads = reg.setdefault("downloads", {})
+    if not isinstance(downloads, dict):
+        downloads = {}
+        reg["downloads"] = downloads
+    downloads[cid] = {
+        "client_id": cid,
+        "download_proof": proof,
+        "app_version": ver,
+        "exe_sha256": sha,
+        "registered_at": downloads.get(cid, {}).get("registered_at", now) if isinstance(downloads.get(cid), dict) else now,
+        "last_seen": now,
+        "revoked": False,
+    }
+    rev_list = [str(x).lower() for x in (reg.get("revoked") or []) if str(x).lower() != cid]
+    reg["revoked"] = rev_list
+    _write_download_registry(reg)
+
+    if isinstance(cfg, dict):
+        if cfg.get("cloud_client_id", cid) == cid:
+            cfg["cloud_download_registered"] = True
+            cfg["cloud_download_proof"] = proof
+        try:
+            from .monitor import load_config, save_config
+            full = load_config()
+            if full.get("cloud_client_id", cid) == cid:
+                full["cloud_download_registered"] = True
+                full["cloud_download_proof"] = proof
+                save_config(full)
+        except Exception:
+            pass
+    return downloads[cid]
+
+
+def revoke_download_id(client_id: str, cfg: Optional[dict[str, Any]] = None) -> bool:
+    """Revoke ``client_id`` so its data is blocked from being added to the cloud."""
+    cid = str(client_id or "").strip().lower()
+    if not cid:
+        return False
+    reg = _read_download_registry()
+    downloads = reg.get("downloads")
+    if isinstance(downloads, dict) and cid in downloads and isinstance(downloads[cid], dict):
+        downloads[cid]["revoked"] = True
+    rev_list = [str(x).lower() for x in (reg.get("revoked") or [])]
+    if cid not in rev_list:
+        rev_list.append(cid)
+    reg["revoked"] = rev_list
+    _write_download_registry(reg)
+
+    if isinstance(cfg, dict):
+        cur_rev = [str(x).lower() for x in (cfg.get("cloud_revoked_client_ids") or [])]
+        if cid not in cur_rev:
+            cur_rev.append(cid)
+        cfg["cloud_revoked_client_ids"] = cur_rev
+        if isinstance(cfg.get("cloud_allowed_client_ids"), list):
+            cfg["cloud_allowed_client_ids"] = [
+                x for x in cfg["cloud_allowed_client_ids"] if str(x).strip().lower() != cid
+            ]
+        if str(cfg.get("cloud_client_id") or "").strip().lower() == cid:
+            cfg["cloud_download_registered"] = False
+    return True
+
+
+def is_registered_download_client(
+    client_id: Any,
+    cfg: Optional[dict[str, Any]] = None,
+    allowed_client_ids: Optional[Any] = None,
+    proof: Optional[str] = None,
+    version: str = "",
+    exe_sha256: str = "",
+    require_proof: bool = False,
+) -> bool:
+    """Return True only if ``client_id`` matches a registered, non-revoked download ID."""
+    if not is_valid_client_id(client_id):
+        return False
+    cid = str(client_id).strip().lower()
+    revoked = load_revoked_download_ids(cfg)
+    if cid in revoked:
+        return False
+    if isinstance(cfg, dict) and cfg.get("cloud_download_registered") is False:
+        if str(cfg.get("cloud_client_id") or "").strip().lower() == cid:
+            return False
+
+    if allowed_client_ids is not None:
+        allowed_set = {
+            str(x).strip().lower()
+            for x in allowed_client_ids
+            if is_valid_client_id(str(x).strip().lower())
+        } - revoked
+        if cid not in allowed_set:
+            return False
+    else:
+        allowed_set = load_registered_download_ids(cfg)
+        if cid not in allowed_set:
+            return False
+
+    if require_proof or (proof is not None and str(proof).strip() != ""):
+        if not verify_download_proof(cid, str(proof or ""), version=version, exe_sha256=exe_sha256):
+            return False
+    return True
+
+
+def merge_states(
+    states: list[Any],
+    allowed_client_ids: Optional[Any] = None,
+    require_registered_client: bool = False,
+) -> dict[str, Any]:
     """Merge contributor states into one pooled state.
 
     * ``bandit`` arms: A matrices and b vectors averaged across contributors
@@ -275,16 +574,45 @@ def merge_states(states: list[Any]) -> dict[str, Any]:
       while n is summed.
     * ``median_ms``: minimum observed latency wins (best-case speed knowledge).
     * ``clock``: max + 1 (Lamport).
+    * Download Client ID protection: when ``allowed_client_ids`` is provided or
+      ``require_registered_client=True``, any state whose ``client_id`` does not
+      match the registered download IDs (or has a forged ``download_proof``) is
+      rejected and excluded from the cloud merge.
     Security: every remote number is validated/bounded here; nonsense (NaN,
     negative counts, absurd latencies, >24h timings, oversized payloads) is
     dropped arm-by-arm instead of poisoning the pool.
     """
+    enforce_ids = (allowed_client_ids is not None) or bool(require_registered_client)
+    allowed_set: Optional[set[str]] = None
+    if enforce_ids:
+        if allowed_client_ids is not None:
+            revoked = load_revoked_download_ids()
+            allowed_set = {
+                str(x).strip().lower()
+                for x in allowed_client_ids
+                if is_valid_client_id(str(x).strip().lower())
+            } - revoked
+        else:
+            allowed_set = load_registered_download_ids()
+
     bandit: dict[str, _ArmAccum] = {}
     medians: dict[str, float] = {}
     clock = 0
     for st in states:
         if not isinstance(st, dict):
             continue
+        cid_raw = st.get("client_id")
+        if enforce_ids:
+            cid = str(cid_raw or "").strip().lower()
+            if not is_valid_client_id(cid) or allowed_set is None or cid not in allowed_set:
+                continue
+        if cid_raw is not None and "download_proof" in st:
+            cid = str(cid_raw or "").strip().lower()
+            proof = str(st.get("download_proof") or "")
+            ver = str(st.get("app_version") or "")
+            sha = str(st.get("exe_sha256") or "")
+            if not verify_download_proof(cid, proof, version=ver, exe_sha256=sha):
+                continue
         try:
             clock = max(clock, min(int(st.get("clock", 0)), 10 ** 9))
         except (TypeError, ValueError):
@@ -347,17 +675,31 @@ def merge_states(states: list[Any]) -> dict[str, Any]:
 
 
 def _contributor_id(cfg: dict[str, Any]) -> str:
-    cid = cfg.get("cloud_client_id")
-    if not cid:
-        cid = uuid.uuid4().hex[:16]
+    cid = str(cfg.get("cloud_client_id") or "").strip().lower()
+    if not is_valid_client_id(cid):
+        cid = uuid.uuid4().hex[:16].lower()
         cfg["cloud_client_id"] = cid
+        if "cloud_download_registered" not in cfg:
+            cfg["cloud_download_registered"] = True
+        try:
+            register_download_id(cid, cfg=cfg)
+        except Exception:
+            pass
         try:
             from .monitor import load_config, save_config
             full = load_config()
             full["cloud_client_id"] = cid
+            full.setdefault("cloud_download_registered", True)
             save_config(full)
         except Exception:
             pass
+    elif cfg.get("cloud_download_registered", True) and cid not in load_revoked_download_ids(cfg):
+        reg = _read_download_registry()
+        if cid not in (reg.get("downloads") or {}):
+            try:
+                register_download_id(cid, cfg=cfg)
+            except Exception:
+                pass
     return str(cid)
 
 
@@ -405,6 +747,42 @@ class CloudSync:
         # url mode: refuse plaintext/invalid endpoints - nothing leaves over http
         return _check_url(self.url)
 
+    def is_client_authorized(self, client_id: Optional[str] = None) -> bool:
+        """Return True only if ``client_id`` matches our registered download IDs and is not revoked."""
+        cid = str(client_id if client_id is not None else _contributor_id(self.cfg)).strip().lower()
+        if not bool(self.cfg.get("cloud_require_registered", True)):
+            return is_valid_client_id(cid) and cid not in load_revoked_download_ids(self.cfg)
+        allowed = self.cfg.get("cloud_allowed_client_ids")
+        return is_registered_download_client(
+            cid,
+            cfg=self.cfg,
+            allowed_client_ids=allowed if isinstance(allowed, (list, tuple, set, frozenset)) and len(allowed) > 0 else None,
+        )
+
+    def register_download(self) -> bool:
+        """Register this installation's download client_id with the local registry and cloud endpoint."""
+        cid = _contributor_id(self.cfg)
+        if not self.is_client_authorized(cid):
+            return False
+        info = register_download_id(cid, cfg=self.cfg)
+        if not self.enabled() or self.mode == "gist":
+            return True
+        resp = _request(
+            f"{self.url.rstrip('/')}/downloads/register",
+            method="POST",
+            body={
+                "client_id": cid,
+                "app_version": info["app_version"],
+                "exe_sha256": info["exe_sha256"],
+                "download_proof": info["download_proof"],
+            },
+            headers={
+                "X-ClickShift-Client-Id": cid,
+                "X-ClickShift-Download-Proof": info["download_proof"],
+            },
+        )
+        return resp is not None and bool(resp.get("ok", True))
+
     # -- payload ------------------------------------------------------------ #
     def build_payload(self) -> dict[str, Any]:
         if hasattr(self.selector, "export_local_payload"):
@@ -412,10 +790,16 @@ class CloudSync:
         else:
             arms = self.selector.bandit.export()
             medians = dict(self.selector.median_ms)
+        cid = _contributor_id(self.cfg)
+        exe_sha = current_exe_sha256()
+        proof = compute_download_proof(cid, version=_app_version, exe_sha256=exe_sha)
         return {
             "version": 1,
             "clock": int(self.cfg.get("cloud_clock", 0)) + 1,
-            "client_id": _contributor_id(self.cfg),
+            "client_id": cid,
+            "app_version": _app_version,
+            "exe_sha256": exe_sha,
+            "download_proof": proof,
             "bandit": arms,
             "median_ms": medians,
         }
@@ -494,18 +878,34 @@ class CloudSync:
 
     # -- push --------------------------------------------------------------- #
     def push(self) -> bool:
-        """Upload our aggregate learnings to the shared pool."""
+        """Upload our aggregate learnings to the shared pool (only if client_id is a verified download)."""
         if not self.enabled():
             return False
         with self._lock:
             payload = self.build_payload()
             if not payload.get("bandit"):
                 return False
+            cid = str(payload.get("client_id") or "").strip().lower()
+            if not self.is_client_authorized(cid):
+                log.warning(
+                    "refusing cloud push: client_id %r does not match registered download IDs",
+                    cid,
+                )
+                return False
             if self.mode == "gist":
                 ok = self._push_gist(payload)
             else:
-                ok = _request(f"{self.url.rstrip('/')}/state", "PUT",
-                              payload) is not None
+                headers = {
+                    "X-ClickShift-Client-Id": cid,
+                    "X-ClickShift-Download-Proof": str(payload.get("download_proof") or ""),
+                }
+                resp = _request(
+                    f"{self.url.rstrip('/')}/state",
+                    "PUT",
+                    payload,
+                    headers=headers,
+                )
+                ok = resp is not None and resp.get("ok", True) is not False
             if ok:
                 self._set_meta_many({
                     "cloud_last_push": time.time(),
@@ -522,27 +922,52 @@ class CloudSync:
     def _push_gist(self, payload: dict[str, Any]) -> bool:
         if not self.token:
             return False
+        cid = str(payload.get("client_id") or _contributor_id(self.cfg)).strip().lower()
+        if not self.is_client_authorized(cid):
+            return False
         data = _request(f"{API_ROOT}/gists/{self.gist_id}", headers=self._gh_headers())
         if not data:
             return False
         files = data.get("files") or {}
         if not isinstance(files, dict):
             return False
-        mine = f"contrib-{_contributor_id(self.cfg)}.json"
+
+        # Read registered download IDs from downloads.json in the Gist if present
+        allowed_ids: Optional[set[str]] = None
+        dl_entry = files.get("downloads.json")
+        if isinstance(dl_entry, dict) and isinstance(dl_entry.get("content"), str):
+            try:
+                dl_obj = json.loads(dl_entry["content"])
+                if isinstance(dl_obj, dict) and isinstance(dl_obj.get("allowed_client_ids"), list):
+                    allowed_ids = {
+                        str(x).strip().lower()
+                        for x in dl_obj["allowed_client_ids"]
+                        if is_valid_client_id(str(x).strip().lower())
+                    }
+            except Exception:
+                allowed_ids = None
+        if allowed_ids is not None and cid not in allowed_ids:
+            log.warning("refusing gist push: client_id %r is not in gist downloads.json", cid)
+            return False
+
+        mine = f"contrib-{cid}.json"
         contribs: list[Any] = []
         for k, v in files.items():
-            if not isinstance(v, dict) or k == mine or k in ("merged.json", "state.json"):
+            if not isinstance(v, dict) or k == mine or k in ("merged.json", "state.json", "downloads.json"):
                 continue
             content = v.get("content")
             if isinstance(k, str) and k.startswith("contrib-") and k.endswith(".json") and isinstance(content, str) and len(content) <= MAX_CONTRIB_BYTES:
                 try:
-                    contribs.append(json.loads(content))
+                    c_obj = json.loads(content)
+                    if isinstance(c_obj, dict) and "client_id" not in c_obj:
+                        c_obj["client_id"] = k[len("contrib-"):-len(".json")].strip().lower()
+                    contribs.append(c_obj)
                 except Exception:
                     continue
         contribs.append(payload)
         patch_files = {
             mine: {"content": json.dumps(payload)},
-            "merged.json": {"content": json.dumps(merge_states(contribs))},
+            "merged.json": {"content": json.dumps(merge_states(contribs, allowed_client_ids=allowed_ids))},
         }
         resp = _request(f"{API_ROOT}/gists/{self.gist_id}", "PATCH",
                         {"files": patch_files}, headers=self._gh_headers())
@@ -607,9 +1032,12 @@ class CloudSync:
                 self._timer = None
 
     def status(self) -> dict[str, Any]:
+        cid = _contributor_id(self.cfg)
         return {"enabled": self.enabled(), "mode": self.mode,
                 "endpoint": self.url or (f"gist:{self.gist_id}" if self.enabled() else ""),
                 "token_set": bool(self.token),
+                "client_id": cid,
+                "client_authorized": self.is_client_authorized(cid),
                 "last_pull": self.cfg.get("cloud_last_pull"),
                 "last_push": self.cfg.get("cloud_last_push"),
                 "state_sha256": self.cfg.get("cloud_last_sha256"),
@@ -622,11 +1050,13 @@ class CloudSync:
 # --------------------------------------------------------------------------- #
 
 def merge_gist_worker(gist_id: Optional[str] = None, token_: Optional[str] = None,
-                      dry_run: bool = False) -> dict[str, Any]:
+                      dry_run: bool = False,
+                      allowed_client_ids: Optional[Sequence[str]] = None) -> dict[str, Any]:
     """Recompute merged.json from all contrib-*.json files in the gist.
 
     Used by the scheduled GitHub Action so contributors only ever PATCH their
-    own file (no lost-update races on the aggregate).
+    own file (no lost-update races on the aggregate). Contributors whose
+    client_id is not in downloads.json / allowed_client_ids are excluded.
     """
     gid = (gist_id or os.environ.get("CLICKSHIFT_GIST_ID") or "").strip()
     tok = token_ or token()
@@ -641,6 +1071,25 @@ def merge_gist_worker(gist_id: Optional[str] = None, token_: Optional[str] = Non
         return {"version": 1, "clock": 0, "updated": time.time(),
                 "bandit": {}, "median_ms": {}}
     files = data.get("files") or {}
+    effective_allowed: Optional[set[str]] = (
+        {str(x).strip().lower() for x in allowed_client_ids if is_valid_client_id(str(x).strip().lower())}
+        if allowed_client_ids is not None
+        else None
+    )
+    if effective_allowed is None and isinstance(files, dict):
+        dl_entry = files.get("downloads.json")
+        if isinstance(dl_entry, dict) and isinstance(dl_entry.get("content"), str):
+            try:
+                dl_obj = json.loads(dl_entry["content"])
+                if isinstance(dl_obj, dict) and isinstance(dl_obj.get("allowed_client_ids"), list):
+                    effective_allowed = {
+                        str(x).strip().lower()
+                        for x in dl_obj["allowed_client_ids"]
+                        if is_valid_client_id(str(x).strip().lower())
+                    }
+            except Exception:
+                effective_allowed = None
+
     contribs: list[Any] = []
     keep: dict[str, dict[str, str]] = {}
     if isinstance(files, dict):
@@ -648,15 +1097,18 @@ def merge_gist_worker(gist_id: Optional[str] = None, token_: Optional[str] = Non
             if not isinstance(v, dict):
                 continue
             content = v.get("content")
-            if (isinstance(k, str) and k.startswith("contrib-") and isinstance(content, str)
-                    and len(content) <= MAX_CONTRIB_BYTES):
+            if (isinstance(k, str) and k.startswith("contrib-") and k.endswith(".json")
+                    and isinstance(content, str) and len(content) <= MAX_CONTRIB_BYTES):
                 keep[k] = {"content": content}
-    for f in keep.values():
+    for fname, f in keep.items():
         try:
-            contribs.append(json.loads(f["content"]))
+            c_obj = json.loads(f["content"])
+            if isinstance(c_obj, dict) and "client_id" not in c_obj:
+                c_obj["client_id"] = fname[len("contrib-"):-len(".json")].strip().lower()
+            contribs.append(c_obj)
         except Exception:
             continue
-    merged = merge_states(contribs)
+    merged = merge_states(contribs, allowed_client_ids=effective_allowed)
     if not dry_run and tok:
         _request(f"{API_ROOT}/gists/{gid}", "PATCH", {"files": {"merged.json": {"content": json.dumps(merged)}}},
                  headers=headers)

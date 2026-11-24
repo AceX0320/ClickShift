@@ -1480,6 +1480,474 @@ class InstallProgressPopup:
             self._closed.set()
 
 
+def format_eta_seconds(seconds: float) -> str:
+    """Format remaining or elapsed seconds into a compact human-readable string."""
+    s = max(0.0, float(seconds))
+    if s < 0.95:
+        return "< 1s"
+    sec_int = int(round(s))
+    if sec_int < 60:
+        return f"{sec_int}s"
+    mins, rem = divmod(sec_int, 60)
+    if mins < 60:
+        return f"{mins}m {rem:02d}s"
+    hrs, mins = divmod(mins, 60)
+    return f"{hrs}h {mins:02d}m"
+
+
+def _load_learned_medians() -> dict[str, float]:
+    """Best-effort read of learned per-pair median latencies from bandit.json."""
+    try:
+        bfile = _resolve_data_dir() / "bandit.json"
+        if bfile.exists():
+            data = json.loads(bfile.read_text(encoding="utf-8"))
+            med = data.get("median_ms")
+            if isinstance(med, dict):
+                return {str(k): float(v) for k, v in med.items() if isinstance(v, (int, float)) and v > 0}
+    except Exception:
+        pass
+    return {}
+
+
+def estimate_job_duration_ms(
+    src_path: str | Path,
+    dst_ext: str,
+    median_map: Optional[dict[str, float]] = None,
+) -> float:
+    """Estimate duration (in ms) for converting ``src_path`` to ``dst_ext``."""
+    p = Path(src_path)
+    src_ext = p.suffix.lstrip(".").lower()
+    target = str(dst_ext or "").lstrip(".").lower()
+    pair = f"{src_ext}>{target}"
+    try:
+        size_bytes = p.stat().st_size
+    except OSError:
+        size_bytes = 0
+    mb = size_bytes / (1024.0 * 1024.0)
+
+    meds = median_map if median_map is not None else _load_learned_medians()
+    learned = meds.get(pair)
+    if learned is not None and learned > 0:
+        base_ms = float(learned)
+        if mb > 2.0:
+            scale = 1.0 + min(25.0, (mb - 1.0) * 0.35)
+            return max(120.0, min(base_ms * scale, 600_000.0))
+        return max(80.0, min(base_ms, 600_000.0))
+
+    if src_ext in ("txt", "md", "markdown", "csv", "tsv", "html", "htm") and target in (
+        "txt", "md", "html", "docx", "rtf", "odt", "csv",
+    ):
+        return max(120.0, 140.0 + mb * 220.0)
+    if src_ext in ("png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff", "avif", "jxl", "heic", "heif", "ico"):
+        return max(260.0, 320.0 + mb * 380.0)
+    if src_ext == "pdf" or target == "pdf":
+        return max(900.0, 1100.0 + mb * 1500.0)
+    return max(750.0, 900.0 + mb * 1100.0)
+
+
+def estimate_jobs_duration_ms(
+    jobs: Sequence[tuple[str, str]],
+    median_map: Optional[dict[str, float]] = None,
+) -> float:
+    """Estimate total duration (in ms) across a batch of (src_path, dst_ext) jobs."""
+    if not jobs:
+        return 500.0
+    meds = median_map if median_map is not None else _load_learned_medians()
+    return sum(estimate_job_duration_ms(s, t, median_map=meds) for s, t in jobs)
+
+
+class ConversionProgressPopup:
+    """Thread-safe small conversion progress window showing active files, %, and time remaining."""
+
+    def __init__(
+        self,
+        jobs: Sequence[tuple[str, str]],
+        title: str = "ClickShift Converter",
+        combine_target: Optional[str] = None,
+        estimated_total_ms: Optional[float] = None,
+        enabled: Optional[bool] = None,
+    ) -> None:
+        if enabled is None:
+            enabled = (
+                (os.name == "nt")
+                and (os.environ.get("CLICKSHIFT_NO_POPUP") != "1")
+                and ("PYTEST_CURRENT_TEST" not in os.environ)
+            )
+        self.enabled = bool(enabled)
+        self.title = title
+        self.jobs: list[tuple[str, str]] = [(str(s), str(t).lstrip(".")) for s, t in jobs]
+        self.combine_target = (combine_target or "").lstrip(".").lower() or None
+
+        meds = _load_learned_medians()
+        self._job_estimates_ms: list[float] = [
+            estimate_job_duration_ms(s, t, median_map=meds) for s, t in self.jobs
+        ] or [600.0]
+        total_est = float(estimated_total_ms) if estimated_total_ms and estimated_total_ms > 0 else sum(self._job_estimates_ms)
+        self._est_total_ms: float = max(150.0, total_est)
+
+        self._lock = threading.Lock()
+        self._t0 = time.perf_counter()
+        self._file_t0 = self._t0
+        self._done_count = 0
+        self._active_idx = 0
+        self._active_file = Path(self.jobs[0][0]).name if self.jobs else ""
+        self._active_target = self.combine_target or (self.jobs[0][1] if self.jobs else "")
+        self._sub_frac: Optional[float] = None
+        self._detail: str = ""
+        self._finished = False
+        self._error_msg = ""
+
+        self._q: queue.Queue[tuple[str, object]] = queue.Queue()
+        self._ready = threading.Event()
+        self._closed = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def files_display_text(self) -> str:
+        """Return a concise summary of the file(s) being converted."""
+        if not self.jobs:
+            return "Preparing conversion..."
+        total = len(self.jobs)
+        with self._lock:
+            cur_name = self._active_file or Path(self.jobs[min(self._active_idx, total - 1)][0]).name
+            cur_dst = (self._active_target or self.jobs[min(self._active_idx, total - 1)][1]).upper()
+            done = self._done_count
+            idx = min(self._active_idx + 1, total)
+
+        if self.combine_target and total > 1:
+            names = [Path(s).name for s, _ in self.jobs[:2]]
+            more = f" (+{total - 2} more)" if total > 2 else ""
+            return f"Combining {total} files ({', '.join(names)}{more}) -> .{self.combine_target.upper()}"
+        if total == 1:
+            return f"{cur_name}  ->  .{cur_dst}"
+        remaining_names = [Path(s).name for s, _ in self.jobs[done:done + 2]]
+        extra = max(0, (total - done) - len(remaining_names))
+        tail = f" (+{extra} more)" if extra > 0 else ""
+        return f"[{idx}/{total}] {cur_name} -> .{cur_dst}  ({', '.join(remaining_names)}{tail})"
+
+    def compute_snapshot(self, now: Optional[float] = None) -> dict[str, Any]:
+        """Compute current (pct, remaining_s, elapsed_s, files_text, status_text, detail_text)."""
+        import math
+
+        t_now = time.perf_counter() if now is None else float(now)
+        total = max(1, len(self.jobs))
+        with self._lock:
+            done = self._done_count
+            idx = min(self._active_idx, total - 1)
+            sub_frac = self._sub_frac
+            detail = self._detail
+            finished = self._finished
+            err_msg = self._error_msg
+            elapsed_s = max(0.0, t_now - self._t0)
+            file_elapsed_ms = max(0.0, (t_now - self._file_t0) * 1000.0)
+            cur_est_ms = self._job_estimates_ms[idx] if idx < len(self._job_estimates_ms) else 800.0
+            est_total_s = max(0.15, self._est_total_ms / 1000.0)
+
+        files_txt = self.files_display_text()
+        if finished:
+            pct = 100.0 if not err_msg else min(99.0, (done / total) * 100.0)
+            rem_s = 0.0
+            status = err_msg if err_msg else f"Converted {total}/{total} file{'s' if total != 1 else ''}"
+            det = f"100%  •  Completed in {format_eta_seconds(elapsed_s)}" if not err_msg else "Conversion failed"
+            return {
+                "pct": round(pct, 1),
+                "remaining_s": rem_s,
+                "elapsed_s": elapsed_s,
+                "files_text": files_txt,
+                "status_text": status,
+                "detail_text": det,
+            }
+
+        if sub_frac is not None and sub_frac > 0.0:
+            in_flight = min(0.98, max(0.01, float(sub_frac)))
+        else:
+            ratio = file_elapsed_ms / max(cur_est_ms, 80.0)
+            in_flight = min(0.95, 0.95 * (1.0 - math.exp(-1.35 * ratio)))
+
+        if self.combine_target and total > 1:
+            overall_frac = min(0.99, in_flight)
+        else:
+            done_weight = sum(self._job_estimates_ms[:done])
+            cur_weight = self._job_estimates_ms[idx] if idx < len(self._job_estimates_ms) else 800.0
+            total_weight = max(1.0, sum(self._job_estimates_ms))
+            overall_frac = min(0.99, (done_weight + cur_weight * in_flight) / total_weight)
+
+        pct = max(1.0, min(99.0, overall_frac * 100.0))
+
+        prior_rem_s = max(0.0, est_total_s - elapsed_s)
+        if sub_frac is not None and sub_frac >= 0.03 and elapsed_s >= 0.15:
+            rate_rem_s = elapsed_s * (1.0 - overall_frac) / max(overall_frac, 0.02)
+            w = min(1.0, overall_frac * 1.8)
+            rem_s = (1.0 - w) * prior_rem_s + w * rate_rem_s
+        elif done > 0 and elapsed_s >= 0.15:
+            rate_rem_s = elapsed_s * (1.0 - overall_frac) / max(overall_frac, 0.02)
+            rem_s = 0.35 * prior_rem_s + 0.65 * rate_rem_s
+        else:
+            if elapsed_s < est_total_s * 0.85:
+                rem_s = max(0.5, prior_rem_s)
+            else:
+                rem_s = max(1.0, elapsed_s * 0.25)
+
+        eta_str = format_eta_seconds(rem_s)
+        el_str = format_eta_seconds(elapsed_s)
+        if detail:
+            det = f"{detail}  •  Time remaining: ~{eta_str}  (Elapsed: {el_str})"
+        else:
+            det = f"Time remaining: ~{eta_str}  •  Elapsed: {el_str}"
+
+        return {
+            "pct": round(pct, 1),
+            "remaining_s": rem_s,
+            "elapsed_s": elapsed_s,
+            "files_text": files_txt,
+            "status_text": files_txt,
+            "detail_text": det,
+        }
+
+    def start(self) -> "ConversionProgressPopup":
+        with self._lock:
+            self._t0 = time.perf_counter()
+            self._file_t0 = self._t0
+        if not self.enabled:
+            self._ready.set()
+            self._closed.set()
+            return self
+        self._thread = threading.Thread(target=self._run_ui, daemon=True, name="clickshift-conv-ui")
+        self._thread.start()
+        self._ready.wait(timeout=2.0)
+        return self
+
+    def on_step(
+        self,
+        file_path: str = "",
+        dst_ext: str = "",
+        file_idx: Optional[int] = None,
+        total_files: Optional[int] = None,
+        sub_frac: Optional[float] = None,
+        detail: str = "",
+    ) -> None:
+        with self._lock:
+            if file_idx is not None and 0 <= int(file_idx) < max(1, len(self.jobs)):
+                if int(file_idx) != self._active_idx:
+                    self._file_t0 = time.perf_counter()
+                self._active_idx = int(file_idx)
+            if file_path:
+                new_name = Path(file_path).name
+                if new_name != self._active_file:
+                    self._active_file = new_name
+            if dst_ext:
+                self._active_target = str(dst_ext).lstrip(".")
+            if sub_frac is not None:
+                self._sub_frac = max(0.0, min(1.0, float(sub_frac)))
+            if detail is not None:
+                self._detail = str(detail)
+        if self.enabled and not self._closed.is_set():
+            self._q.put(("refresh", None))
+
+    def on_file_done(self, res: Any) -> None:
+        now = time.perf_counter()
+        with self._lock:
+            self._done_count = min(len(self.jobs), self._done_count + 1)
+            self._sub_frac = None
+            self._detail = ""
+            if self._done_count < len(self.jobs):
+                self._active_idx = self._done_count
+                self._active_file = Path(self.jobs[self._active_idx][0]).name
+                self._active_target = self.jobs[self._active_idx][1]
+                self._file_t0 = now
+        if self.enabled and not self._closed.is_set():
+            self._q.put(("refresh", None))
+
+    def complete(self, message: Optional[str] = None, delay_s: float = 0.45) -> None:
+        with self._lock:
+            self._done_count = len(self.jobs)
+            self._sub_frac = 1.0
+            self._finished = True
+            if message:
+                self._detail = message
+        if not self.enabled:
+            return
+        self._q.put(("complete", delay_s))
+        if self._thread is not None:
+            self._thread.join(timeout=max(1.5, delay_s + 1.5))
+
+    def error(self, message: str, delay_s: float = 1.5) -> None:
+        with self._lock:
+            self._finished = True
+            self._error_msg = str(message)
+        if not self.enabled:
+            return
+        self._q.put(("error", delay_s))
+        if self._thread is not None:
+            self._thread.join(timeout=max(2.0, delay_s + 1.5))
+
+    def close(self) -> None:
+        if not self.enabled:
+            return
+        self._q.put(("close", None))
+        if self._thread is not None:
+            self._thread.join(timeout=1.5)
+
+    def _run_ui(self) -> None:
+        try:
+            import tkinter as tk
+            from tkinter import ttk
+        except Exception as e:
+            _log_info(f"ConversionProgressPopup disabled (tkinter unavailable): {e}")
+            self._ready.set()
+            self._closed.set()
+            return
+
+        def _run_mainloop() -> None:
+            root = tk.Tk()
+            root.title(self.title)
+            root.resizable(False, False)
+            root.configure(bg="#140A0B")
+            try:
+                ico = find_icon_path()
+                if ico is not None:
+                    root.iconbitmap(default=str(ico))
+            except Exception:
+                pass
+
+            width, height = 450, 176
+            sx = root.winfo_screenwidth()
+            sy = root.winfo_screenheight()
+            # Position cleanly near bottom-right above taskbar so it's visible without blocking center
+            pos_x = max(20, sx - width - 28)
+            pos_y = max(20, sy - height - 68)
+            root.geometry(f"{width}x{height}+{pos_x}+{pos_y}")
+            try:
+                root.attributes("-topmost", True)
+            except Exception:
+                pass
+
+            style = ttk.Style(root)
+            try:
+                style.theme_use("clam")
+            except Exception:
+                pass
+            style.configure(
+                "ClickShiftConv.Horizontal.TProgressbar",
+                troughcolor="#2A1215",
+                background="#E11D2E",
+                bordercolor="#2A1215",
+                lightcolor="#FF3B4A",
+                darkcolor="#B80F1F",
+                thickness=11,
+            )
+
+            frame = tk.Frame(root, bg="#140A0B", padx=20, pady=16)
+            frame.pack(fill="both", expand=True)
+
+            hdr_row = tk.Frame(frame, bg="#140A0B")
+            hdr_row.pack(fill="x")
+
+            total_n = max(1, len(self.jobs))
+            hdr_text = (
+                f"Combining {total_n} images..."
+                if (self.combine_target and total_n > 1)
+                else (f"Converting {total_n} files..." if total_n > 1 else "Converting file...")
+            )
+            heading_lbl = tk.Label(
+                hdr_row,
+                text=hdr_text,
+                bg="#140A0B",
+                fg="#FFFFFF",
+                font=("Segoe UI", 11, "bold"),
+                anchor="w",
+            )
+            heading_lbl.pack(side="left", fill="x", expand=True)
+
+            pct_lbl = tk.Label(
+                hdr_row,
+                text="1%",
+                bg="#140A0B",
+                fg="#FF3B4A",
+                font=("Segoe UI", 11, "bold"),
+                anchor="e",
+            )
+            pct_lbl.pack(side="right")
+
+            files_lbl = tk.Label(
+                frame,
+                text=self.files_display_text(),
+                bg="#140A0B",
+                fg="#E9E9E9",
+                font=("Segoe UI", 9),
+                anchor="w",
+            )
+            files_lbl.pack(fill="x", pady=(8, 8))
+
+            bar = ttk.Progressbar(
+                frame,
+                style="ClickShiftConv.Horizontal.TProgressbar",
+                orient="horizontal",
+                length=410,
+                mode="determinate",
+                maximum=100.0,
+                value=1.0,
+            )
+            bar.pack(fill="x")
+
+            detail_lbl = tk.Label(
+                frame,
+                text="Estimating time remaining...",
+                bg="#140A0B",
+                fg="#A1A1AA",
+                font=("Segoe UI", 8),
+                anchor="w",
+            )
+            detail_lbl.pack(fill="x", pady=(8, 0))
+
+            self._ready.set()
+
+            def _destroy_cleanly() -> None:
+                try:
+                    root.destroy()
+                except Exception:
+                    pass
+
+            def _apply_snapshot() -> None:
+                snap = self.compute_snapshot()
+                pct_val = float(snap["pct"])
+                pct_lbl.configure(text=f"{int(round(pct_val))}%")
+                files_lbl.configure(text=str(snap["status_text"]))
+                detail_lbl.configure(text=str(snap["detail_text"]))
+                bar["value"] = max(0.0, min(100.0, pct_val))
+
+            def poll() -> None:
+                closing = False
+                close_delay = 0.0
+                while True:
+                    try:
+                        kind, payload = self._q.get_nowait()
+                    except queue.Empty:
+                        break
+                    if kind in ("complete", "error"):
+                        closing = True
+                        close_delay = float(payload or 0.4)  # type: ignore[arg-type]
+                    elif kind == "close":
+                        _destroy_cleanly()
+                        return
+
+                _apply_snapshot()
+                if closing:
+                    root.after(int(max(0.1, close_delay) * 1000), _destroy_cleanly)
+                    return
+                root.after(80, poll)
+
+            root.protocol("WM_DELETE_WINDOW", _destroy_cleanly)
+            root.after(60, poll)
+            root.mainloop()
+
+        import gc
+        try:
+            _run_mainloop()
+        finally:
+            gc.collect()
+            self._closed.set()
+
+
 def _norm_vtag(ver: str) -> str:
     v = str(ver or "").strip()
     return v if v.startswith("v") else f"v{v}"

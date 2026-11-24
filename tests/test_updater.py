@@ -862,3 +862,65 @@ def test_sign_release_blockmap_subcommand(tmp_path):
     # Unmatched glob fails closed
     assert sign_release.cmd_blockmap([str(tmp_path / "DoesNotExist*.exe")]) == 1
 
+
+def test_conversion_progress_popup_eta_and_percent(tmp_path):
+    from clickshift import engine, monitor
+
+    f1 = tmp_path / "report.pdf"
+    f2 = tmp_path / "notes.txt"
+    f1.write_bytes(b"%PDF-1.4\n" + b"x" * 4096)
+    f2.write_text("hello world\n", encoding="utf-8")
+
+    assert updater.format_eta_seconds(0.3) == "< 1s"
+    assert updater.format_eta_seconds(14.2) == "14s"
+    assert updater.format_eta_seconds(125.0) == "2m 05s"
+
+    popup = updater.ConversionProgressPopup(
+        [(str(f1), "md"), (str(f2), "docx")],
+        estimated_total_ms=10_000.0,
+        enabled=False,
+    ).start()
+    t0 = popup._t0
+
+    # Initial snapshot shows first file, >0% progress, and time remaining
+    snap0 = popup.compute_snapshot(now=t0 + 0.5)
+    assert "report.pdf" in snap0["files_text"]
+    assert ".MD" in snap0["files_text"]
+    assert 1.0 <= snap0["pct"] < 50.0
+    assert snap0["remaining_s"] > 0.0
+    assert "Time remaining:" in snap0["detail_text"]
+
+    # Page sub-progress updates percentage and detail text
+    popup.on_step(file_path=str(f1), dst_ext="md", file_idx=0, total_files=2, sub_frac=0.5, detail="Page 5 of 10")
+    snap_mid = popup.compute_snapshot(now=t0 + 2.0)
+    assert snap_mid["pct"] > snap0["pct"]
+    assert "Page 5 of 10" in snap_mid["detail_text"]
+    assert "Time remaining:" in snap_mid["detail_text"]
+
+    # Completing file 1 advances active file to file 2 (notes.txt -> .DOCX)
+    popup.on_file_done(None)
+    snap_f2 = popup.compute_snapshot(now=t0 + 4.0)
+    assert "notes.txt" in snap_f2["files_text"]
+    assert ".DOCX" in snap_f2["files_text"]
+    assert snap_f2["pct"] >= 50.0
+
+    # Completing batch reaches 100% and 0s remaining
+    popup.complete()
+    snap_done = popup.compute_snapshot(now=t0 + 5.0)
+    assert snap_done["pct"] == 100.0
+    assert snap_done["remaining_s"] == 0.0
+    assert "100%" in snap_done["detail_text"]
+
+    # Engine step_progress and subprogress_scope emit live progress events
+    step_events = []
+    eng = engine.ConversionEngine(enable_ml=False)
+    try:
+        res_list = eng.convert_many([(str(f2), "html")], step_progress=step_events.append)
+        assert len(res_list) == 1 and res_list[0].ok
+        assert len(step_events) >= 1
+        assert step_events[0]["file"] == "notes.txt"
+        assert step_events[0]["dst_ext"] == "html"
+    finally:
+        eng.shutdown()
+
+
