@@ -162,7 +162,7 @@ def _load_filelist(filelist_path: Path) -> list[Path]:
     """Read UTF-8 ordered file paths from a response file and remove staging temp lists."""
     paths: list[Path] = []
     try:
-        raw = filelist_path.read_text(encoding="utf-8", errors="ignore")
+        raw = filelist_path.read_text(encoding="utf-8-sig", errors="ignore")
         for line in raw.splitlines():
             item = line.strip()
             if item:
@@ -171,7 +171,7 @@ def _load_filelist(filelist_path: Path) -> list[Path]:
         try:
             name_low = filelist_path.name.lower()
             parent_low = str(filelist_path.parent).lower()
-            if name_low.endswith(".filelist") and "clickshift" in parent_low:
+            if name_low.endswith(".filelist") and ("clickshift" in parent_low or name_low.startswith("batch_")):
                 filelist_path.unlink(missing_ok=True)
         except Exception:
             pass

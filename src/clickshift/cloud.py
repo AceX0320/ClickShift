@@ -104,7 +104,7 @@ _EXE_SHA256_CACHE: Optional[str] = None
 # ---- security limits --------------------------------------------------------
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024      # 2 MiB cap on any downloaded state
 MAX_CONTRIB_BYTES = 512 * 1024            # skip absurdly large contrib files
-MAX_LATENCY_MS = 86_400_000.0             # > 24 h is nonsense -> reject
+MAX_LATENCY_MS = 3_600_000.0              # > 1 h baseline latency is nonsense -> reject
 ALLOWED_SCHEMES = ("https",)              # plaintext upload is forbidden
 
 

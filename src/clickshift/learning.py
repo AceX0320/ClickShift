@@ -69,61 +69,85 @@ _HAVE_NUMPY = np is not None
 #  Feature extraction (compact, content-aware, pair-local)
 # --------------------------------------------------------------------------- #
 
+from .formats import IMAGE_EXTS
+
 DIM = 10  # [bias, norm_log_bytes, is_large, depth, sin_h, cos_h,
           #  structure_density, media_ratio, complexity_proxy, interaction]
 
 _HEADER_READ_BYTES = 32_768
 _ASCII_BYTES = bytes(range(128))
+_IMAGE_FEATURE_EXTS = IMAGE_EXTS | {"wmf", "emf"}
+_LOG_1MB = math.log1p(1_048_576)
+_LOG_150MB = math.log1p(150 * 1024 * 1024)
+
+
+def _size_latency_scale(src_size: Optional[int]) -> float:
+    """Sub-linear MB scaling factor (1.0 up to 1 MiB, ~42.9x at 150 MiB) keeping median_ms normalized."""
+    if src_size is None or src_size <= 1_048_576:
+        return 1.0
+    return max(1.0, (float(src_size) / 1_048_576.0) ** 0.75)
 
 
 def _probe_content_features(src: Path, ext: str, size: int, lb: float) -> tuple[float, float, float]:
-    """Fast (<0.5 ms) header probe returning (structure_density, media_ratio, complexity).
+    """Fast (<0.5 ms) header+tail probe returning (structure_density, media_ratio, complexity).
 
-    Distinguishes e.g. scanned image-heavy PDFs from text-centric PDFs,
-    or complex multi-part OOXML/EPUB archives from simple documents.
+    Reading both the first 32 KiB and last 32 KiB captures PDF EOF trailers (/Root,
+    /Encrypt, /AcroForm) and OOXML/EPUB ZIP Central Directories (PK\\x01\\x02) on 150 MB files.
     All values are bounded in [0.0, 1.0].
     """
-    struct_density = min(lb / 18.0, 1.0)
+    struct_density = min(lb / 19.0, 1.0)
     media_ratio = 0.0
     complexity = 0.0
     if size <= 0:
         return struct_density, media_ratio, complexity
+    tail = b""
     try:
         with open(src, "rb") as fh:
             head = fh.read(_HEADER_READ_BYTES)
+            if size > _HEADER_READ_BYTES:
+                tail_off = max(_HEADER_READ_BYTES, size - _HEADER_READ_BYTES)
+                fh.seek(tail_off)
+                tail = fh.read(_HEADER_READ_BYTES)
     except OSError:
         return struct_density, media_ratio, complexity
 
     if not head:
         return struct_density, media_ratio, complexity
+    sample = head if not tail else (head + b"\n" + tail)
 
     if ext == "pdf" or head.startswith(b"%PDF"):
-        # Count page, font, and image/XObject stream markers in the header slice
-        pages = head.count(b"/Type /Page") + head.count(b"/Type/Page")
-        fonts = head.count(b"/Font")
-        images = head.count(b"/Subtype /Image") + head.count(b"/Subtype/Image") + head.count(b"/Image")
-        tables_or_forms = head.count(b"/AcroForm") + head.count(b"/StructTreeRoot")
+        # Count page, font, and image/XObject stream markers across header + trailer slice
+        pages = sample.count(b"/Type /Page") + sample.count(b"/Type/Page")
+        fonts = sample.count(b"/Font")
+        images = sample.count(b"/Subtype /Image") + sample.count(b"/Subtype/Image") + sample.count(b"/Image")
+        tables_or_forms = sample.count(b"/AcroForm") + sample.count(b"/StructTreeRoot")
         struct_density = min((pages * 0.15) + (lb / 20.0), 1.0)
         total_markers = max(fonts + images, 1)
         media_ratio = min(images / total_markers, 1.0) if images else 0.0
-        complexity = min((fonts * 0.05) + (tables_or_forms * 0.25) + (0.3 if b"/Encrypt" in head else 0.0), 1.0)
+        complexity = min((fonts * 0.05) + (tables_or_forms * 0.25) + (0.3 if b"/Encrypt" in sample else 0.0), 1.0)
     elif head.startswith(b"PK\x03\x04"):  # OOXML (.docx/.xlsx/.pptx/.odt) or .epub
-        # Count local file headers and media entries visible in the first 32 KB
-        entries = head.count(b"PK\x03\x04")
-        media_hits = head.count(b"media/") + head.count(b"Pictures/") + head.count(b".png") + head.count(b".jpg")
-        xml_hits = head.count(b".xml") + head.count(b".xhtml")
-        struct_density = min(entries / 25.0, 1.0)
+        # Count local headers + central directory entries visible in header + EOF tail
+        entries = head.count(b"PK\x03\x04") + tail.count(b"PK\x01\x02")
+        media_hits = (
+            sample.count(b"media/")
+            + sample.count(b"Pictures/")
+            + sample.count(b".png")
+            + sample.count(b".jpg")
+            + sample.count(b".jpeg")
+        )
+        xml_hits = sample.count(b".xml") + sample.count(b".xhtml")
+        struct_density = min(entries / 40.0, 1.0)
         media_ratio = min(media_hits / max(entries, 1), 1.0)
-        complexity = min((xml_hits / 20.0) + (0.25 if b"embeddings" in head or b"charts" in head else 0.0), 1.0)
-    elif ext in ("png", "jpg", "jpeg", "webp", "avif", "jxl", "tif", "tiff", "gif", "bmp"):
-        # Image: size proxy correlates with resolution & bit depth
-        struct_density = min(lb / 16.0, 1.0)
+        complexity = min((xml_hits / 30.0) + (0.25 if b"embeddings" in sample or b"charts" in sample else 0.0), 1.0)
+    elif ext in _IMAGE_FEATURE_EXTS:
+        # Image: log-scaled resolution & size proxy spanning 100 KB .. 150 MB without saturating at 2 MB
+        struct_density = min(lb / 19.0, 1.0)
         media_ratio = 1.0
-        complexity = 1.0 if size > 2_000_000 else (size / 2_000_000.0)
+        complexity = min(max(lb - 11.5, 0.0) / 7.4, 1.0)
     else:
         # Text / Markdown / HTML / CSV
-        lines = head.count(b"\n")
-        md_or_tags = head.count(b"<table") + head.count(b"```") + head.count(b"|") + head.count(b"# ")
+        lines = sample.count(b"\n")
+        md_or_tags = sample.count(b"<table") + sample.count(b"```") + sample.count(b"|") + sample.count(b"# ")
         struct_density = min(lines / 500.0, 1.0)
         head4k = head[:4096]
         non_ascii = len(head4k.translate(None, _ASCII_BYTES))
@@ -143,7 +167,12 @@ def _features(src: Path, dst_ext: str, src_size: Optional[int] = None) -> list[f
         size = src_size
     lb = math.log1p(max(size, 0))
     norm_lb = min(lb / 20.0, 1.5)
-    is_large = 1.0 if size > 5 * 1024 * 1024 else 0.0
+    # Continuous log ramp: 0.0 up to 1 MiB, ramping smoothly to 1.0 at 150 MiB
+    is_large = (
+        0.0
+        if size <= 1_048_576
+        else min(1.0, (lb - _LOG_1MB) / (_LOG_150MB - _LOG_1MB))
+    )
     depth = min(len(src.parts), 12) / 12.0
     lt = time.localtime()
     h = lt.tm_hour + lt.tm_min / 60.0
@@ -453,7 +482,7 @@ class BanditSelector:
                         ms_val = float(ms)
                     except (TypeError, ValueError):
                         continue
-                    if not (0.0 < ms_val <= 86_400_000.0):
+                    if not (0.0 < ms_val <= 3_600_000.0):
                         continue
                     cur = self.median_ms.get(pair)
                     if cur is None or ms_val < cur:
@@ -513,24 +542,33 @@ class BanditSelector:
                features: Optional[Any] = None, src_size: Optional[int] = None) -> None:
         pair_key = f"{src.suffix.lstrip('.').lower()}>{dst_ext.lstrip('.').lower()}"
         arm = f"{pair_key}|{backend}"
-        x = features if features is not None else self.extract_features(src, dst_ext, src_size=src_size)
+        if src_size is None:
+            try:
+                eff_size: Optional[int] = src.stat().st_size
+            except OSError:
+                eff_size = None
+        else:
+            eff_size = src_size
+        x = features if features is not None else self.extract_features(src, dst_ext, src_size=eff_size)
 
         key = pair_key
+        norm_ms = max(elapsed_ms, 1.0) / _size_latency_scale(eff_size)
         med = self.median_ms.get(key)
-        ref = med if med and med > 0 else max(elapsed_ms, 1.0)
-        speed_reward = 1.0 - 0.5 * abs(math.log(max(elapsed_ms, 1.0) / ref))
+        ref = med if med and med > 0 else norm_ms
+        # Faster than ref gets positive bonus (clamped to +1.0); slower gets smooth log penalty
+        speed_reward = 1.0 - 0.5 * math.log(max(norm_ms, 0.1) / max(ref, 0.1))
         reward = (1.0 if ok else -1.0) + max(min(speed_reward, 1.0), -1.0) * 0.5
 
         self.bandit.update(arm, x, float(reward))
         self.local_bandit.update(arm, x, float(reward))
-        # exponential moving average of successful latency per pair
+        # exponential moving average of size-normalized (~1 MiB baseline) latency per pair
         if ok:
             with self._io_lock:
                 prev = self.median_ms.get(key)
-                self.median_ms[key] = elapsed_ms if prev is None else prev * 0.7 + elapsed_ms * 0.3
+                self.median_ms[key] = norm_ms if prev is None else prev * 0.7 + norm_ms * 0.3
                 prev_loc = self.local_median_ms.get(key)
                 self.local_median_ms[key] = (
-                    elapsed_ms if prev_loc is None else prev_loc * 0.7 + elapsed_ms * 0.3
+                    norm_ms if prev_loc is None else prev_loc * 0.7 + norm_ms * 0.3
                 )
 
         # opportunistic cloud sync (fire-and-forget; only when enabled)

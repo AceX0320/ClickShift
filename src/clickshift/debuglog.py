@@ -78,12 +78,15 @@ def _get_platform() -> str:
     return _PLATFORM_STR
 
 
-def _fmt_exc(exc: Optional[BaseException]) -> str:
+def _fmt_exc(exc: Optional[BaseException], max_chars: int = 16384) -> str:
     if exc is None:
         return ""
     import traceback
 
-    return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    txt = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    if max_chars > 0 and len(txt) > max_chars:
+        return txt[:max_chars] + "\n... (traceback truncated)"
+    return txt
 
 
 def _redact_home_path(value: object, _home: Optional[tuple[str, str]] = None) -> str:
@@ -178,6 +181,8 @@ def render_report(session: dict) -> str:
                 L.append(f"        error: {err[:500]}")
                 tb = a.get("traceback") or _fmt_exc(a.get("exc"))
                 if tb:
+                    if len(tb) > 16384:
+                        tb = tb[:16384] + "\n... (traceback truncated)"
                     for line in tb.rstrip().splitlines():
                         L.append(f"        | {line}")
     L.append("")
@@ -190,7 +195,7 @@ def render_report(session: dict) -> str:
     nfail = sum(1 for a in attempts if not a["ok"])
     L.append(f"  Attempts       : {len(attempts)} ({nfail} failed)")
     if session.get("final_error"):
-        L.append(f"  Final error    : {session['final_error']}")
+        L.append(f"  Final error    : {str(session['final_error'])[:2000]}")
     if ok:
         L.append("")
         L.append("  What went RIGHT:")

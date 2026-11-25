@@ -34,6 +34,8 @@ import atexit
 import base64
 import colorsys
 import contextlib
+import gc
+import hashlib
 import html as _html_mod
 import importlib
 import io
@@ -358,9 +360,16 @@ _MAX_MERGE_GAP_TWIPS = 300  # spacer paragraphs up to 15pt are part of one box
 
 def _merge_shaded_line_tables_with_check(xml: bytes) -> tuple[bytes, int, bool]:
     """Merge runs of per-line shaded tables and check document non-emptiness in one parse."""
+    head_up = xml[:16384].upper()
+    if b"<!ENTITY" in head_up or b"<!DOCTYPE" in head_up:
+        raise ValueError("Refusing XML with DTD/ENTITY declarations")
     etree: Any = importlib.import_module("lxml.etree")
     w = "{%s}" % _W_NS
-    parser = etree.XMLParser(resolve_entities=False, no_network=True, huge_tree=False)
+    parser = etree.XMLParser(
+        resolve_entities=False,
+        no_network=True,
+        huge_tree=len(xml) > 8 * 1024 * 1024,
+    )
     root = etree.fromstring(xml, parser=parser)
 
     def ival(el: Any, attr: str = "w") -> int:
@@ -479,16 +488,27 @@ def _merge_shaded_line_tables(xml: bytes) -> tuple[bytes, int]:
     return out_xml, merged
 
 
-_MAX_ZIP_ENTRY_BYTES = 50 * 1024 * 1024
-_MAX_ZIP_TOTAL_BYTES = 500 * 1024 * 1024
-_MAX_ZIP_ENTRIES = 5000
+_MAX_ZIP_ENTRY_BYTES = 600 * 1024 * 1024   # 600 MiB single member ceiling (supports 150 MiB OOXML/EPUB)
+_MAX_ZIP_TOTAL_BYTES = 2500 * 1024 * 1024  # 2.5 GiB total archive ceiling
+_MAX_ZIP_ENTRIES = 50_000
+_MAX_ZIP_BOMB_RATIO = 200
+
+
+def _check_zip_member_safety(info: zipfile.ZipInfo, max_bytes: int) -> None:
+    if info.file_size > max_bytes:
+        raise ValueError(f"ZIP entry '{info.filename}' exceeds size limit ({info.file_size} > {max_bytes})")
+    if info.file_size > 32 * 1024 * 1024:
+        comp = max(int(info.compress_size or 0), 1)
+        if info.file_size > comp * _MAX_ZIP_BOMB_RATIO:
+            raise ValueError(
+                f"ZIP entry '{info.filename}' exceeds compression ratio limit ({info.file_size} / {comp})"
+            )
 
 
 def _zip_read_bounded(z: zipfile.ZipFile, name: str, max_bytes: int = _MAX_ZIP_ENTRY_BYTES) -> bytes:
     """Safely read a ZIP member up to ``max_bytes`` (guards against zip bombs)."""
     info = z.getinfo(name)
-    if info.file_size > max_bytes:
-        raise ValueError(f"ZIP entry '{name}' exceeds size limit ({info.file_size} > {max_bytes})")
+    _check_zip_member_safety(info, max_bytes)
     chunks: list[bytes] = []
     total = 0
     with z.open(info, "r") as stream:
@@ -503,6 +523,39 @@ def _zip_read_bounded(z: zipfile.ZipFile, name: str, max_bytes: int = _MAX_ZIP_E
     return b"".join(chunks)
 
 
+def _zip_copy_member_bounded(
+    zin: zipfile.ZipFile,
+    zout: zipfile.ZipFile,
+    info: zipfile.ZipInfo,
+    max_bytes: int = _MAX_ZIP_ENTRY_BYTES,
+) -> int:
+    """Stream-copy ``info`` from ``zin`` into ``zout`` in 1 MiB chunks without buffering in RAM."""
+    _check_zip_member_safety(info, max_bytes)
+    if info.is_dir():
+        zout.writestr(info, b"")
+        return 0
+    out_info = zipfile.ZipInfo(filename=info.filename, date_time=info.date_time)
+    out_info.compress_type = info.compress_type
+    out_info.external_attr = info.external_attr
+    out_info.internal_attr = info.internal_attr
+    out_info.create_system = info.create_system
+    out_info.comment = info.comment
+    out_info.extra = info.extra
+    total = 0
+    with zin.open(info, "r") as src_s, zout.open(out_info, "w", force_zip64=info.file_size > 0x7FFFFFFF) as dst_s:
+        while True:
+            chunk = src_s.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(
+                    f"ZIP entry '{info.filename}' exceeded decompressed size cap ({max_bytes} bytes)"
+                )
+            dst_s.write(chunk)
+    return total
+
+
 def _safe_xml_fromstring(data: bytes) -> ET.Element:
     """Parse XML bytes rejecting DTD/ENTITY declarations."""
     if b"<!ENTITY" in data[:16384].upper() or b"<!DOCTYPE" in data[:16384].upper():
@@ -515,20 +568,27 @@ def _postprocess_pdf2docx(dst: Path) -> Optional[bool]:
     tmp_name: Optional[str] = None
     try:
         with zipfile.ZipFile(dst) as zin:
-            xml = _zip_read_bounded(zin, "word/document.xml", _MAX_ZIP_ENTRY_BYTES)
+            doc_info = zin.getinfo("word/document.xml")
+            if doc_info.file_size > 128 * 1024 * 1024:
+                # Very large document.xml is non-empty; skip full-DOM cosmetic merge to bound RAM.
+                return True
+            xml = _zip_read_bounded(zin, "word/document.xml", 128 * 1024 * 1024)
             new_xml, merged, has_content = _merge_shaded_line_tables_with_check(xml)
+            del xml
             if not merged:
                 return has_content
-            fd, tmp_name = tempfile.mkstemp(suffix=".docx", dir=str(dst.parent))
+            fd, tmp_name = tempfile.mkstemp(prefix=".~clickshift-pp-", suffix=".tmp", dir=str(dst.parent))
             os.close(fd)
-            with zipfile.ZipFile(tmp_name, "w", zipfile.ZIP_DEFLATED) as zout:
+            total_copied = len(new_xml)
+            with zipfile.ZipFile(tmp_name, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zout:
                 for item in zin.infolist():
-                    data = (
-                        new_xml
-                        if item.filename == "word/document.xml"
-                        else _zip_read_bounded(zin, item.filename, _MAX_ZIP_ENTRY_BYTES * 2)
-                    )
-                    zout.writestr(item, data)
+                    if item.filename == "word/document.xml":
+                        zout.writestr(item, new_xml)
+                    else:
+                        total_copied += _zip_copy_member_bounded(zin, zout, item, _MAX_ZIP_ENTRY_BYTES)
+                        if total_copied > _MAX_ZIP_TOTAL_BYTES:
+                            raise ValueError("DOCX archive exceeded cumulative size limit")
+            del new_xml
         os.replace(tmp_name, str(dst))
         tmp_name = None
         return has_content
@@ -630,26 +690,141 @@ def _lo_build_base_args(prof_uri: str, dst_ext: str, infilter: Optional[str], ex
     return args
 
 
+def _scaled_backend_timeout(size_bytes: int, base_s: float = 180.0, per_mb_s: float = 5.0,
+                            min_s: float = 300.0, max_s: float = 1200.0) -> float:
+    mb = max(0.0, float(size_bytes) / (1024.0 * 1024.0))
+    return max(min_s, min(max_s, base_s + mb * per_mb_s))
+
+
+_ORIG_SUBPROCESS_RUN = subprocess.run
+
+
+def _run_subprocess_job_tree(args: list[str], timeout: float) -> subprocess.CompletedProcess[bytes]:
+    """Run ``args`` with a Win32 Job Object (or POSIX process group) so child trees die cleanly on timeout."""
+    if subprocess.run is not _ORIG_SUBPROCESS_RUN:
+        return subprocess.run(args, capture_output=True, timeout=timeout)
+    if not IS_WINDOWS:
+        posix_proc: Any = subprocess.Popen(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        try:
+            out, err = posix_proc.communicate(timeout=timeout)
+            return subprocess.CompletedProcess(args, posix_proc.returncode or 0, out, err)
+        except subprocess.TimeoutExpired:
+            try:
+                import signal
+                os.killpg(posix_proc.pid, getattr(signal, "SIGKILL", 9))
+            except Exception:
+                posix_proc.kill()
+            posix_proc.communicate()
+            raise
+
+    ctypes_mod: Any = _opt_import("ctypes")
+    hjob: Any = None
+    k32: Any = None
+    if ctypes_mod is not None and hasattr(ctypes_mod, "WinDLL"):
+        try:
+            k32 = ctypes_mod.WinDLL("kernel32", use_last_error=True)
+            k32.CreateJobObjectW.argtypes = [ctypes_mod.c_void_p, ctypes_mod.c_wchar_p]
+            k32.CreateJobObjectW.restype = ctypes_mod.c_void_p
+            k32.AssignProcessToJobObject.argtypes = [ctypes_mod.c_void_p, ctypes_mod.c_void_p]
+            k32.AssignProcessToJobObject.restype = ctypes_mod.c_int
+            k32.TerminateJobObject.argtypes = [ctypes_mod.c_void_p, ctypes_mod.c_uint]
+            k32.TerminateJobObject.restype = ctypes_mod.c_int
+            k32.CloseHandle.argtypes = [ctypes_mod.c_void_p]
+            k32.CloseHandle.restype = ctypes_mod.c_int
+            hjob = k32.CreateJobObjectW(None, None)
+        except Exception:
+            hjob = None
+
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    proc = subprocess.Popen(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        creationflags=creationflags,
+    )
+    job_attached = False
+    if hjob and k32 is not None:
+        try:
+            ph = int(getattr(proc, "_handle", 0) or 0)
+            if ph:
+                job_attached = bool(k32.AssignProcessToJobObject(hjob, ctypes_mod.c_void_p(ph)))
+        except Exception:
+            job_attached = False
+    try:
+        out, err = proc.communicate(timeout=timeout)
+        return subprocess.CompletedProcess(args, proc.returncode or 0, out, err)
+    except subprocess.TimeoutExpired:
+        if job_attached and hjob and k32 is not None:
+            try:
+                k32.TerminateJobObject(hjob, 1)
+            except Exception:
+                pass
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            proc.communicate(timeout=5.0)
+        except Exception:
+            pass
+        raise
+    finally:
+        if hjob and k32 is not None:
+            try:
+                if job_attached:
+                    k32.TerminateJobObject(hjob, 0)
+                k32.CloseHandle(hjob)
+            except Exception:
+                pass
+
+
 def lo_convert(src: Path, dst: Path, extra: Optional[list[str]] = None) -> None:
     if not BACKENDS.libreoffice:
         raise RuntimeError("LibreOffice not found")
     outdir = dst.parent
+    outdir.mkdir(parents=True, exist_ok=True)
     src_resolved = Path(src).resolve()
+    try:
+        src_bytes = src_resolved.stat().st_size
+    except OSError:
+        src_bytes = 0
+    timeout_s = _scaled_backend_timeout(src_bytes, base_s=180.0, per_mb_s=5.0, min_s=300.0, max_s=1200.0)
     dst_ext = dst.suffix.lstrip(".").lower()
     src_ext = src_resolved.suffix.lstrip(".").lower()
     infilter = _lo_infilter_for(src_ext, dst_ext)
-    with _LO_SEM, tempfile.TemporaryDirectory(prefix="clickshift_lo_") as prof_tmp:
-        prof_dir = Path(prof_tmp)
-        user_dir = prof_dir / "user"
-        user_dir.mkdir(parents=True, exist_ok=True)
-        (user_dir / "registrymodifications.xcu").write_text(_LO_XCU_HARDENED, encoding="utf-8")
-        prof_uri = prof_dir.resolve().as_uri()
-        args = _lo_build_base_args(prof_uri, dst_ext, infilter, extra)
-        args += ["--outdir", str(outdir), str(src_resolved)]
-        proc = subprocess.run(args, capture_output=True, timeout=300)
-    produced = outdir / (src_resolved.stem + dst.suffix)
-    if produced.exists() and produced != dst:
-        produced.replace(dst)
+    same_vol_stage: Optional[Path] = None
+    try:
+        cand_stage = outdir / f".~clickshift-lo-{uuid.uuid4().hex[:8]}"
+        cand_stage.mkdir(parents=False, exist_ok=False)
+        same_vol_stage = cand_stage
+    except OSError:
+        same_vol_stage = None
+    try:
+        with _LO_SEM, tempfile.TemporaryDirectory(prefix="clickshift_lo_") as prof_tmp:
+            prof_dir = Path(prof_tmp)
+            user_dir = prof_dir / "user"
+            user_dir.mkdir(parents=True, exist_ok=True)
+            (user_dir / "registrymodifications.xcu").write_text(_LO_XCU_HARDENED, encoding="utf-8")
+            stage_dir = same_vol_stage if same_vol_stage is not None else (prof_dir / "out")
+            stage_dir.mkdir(parents=True, exist_ok=True)
+            prof_uri = prof_dir.resolve().as_uri()
+            args = _lo_build_base_args(prof_uri, dst_ext, infilter, extra)
+            args += ["--outdir", str(stage_dir), str(src_resolved)]
+            proc = _run_subprocess_job_tree(args, timeout=timeout_s)
+            produced = stage_dir / (src_resolved.stem + dst.suffix)
+            if produced.exists() and produced.stat().st_size > 0:
+                try:
+                    os.replace(str(produced), str(dst))
+                except OSError:
+                    shutil.move(str(produced), str(dst))
+    finally:
+        if same_vol_stage is not None:
+            shutil.rmtree(same_vol_stage, ignore_errors=True)
     if not dst.exists():
         raise RuntimeError(f"LibreOffice produced no output ({proc.returncode}): "
                            f"{proc.stderr.decode(errors='replace')[:400]}")
@@ -669,6 +844,16 @@ def _lo_convert_batch(
     ext_dot = "." + dst_ext.lstrip(".")
     ok_map: dict[Path, bool] = {s: False for s, _ in pairs}
     err_msg = ""
+    total_bytes = 0
+    for s_p, _ in pairs:
+        try:
+            total_bytes += s_p.stat().st_size
+        except OSError:
+            pass
+    timeout_s = max(
+        float(max(300, 60 * len(pairs))),
+        _scaled_backend_timeout(total_bytes, base_s=180.0, per_mb_s=5.0, min_s=300.0, max_s=1200.0),
+    )
     with _LO_SEM, tempfile.TemporaryDirectory(prefix="clickshift_lobatch_") as prof_tmp:
         root_tmp = Path(prof_tmp)
         user_dir = root_tmp / "user"
@@ -680,7 +865,7 @@ def _lo_convert_batch(
         args = _lo_build_base_args(prof_uri, dst_ext, infilter, None)
         args += ["--outdir", str(stage_out)] + [str(s.resolve()) for s, _ in pairs]
         try:
-            proc = subprocess.run(args, capture_output=True, timeout=max(300, 60 * len(pairs)))
+            proc = _run_subprocess_job_tree(args, timeout=timeout_s)
             if proc.returncode != 0:
                 err_msg = proc.stderr.decode(errors="replace")[:400]
         except Exception as exc:
@@ -713,6 +898,76 @@ _FILEFORMAT = {  # https://learn.microsoft.com/office/vba/api/wdwdformat etc.
     "txt": 2,     # wdFormatText  (Word only)
 }
 _WORD_ONLY_FMTS = {"html", "rtf", "txt"}
+_OFFICE_EXE_NAMES = {
+    "word": "winword.exe",
+    "excel": "excel.exe",
+    "powerpoint": "powerpnt.exe",
+}
+
+
+def _snapshot_process_pids(exe_name_lower: str) -> set[int]:
+    """Return running PIDs matching ``exe_name_lower`` via Win32 Toolhelp32 (zero child shells)."""
+    pids: set[int] = set()
+    if not IS_WINDOWS or not exe_name_lower:
+        return pids
+    ctypes_mod: Any = _opt_import("ctypes")
+    if ctypes_mod is None or not hasattr(ctypes_mod, "WinDLL"):
+        return pids
+    try:
+        class PROCESSENTRY32W(ctypes_mod.Structure):
+            _fields_ = [
+                ("dwSize", ctypes_mod.c_uint32),
+                ("cntUsage", ctypes_mod.c_uint32),
+                ("th32ProcessID", ctypes_mod.c_uint32),
+                ("th32DefaultHeapID", ctypes_mod.c_size_t),
+                ("th32ModuleID", ctypes_mod.c_uint32),
+                ("cntThreads", ctypes_mod.c_uint32),
+                ("th32ParentProcessID", ctypes_mod.c_uint32),
+                ("pcPriClassBase", ctypes_mod.c_long),
+                ("dwFlags", ctypes_mod.c_uint32),
+                ("szExeFile", ctypes_mod.c_wchar * 260),
+            ]
+
+        k32 = ctypes_mod.WinDLL("kernel32", use_last_error=True)
+        TH32CS_SNAPPROCESS = 0x00000002
+        snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if not snap or snap == ctypes_mod.c_void_p(-1).value:
+            return pids
+        try:
+            pe = PROCESSENTRY32W()
+            pe.dwSize = ctypes_mod.sizeof(PROCESSENTRY32W)
+            ok = k32.Process32FirstW(snap, ctypes_mod.byref(pe))
+            while ok:
+                if str(pe.szExeFile).lower() == exe_name_lower:
+                    pids.add(int(pe.th32ProcessID))
+                ok = k32.Process32NextW(snap, ctypes_mod.byref(pe))
+        finally:
+            k32.CloseHandle(snap)
+    except Exception:
+        pass
+    return pids
+
+
+def _terminate_owned_pid(pid: Optional[int], expected_exe_lower: str) -> None:
+    """Terminate ``pid`` ONLY if it still matches ``expected_exe_lower`` (never kills unrelated PIDs)."""
+    if not IS_WINDOWS or not pid or pid <= 0 or pid == os.getpid():
+        return
+    if pid not in _snapshot_process_pids(expected_exe_lower):
+        return
+    ctypes_mod: Any = _opt_import("ctypes")
+    if ctypes_mod is None or not hasattr(ctypes_mod, "WinDLL"):
+        return
+    try:
+        k32 = ctypes_mod.WinDLL("kernel32", use_last_error=True)
+        PROCESS_TERMINATE = 0x0001
+        hproc = k32.OpenProcess(PROCESS_TERMINATE, False, int(pid))
+        if hproc:
+            try:
+                k32.TerminateProcess(hproc, 1)
+            finally:
+                k32.CloseHandle(hproc)
+    except Exception:
+        pass
 
 
 class _OfficeStaWorker:
@@ -726,6 +981,7 @@ class _OfficeStaWorker:
         self.progid = progid
         self._q: "queue.Queue" = queue.Queue()
         self._thread: Optional[threading.Thread] = None
+        self._owned_pid: Optional[int] = None
         self._lock = threading.Lock()
 
     def _ensure_thread(self) -> None:
@@ -736,18 +992,24 @@ class _OfficeStaWorker:
                 )
                 self._thread.start()
 
-    def submit(self, fn: Callable[[Any], None]) -> None:
+    def submit(self, fn: Callable[[Any], None], timeout_s: Optional[float] = None) -> None:
         self._ensure_thread()
+        eff_timeout = float(timeout_s) if (timeout_s is not None and timeout_s > 0) else self.CALL_TIMEOUT_S
         res_q: "queue.Queue[tuple[bool, Any]]" = queue.Queue(maxsize=1)
         self._q.put((fn, res_q))
         try:
-            ok, payload = res_q.get(timeout=self.CALL_TIMEOUT_S)
+            ok, payload = res_q.get(timeout=eff_timeout)
         except queue.Empty as exc:
-            # Detach hung STA thread so subsequent jobs spawn a fresh worker
+            # Detach hung STA thread and terminate ONLY an exclusively owned Office PID
+            owned_pid: Optional[int] = None
             with self._lock:
                 self._thread = None
+                owned_pid = self._owned_pid
+                self._owned_pid = None
+            if owned_pid:
+                _terminate_owned_pid(owned_pid, _OFFICE_EXE_NAMES.get(self.app_name, ""))
             raise TimeoutError(
-                f"{self.progid} COM automation timed out after {int(self.CALL_TIMEOUT_S)}s"
+                f"{self.progid} COM automation timed out after {int(eff_timeout)}s"
             ) from exc
         if not ok:
             raise payload
@@ -763,8 +1025,30 @@ class _OfficeStaWorker:
             th.join(timeout=wait_timeout)
 
     def _spawn_app(self) -> Any:
+        exe_lower = _OFFICE_EXE_NAMES.get(self.app_name, "")
+        pre_pids = _snapshot_process_pids(exe_lower) if exe_lower else set()
         win32_client: Any = importlib.import_module("win32com.client")
         app = win32_client.DispatchEx(self.progid)
+        post_pids = _snapshot_process_pids(exe_lower) if exe_lower else set()
+        new_pids = post_pids - pre_pids
+        owned_pid: Optional[int] = None
+        if len(new_pids) == 1:
+            cand_pid = next(iter(new_pids))
+            # Extra safety for single-instance servers (PowerPoint): confirm 0 open docs
+            open_count = 0
+            try:
+                if self.app_name == "powerpoint":
+                    open_count = int(app.Presentations.Count)
+                elif self.app_name == "word":
+                    open_count = int(app.Documents.Count)
+                elif self.app_name == "excel":
+                    open_count = int(app.Workbooks.Count)
+            except Exception:
+                open_count = 0
+            if open_count == 0:
+                owned_pid = cand_pid
+        with self._lock:
+            self._owned_pid = owned_pid
         if self.app_name == "powerpoint":
             # PowerPoint uses ppAlertsNone=1 (0 is rejected and leaves ppAlertsAll=2)
             # and disallows Visible=False / ScreenUpdating=False.
@@ -784,6 +1068,8 @@ class _OfficeStaWorker:
         return app
 
     def _quit_app(self, app: Any) -> None:
+        with self._lock:
+            self._owned_pid = None
         if app is not None:
             try:
                 app.Quit()
@@ -842,13 +1128,14 @@ class _OfficeComPool:
         self._workers: dict[str, _OfficeStaWorker] = {}
         self._lock = threading.Lock()
 
-    def run(self, app_name: str, progid: str, fn: Callable[[Any], None]) -> None:
+    def run(self, app_name: str, progid: str, fn: Callable[[Any], None],
+            timeout_s: Optional[float] = None) -> None:
         with self._lock:
             w = self._workers.get(app_name)
             if w is None:
                 w = _OfficeStaWorker(app_name, progid)
                 self._workers[app_name] = w
-        w.submit(fn)
+        w.submit(fn, timeout_s=timeout_s)
 
     def shutdown(self) -> None:
         with self._lock:
@@ -901,26 +1188,37 @@ def _sanitize_ooxml_for_com(src: Path, tmp_dir: Any) -> Path:
         for info in infos:
             if not info.filename.lower().endswith(".rels"):
                 continue
-            raw = _zip_read_bounded(zin, info.filename, 10 * 1024 * 1024)
+            raw = _zip_read_bounded(zin, info.filename, 32 * 1024 * 1024)
             root = _safe_xml_fromstring(raw)
+            kept: list[ET.Element] = []
             changed = False
-            for rel in list(root):
-                if (rel.get("TargetMode") or "").strip().lower() != "external":
-                    continue
-                if _is_unsafe_external_rel(rel.get("Type") or "", rel.get("Target") or ""):
-                    root.remove(rel)
+            for rel in root:
+                if (
+                    (rel.get("TargetMode") or "").strip().lower() == "external"
+                    and _is_unsafe_external_rel(rel.get("Type") or "", rel.get("Target") or "")
+                ):
                     changed = True
+                else:
+                    kept.append(rel)
             if changed:
+                root[:] = kept
                 ET.register_namespace("", _RELS_NS)
                 rewrites[info.filename] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
         if not rewrites:
             return src
         out_dir = tmp_dir() if callable(tmp_dir) else Path(tmp_dir)
         sanitized = out_dir / src.name
-        with zipfile.ZipFile(sanitized, "w", zipfile.ZIP_DEFLATED) as zout:
+        total_copied = 0
+        with zipfile.ZipFile(sanitized, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zout:
             for info in infos:
-                data = rewrites[info.filename] if info.filename in rewrites else _zip_read_bounded(zin, info.filename, _MAX_ZIP_ENTRY_BYTES * 2)
-                zout.writestr(info, data)
+                if info.filename in rewrites:
+                    payload = rewrites[info.filename]
+                    total_copied += len(payload)
+                    zout.writestr(info, payload)
+                else:
+                    total_copied += _zip_copy_member_bounded(zin, zout, info, _MAX_ZIP_ENTRY_BYTES)
+                if total_copied > _MAX_ZIP_TOTAL_BYTES:
+                    raise ValueError("OOXML archive exceeded cumulative decompressed size limit")
     return sanitized
 
 
@@ -928,16 +1226,13 @@ def _check_rtf_for_com(src: Path) -> None:
     if src.suffix.lower() != ".rtf":
         return
     try:
-        max_bytes = 16 * 1024 * 1024
-        chunk_bytes = 256 * 1024
+        chunk_bytes = 1024 * 1024
         overlap = b""
-        seen = 0
         with open(src, "rb") as fh:
-            while seen < max_bytes:
-                chunk = fh.read(min(chunk_bytes, max_bytes - seen))
+            while True:
+                chunk = fh.read(chunk_bytes)
                 if not chunk:
                     break
-                seen += len(chunk)
                 buf = overlap + chunk
                 if _RTF_UNSAFE_RE.search(buf):
                     raise RuntimeError("Refusing unsafe external template/DDE reference in RTF via Office COM")
@@ -964,10 +1259,19 @@ def conv_office_com(src: Path, dst: Path) -> None:
     if not progid:
         raise RuntimeError(f"Microsoft {app_name.title()} not installed")
     _check_rtf_for_com(src)
-    target = Path(dst)
-    if target.exists():
-        target = _unique(target)
-    dst_abs = str(target.resolve())
+    try:
+        src_bytes = src.stat().st_size
+    except OSError:
+        src_bytes = 0
+    com_timeout_s = _scaled_backend_timeout(
+        src_bytes, base_s=90.0, per_mb_s=4.5, min_s=_OfficeStaWorker.CALL_TIMEOUT_S, max_s=900.0
+    )
+    wanted = Path(dst)
+    wanted.parent.mkdir(parents=True, exist_ok=True)
+    if wanted.exists():
+        wanted = _unique(wanted)
+    stage_target = wanted.parent / f".~clickshift-com-{uuid.uuid4().hex[:8]}{wanted.suffix}"
+    dst_abs = str(stage_target.resolve())
     disable_macros = _office_disable_macros_enabled()
 
     tmp_obj: Optional[tempfile.TemporaryDirectory] = None
@@ -1033,14 +1337,22 @@ def conv_office_com(src: Path, dst: Path) -> None:
                     except Exception:
                         pass
 
-        _OFFICE_POOL.run(app_name, progid, _do_convert)
+        _OFFICE_POOL.run(app_name, progid, _do_convert, timeout_s=com_timeout_s)
+    except Exception:
+        try:
+            stage_target.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
     finally:
         if tmp_obj is not None:
-            tmp_obj.cleanup()
+            try:
+                tmp_obj.cleanup()
+            except OSError:
+                shutil.rmtree(tmp_obj.name, ignore_errors=True)
     out_file = Path(dst_abs)
     if not out_file.exists():
         raise RuntimeError("Office COM produced no output")
-    wanted = Path(dst)
     if out_file != wanted.resolve():
         out_file.replace(wanted)
 
@@ -1065,11 +1377,12 @@ def conv_pdf2docx(src: Path, dst: Path) -> None:
     # Fallback emptiness check only if XML postprocess could not inspect word/document.xml
     if has_content is None and BACKENDS.python_docx:
         try:
-            docx: Any = importlib.import_module("docx")
-            d = docx.Document(str(dst))
-            if not (any(p.text.strip() for p in d.paragraphs) or d.tables or d.inline_shapes):
-                dst.unlink(missing_ok=True)
-                raise RuntimeError("pdf2docx produced an empty DOCX (likely scanned PDF)")
+            if dst.stat().st_size < 16 * 1024 * 1024:
+                docx: Any = importlib.import_module("docx")
+                d = docx.Document(str(dst))
+                if not (any(p.text.strip() for p in d.paragraphs) or d.tables or d.inline_shapes):
+                    dst.unlink(missing_ok=True)
+                    raise RuntimeError("pdf2docx produced an empty DOCX (likely scanned PDF)")
         except RuntimeError:
             raise
         except Exception:
@@ -1081,20 +1394,31 @@ _WR_HEAD_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 _WR_BULLET_RE = re.compile(r"^\s*[-*+]\s+")
 _WR_NUM_RE = re.compile(r"^\s*\d+[.)]\s+")
 _WR_QUOTE_RE = re.compile(r"^>\s?")
-_RICH_MD_RE = re.compile(r"(\*\*.+?\*\*|`.+?`)")
-_EPUB_SCRIPT_RE = re.compile(r"(?is)<(script|style).+?</\1>")
+_RICH_MD_RE = re.compile(r"(\*\*[^*\n]+\*\*|`[^`\n]+`)")
+_EPUB_SCRIPT_RE = re.compile(r"(?is)<script\b[^>]*>.*?</script>|<style\b[^>]*>.*?</style>")
 _EPUB_BREAK_RE = re.compile(r"(?i)</(p|div|h[1-6]|li|br)>")
 _EPUB_TAG_RE = re.compile(r"(?s)<[^>]+>")
 _EPUB_WS_RE = re.compile(r"[ \t]+")
 _EPUB_NL_RE = re.compile(r"\n\s*\n+")
 
 
+def _adaptive_scan_dpi(page: Any, target_dpi: int = 200, max_pixels: int = 24_000_000) -> int:
+    """Compute scan/raster DPI bounded by ``max_pixels`` so oversized pages never spike RAM."""
+    w_in = max(0.1, float(page.rect.width) / 72.0)
+    h_in = max(0.1, float(page.rect.height) / 72.0)
+    est_px = (w_in * target_dpi) * (h_in * target_dpi)
+    if est_px <= max_pixels:
+        return target_dpi
+    scaled = int((max_pixels / (w_in * h_in)) ** 0.5)
+    return max(72, min(target_dpi, scaled))
+
+
 def conv_pdf_to_docx_pymupdf(src: Path, dst: Path) -> None:
     """High-reliability PDF -> DOCX via PyMuPDF (fitz) + python-docx.
 
     Preserves headings, bold/italic text runs, and embedded images; if a page
-    is scanned (image-only with no text), renders the page at 200 DPI into the
-    Word document so scanned PDFs convert cleanly.
+    is scanned (image-only with no text), renders the page into the Word
+    document using adaptive-DPI JPEG so large scanned PDFs stay fast and compact.
     """
     fitz: Any = _import_fitz()
     docx: Any = importlib.import_module("docx")
@@ -1111,9 +1435,11 @@ def conv_pdf_to_docx_pymupdf(src: Path, dst: Path) -> None:
     style.font.name = "Calibri"
     style.font.size = Pt(11)
     text_flags = getattr(fitz, "TEXTFLAGS_DICT", 0) & ~getattr(fitz, "TEXT_PRESERVE_IMAGES", 0)
+    total_pages = len(pdf)
 
     try:
         for page_idx, page in enumerate(pdf):
+            _report_subprogress(page_idx + 1, total_pages, f"Page {page_idx + 1} of {total_pages}")
             if page_idx > 0:
                 doc.add_page_break()
             pdict = page.get_text("dict", flags=text_flags) if text_flags else page.get_text("dict")
@@ -1157,8 +1483,12 @@ def conv_pdf_to_docx_pymupdf(src: Path, dst: Path) -> None:
                                     r.italic = True
             # If the page had no extractable text (e.g. scanned page), embed rendered page image
             if not wrote_any_text:
-                pix = page.get_pixmap(dpi=200, alpha=False)
-                img_bytes = pix.tobytes("png")
+                scan_dpi = _adaptive_scan_dpi(page, target_dpi=200, max_pixels=20_000_000)
+                pix = page.get_pixmap(dpi=scan_dpi, alpha=False)
+                try:
+                    img_bytes = pix.tobytes("jpeg", jpg_quality=90)
+                except TypeError:
+                    img_bytes = pix.tobytes("jpeg")
                 with io.BytesIO(img_bytes) as bio:
                     doc.add_picture(bio, width=Inches(6.2))
     finally:
@@ -1201,6 +1531,22 @@ def conv_pdf_to_docx_pypdf(src: Path, dst: Path) -> None:
 
 _IMG_QUALITY = {"jpg": 95, "jpeg": 95, "webp": 95, "avif": 60, "heic": 60,
                 "jxl": 90, "tiff": 90, "png": None}
+_MAX_SAFE_IMAGE_PIXELS = 400_000_000  # 400 MP: supports 150 MB posters/blueprints while blocking gigapixel bombs
+_WEBP_MAX_SIDE = 16_383
+_PIL_PIXEL_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def _allow_large_images(Image: Any):
+    """Raise Pillow's decompression ceiling safely up to ``_MAX_SAFE_IMAGE_PIXELS``."""
+    with _PIL_PIXEL_LOCK:
+        prev = getattr(Image, "MAX_IMAGE_PIXELS", None)
+        if prev is not None and prev < _MAX_SAFE_IMAGE_PIXELS:
+            Image.MAX_IMAGE_PIXELS = _MAX_SAFE_IMAGE_PIXELS
+    try:
+        yield
+    finally:
+        pass
 
 
 def _exif_orientation(im: Any) -> int:
@@ -1216,26 +1562,38 @@ def conv_pillow(src: Path, dst: Path) -> None:
     ext = dst.suffix.lstrip(".").lower()
     if ext == "jpg":
         ext = "jpeg"
-    with Image.open(src) as im_orig:
+    with _allow_large_images(Image), Image.open(src) as im_orig:
         if _exif_orientation(im_orig) != 1:
             ImageOps: Any = importlib.import_module("PIL.ImageOps")
             im = ImageOps.exif_transpose(im_orig) or im_orig
         else:
             im = im_orig
-        if ext in ("jpeg", "bmp", "ico") and im.mode in ("RGBA", "LA", "P"):
+        if ext == "ico" and (im.width > 256 or im.height > 256):
+            im = im.copy()
+            im.thumbnail((256, 256), Image.LANCZOS)
+        elif ext == "webp" and (im.width > _WEBP_MAX_SIDE or im.height > _WEBP_MAX_SIDE):
+            scale = _WEBP_MAX_SIDE / float(max(im.width, im.height))
+            nw = max(1, min(_WEBP_MAX_SIDE, int(round(im.width * scale))))
+            nh = max(1, min(_WEBP_MAX_SIDE, int(round(im.height * scale))))
+            im = im.resize((nw, nh), Image.LANCZOS)
+        if ext in ("jpeg", "bmp") and im.mode in ("RGBA", "LA", "P"):
             bg = Image.new("RGB", im.size, (255, 255, 255))
             rgba = im.convert("RGBA") if im.mode != "RGBA" else im
             bg.paste(rgba, mask=rgba.getchannel("A"))
             im = bg
         elif ext in ("jpeg", "bmp") and im.mode not in ("RGB", "L"):
             im = im.convert("RGB")
+        elif ext == "ico" and im.mode not in ("RGBA", "RGB"):
+            im = im.convert("RGBA")
         save_kw: dict[str, Any] = {}
         q = _IMG_QUALITY.get(ext)
-        if q is not None and ext in ("jpeg", "webp", "tiff"):
+        if q is not None and ext in ("jpeg", "webp"):
             save_kw["quality"] = q
         if ext == "webp":
-            save_kw["method"] = 4          # fast but strong compression
-        if ext in ("png", "tiff"):
+            save_kw["method"] = 4 if (im.width * im.height) <= 25_000_000 else 2
+        if ext in ("tif", "tiff"):
+            save_kw["compression"] = "tiff_adobe_deflate"
+        if ext == "png" and (im.width * im.height) <= 16_000_000:
             save_kw["optimize"] = True
         if ext == "jpeg":
             save_kw["subsampling"] = 0     # 4:4:4 = maximum fidelity
@@ -1247,47 +1605,242 @@ def conv_pillow(src: Path, dst: Path) -> None:
 
 # ---- Text-family conversions ----------------------------------------------- #
 
+def _detect_text_encoding(path: Path) -> str:
+    """Detect text file encoding from a 64 KiB header sample in O(1) RAM."""
+    try:
+        with open(path, "rb") as fh:
+            sample = fh.read(65_536)
+    except OSError:
+        return "utf-8"
+    if not sample:
+        return "utf-8"
+    if sample.startswith(b"\xef\xbb\xbf"):
+        return "utf-8-sig"
+    if sample.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return "utf-16"
+    try:
+        sample.decode("utf-8")
+        return "utf-8"
+    except UnicodeDecodeError as exc:
+        # Multibyte UTF-8 split right at the 64 KiB sample boundary is still valid UTF-8
+        if len(sample) == 65_536 and exc.start >= 65_532:
+            try:
+                sample[: exc.start].decode("utf-8")
+                return "utf-8"
+            except UnicodeDecodeError:
+                pass
+    if BACKENDS.chardet:
+        try:
+            chardet: Any = importlib.import_module("chardet")
+            guess = chardet.detect(sample)
+            enc = guess.get("encoding")
+            if enc:
+                b"x".decode(enc)
+                return str(enc)
+        except Exception:
+            pass
+    return "utf-8"
+
+
 def _read_text_auto(path: Path) -> tuple[str, str]:
+    enc = _detect_text_encoding(path)
     raw = path.read_bytes()
     if not raw:
-        return "", "utf-8"
-    if raw.startswith(b"\xef\xbb\xbf"):
-        return raw.decode("utf-8-sig", errors="replace"), "utf-8-sig"
-    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
-        return raw.decode("utf-16", errors="replace"), "utf-16"
+        return "", enc
     try:
-        return raw.decode("utf-8"), "utf-8"
-    except UnicodeDecodeError:
-        pass
-    enc = "utf-8"
-    sample = raw[:65_536]
-    if BACKENDS.chardet:
-        chardet: Any = importlib.import_module("chardet")
-        guess = chardet.detect(sample)
-        if guess.get("encoding"):
-            enc = guess["encoding"]
-    try:
-        return raw.decode(enc, errors="replace"), enc
-    except LookupError:
+        return raw.decode(enc), enc
+    except (UnicodeDecodeError, LookupError):
         return raw.decode("utf-8", errors="replace"), "utf-8"
 
 
 def conv_text_generic(src: Path, dst: Path) -> None:
-    text, _enc = _read_text_auto(src)
     ext = dst.suffix.lstrip(".").lower()
-    if ext in (TEXT_EXTS - {"html", "htm"}):
-        dst.write_text(text, encoding="utf-8-sig")
-    elif ext in ("html", "htm"):
-        body = _html_mod.escape(text)
-        dst.write_text(
-            "<!DOCTYPE html><html><head><meta charset='utf-8'><title>"
-            f"{_html_mod.escape(src.stem)}</title></head><body><pre>{body}</pre></body></html>",
-            encoding="utf-8")
-    else:
+    if ext not in TEXT_EXTS:
         raise RuntimeError(f"unsupported text target .{ext}")
+    try:
+        src_size = src.stat().st_size
+    except OSError:
+        src_size = 0
+    if src_size <= 8 * 1024 * 1024:
+        text, _enc = _read_text_auto(src)
+        if ext in (TEXT_EXTS - {"html", "htm"}):
+            dst.write_text(text, encoding="utf-8-sig")
+        else:
+            body = _html_mod.escape(text)
+            dst.write_text(
+                "<!DOCTYPE html><html><head><meta charset='utf-8'><title>"
+                f"{_html_mod.escape(src.stem)}</title></head><body><pre>{body}</pre></body></html>",
+                encoding="utf-8",
+            )
+        return
+
+    enc = _detect_text_encoding(src)
+    chunk_chars = 1024 * 1024
+    done_bytes = 0
+    with open(src, "r", encoding=enc, errors="replace") as rfh:
+        if ext in ("html", "htm"):
+            with open(dst, "w", encoding="utf-8") as wfh:
+                wfh.write(
+                    "<!DOCTYPE html><html><head><meta charset='utf-8'><title>"
+                    f"{_html_mod.escape(src.stem)}</title></head><body><pre>"
+                )
+                while True:
+                    chunk = rfh.read(chunk_chars)
+                    if not chunk:
+                        break
+                    wfh.write(_html_mod.escape(chunk))
+                    done_bytes = min(src_size, done_bytes + len(chunk))
+                    _report_subprogress(done_bytes, max(1, src_size), "Streaming HTML")
+                wfh.write("</pre></body></html>")
+        else:
+            with open(dst, "w", encoding="utf-8-sig") as wfh:
+                while True:
+                    chunk = rfh.read(chunk_chars)
+                    if not chunk:
+                        break
+                    wfh.write(chunk)
+                    done_bytes = min(src_size, done_bytes + len(chunk))
+                    _report_subprogress(done_bytes, max(1, src_size), "Streaming text")
 
 
 _MD_HEURISTIC = re.compile(r"^(#{1,6}\s|[*-]\s|\d+.\s|>\s|`|\*\*)", re.M)
+_XML_CTRL_STRIP_TRANS = dict.fromkeys(
+    [c for c in range(32) if c not in (9, 10, 13)] + [0xFFFE, 0xFFFF], None
+)
+
+
+def _docx_xml_safe(s: str) -> str:
+    return _xml_escape(s.translate(_XML_CTRL_STRIP_TRANS))
+
+
+def _stream_large_text_to_docx(src: Path, dst: Path, enc: str, md: bool) -> None:
+    """Stream-write an arbitrarily large (>15 MiB) plain-text or Markdown file into OOXML .docx in O(1) RAM."""
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/word/document.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+        '<Override PartName="/word/styles.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>'
+        "</Types>"
+    )
+    root_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+        'Target="word/document.xml"/>'
+        "</Relationships>"
+    )
+    doc_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" '
+        'Target="styles.xml"/>'
+        "</Relationships>"
+    )
+    styles_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<w:styles xmlns:w="{_W_NS}">'
+        '<w:docDefaults><w:rPrDefault><w:rPr>'
+        '<w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/>'
+        '<w:sz w:val="22"/><w:szCs w:val="22"/>'
+        "</w:rPr></w:rPrDefault></w:docDefaults>"
+        '<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>'
+        '<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/>'
+        '<w:rPr><w:b/><w:sz w:val="36"/></w:rPr></w:style>'
+        '<w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="heading 2"/>'
+        '<w:rPr><w:b/><w:sz w:val="30"/></w:rPr></w:style>'
+        '<w:style w:type="paragraph" w:styleId="Heading3"><w:name w:val="heading 3"/>'
+        '<w:rPr><w:b/><w:sz w:val="26"/></w:rPr></w:style>'
+        '<w:style w:type="paragraph" w:styleId="Heading4"><w:name w:val="heading 4"/>'
+        '<w:rPr><w:b/><w:sz w:val="24"/></w:rPr></w:style>'
+        "</w:styles>"
+    )
+    try:
+        total_bytes = max(1, src.stat().st_size)
+    except OSError:
+        total_bytes = 1
+
+    def _runs_xml(line_s: str) -> str:
+        if not md or ("**" not in line_s and "`" not in line_s):
+            return f'<w:r><w:t xml:space="preserve">{_docx_xml_safe(line_s)}</w:t></w:r>'
+        out_r: list[str] = []
+        for part in _RICH_MD_RE.split(line_s):
+            if not part:
+                continue
+            if part.startswith("**") and part.endswith("**") and len(part) > 4:
+                out_r.append(
+                    f'<w:r><w:rPr><w:b/></w:rPr><w:t xml:space="preserve">{_docx_xml_safe(part[2:-2])}</w:t></w:r>'
+                )
+            elif part.startswith("`") and part.endswith("`") and len(part) > 2:
+                out_r.append(
+                    '<w:r><w:rPr><w:rFonts w:ascii="Consolas" w:hAnsi="Consolas"/></w:rPr>'
+                    f'<w:t xml:space="preserve">{_docx_xml_safe(part[1:-1])}</w:t></w:r>'
+                )
+            else:
+                out_r.append(f'<w:r><w:t xml:space="preserve">{_docx_xml_safe(part)}</w:t></w:r>')
+        return "".join(out_r)
+
+    with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zout:
+        zout.writestr("[Content_Types].xml", content_types.encode("utf-8"))
+        zout.writestr("_rels/.rels", root_rels.encode("utf-8"))
+        zout.writestr("word/_rels/document.xml.rels", doc_rels.encode("utf-8"))
+        zout.writestr("word/styles.xml", styles_xml.encode("utf-8"))
+        doc_info = zipfile.ZipInfo("word/document.xml")
+        doc_info.compress_type = zipfile.ZIP_DEFLATED
+        with zout.open(doc_info, "w", force_zip64=True) as raw_doc, open(
+            src, "r", encoding=enc, errors="replace"
+        ) as rfh:
+            wbuf: list[str] = [
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                f'<w:document xmlns:w="{_W_NS}"><w:body>'
+            ]
+            wbuf_chars = len(wbuf[0])
+            seen_chars = 0
+            in_code = False
+            for raw_line in rfh:
+                seen_chars += len(raw_line)
+                line = raw_line.rstrip("\r\n")
+                if md and line.strip().startswith("```"):
+                    in_code = not in_code
+                    continue
+                if in_code:
+                    pxml = (
+                        "<w:p><w:r><w:rPr>"
+                        '<w:rFonts w:ascii="Consolas" w:hAnsi="Consolas"/><w:sz w:val="18"/>'
+                        f'</w:rPr><w:t xml:space="preserve">{_docx_xml_safe(line)}</w:t></w:r></w:p>'
+                    )
+                else:
+                    hm = _WR_HEAD_RE.match(line) if md else None
+                    if hm:
+                        lvl = min(len(hm.group(1)), 4)
+                        pxml = (
+                            f'<w:p><w:pPr><w:pStyle w:val="Heading{lvl}"/></w:pPr>'
+                            f'<w:r><w:t xml:space="preserve">{_docx_xml_safe(hm.group(2).strip())}</w:t></w:r></w:p>'
+                        )
+                    elif md and _WR_BULLET_RE.match(line):
+                        mb = _WR_BULLET_RE.match(line)
+                        rest = line[mb.end():] if mb else line
+                        pxml = f"<w:p><w:pPr><w:ind w:left=\"360\"/></w:pPr>{_runs_xml('• ' + rest)}</w:p>"
+                    elif md and _WR_QUOTE_RE.match(line):
+                        mq = _WR_QUOTE_RE.match(line)
+                        rest = line[mq.end():] if mq else line
+                        pxml = f"<w:p><w:pPr><w:ind w:left=\"360\"/></w:pPr>{_runs_xml(rest)}</w:p>"
+                    else:
+                        pxml = f"<w:p>{_runs_xml(line)}</w:p>"
+                wbuf.append(pxml)
+                wbuf_chars += len(pxml)
+                if wbuf_chars >= 524_288:
+                    raw_doc.write("".join(wbuf).encode("utf-8"))
+                    wbuf.clear()
+                    wbuf_chars = 0
+                    _report_subprogress(min(total_bytes, seen_chars), total_bytes, "Streaming DOCX")
+            wbuf.append("</w:body></w:document>")
+            raw_doc.write("".join(wbuf).encode("utf-8"))
 
 
 def _write_text_to_docx(text: str, dst: Path, md: bool) -> None:
@@ -1339,6 +1892,17 @@ def _write_text_to_docx(text: str, dst: Path, md: bool) -> None:
 
 
 def conv_text_to_docx(src: Path, dst: Path) -> None:
+    try:
+        src_size = src.stat().st_size
+    except OSError:
+        src_size = 0
+    if src_size > 15 * 1024 * 1024:
+        enc = _detect_text_encoding(src)
+        with open(src, "r", encoding=enc, errors="replace") as fh:
+            head = fh.read(4096)
+        md = src.suffix.lstrip(".").lower() in ("md", "markdown") or bool(_MD_HEURISTIC.search(head))
+        _stream_large_text_to_docx(src, dst, enc=enc, md=md)
+        return
     text, _ = _read_text_auto(src)
     md = src.suffix.lstrip(".").lower() in ("md", "markdown") or bool(_MD_HEURISTIC.search(text[:4000]))
     _write_text_to_docx(text, dst, md=md)
@@ -1365,16 +1929,42 @@ def conv_html_to_docx(src: Path, dst: Path) -> None:
     lo_convert(src, dst)
 
 
+def _iter_docx_table_rows_text(tbl_elm: Any) -> list[list[str]]:
+    """Extract cell text rows directly from ``w:tbl`` XML in O(R * C) time (avoids python-docx O(R^2 * C^2))."""
+    w_tr = f"{{{_W_NS}}}tr"
+    w_tc = f"{{{_W_NS}}}tc"
+    w_p = f"{{{_W_NS}}}p"
+    w_t = f"{{{_W_NS}}}t"
+    rows_out: list[list[str]] = []
+    for tr in tbl_elm.findall(w_tr):
+        row_cells: list[str] = []
+        for tc in tr.findall(w_tc):
+            paras: list[str] = []
+            for p in tc.findall(w_p):
+                pt = "".join(t.text for t in p.iter(w_t) if t.text)
+                if pt:
+                    paras.append(pt)
+            if not paras:
+                fallback = "".join(t.text for t in tc.iter(w_t) if t.text)
+                row_cells.append(fallback.strip())
+            else:
+                row_cells.append("\n".join(paras).strip())
+        if row_cells:
+            rows_out.append(row_cells)
+    return rows_out
+
+
 def conv_epub_extract(src: Path, dst: Path) -> None:
-    texts: list[str] = []
+    ext = dst.suffix.lstrip(".").lower()
     with zipfile.ZipFile(src) as z:
         all_infos = z.infolist()
         if len(all_infos) > _MAX_ZIP_ENTRIES:
             raise ValueError(f"EPUB archive exceeds maximum entries ({len(all_infos)} > {_MAX_ZIP_ENTRIES})")
         name_set = {i.filename for i in all_infos}
-        names = [n for n in name_set if n.lower().endswith((".xhtml", ".html", ".htm"))]
+        fallback_names = sorted(n for n in name_set if n.lower().endswith((".xhtml", ".html", ".htm")))
+        names = fallback_names
         total_read = 0
-        # respect spine order when possible
+        # respect OPF spine reading order when available
         try:
             container_bytes = _zip_read_bounded(z, "META-INF/container.xml", _MAX_ZIP_ENTRY_BYTES)
             total_read += len(container_bytes)
@@ -1382,7 +1972,8 @@ def conv_epub_extract(src: Path, dst: Path) -> None:
             rootfiles = root.findall(".//{urn:oasis:names:tc:opendocument:xmlns:container}rootfile")
             opf_path = rootfiles[0].get("full-path") if rootfiles else None
             if opf_path:
-                opf_dir = str(Path(opf_path).parent)
+                opf_parent = Path(opf_path).parent.as_posix()
+                opf_prefix = "" if opf_parent in ("", ".") else (opf_parent.rstrip("/") + "/")
                 opf_bytes = _zip_read_bounded(z, opf_path, _MAX_ZIP_ENTRY_BYTES)
                 total_read += len(opf_bytes)
                 opf = _safe_xml_fromstring(opf_bytes)
@@ -1392,62 +1983,110 @@ def conv_epub_extract(src: Path, dst: Path) -> None:
                     item_id = it.get("id")
                     item_href = it.get("href")
                     if item_id and item_href:
-                        manifest[item_id] = item_href
+                        manifest[item_id] = item_href.split("#", 1)[0]
                 ordered: list[str] = []
+                seen_sp: set[str] = set()
                 for it in opf.findall(".//p:spine/p:itemref", ns):
                     idref = it.get("idref")
                     href = manifest.get(idref) if idref else None
                     if href:
-                        ordered.append((opf_dir + "/" + href).replace("\\", "/").lstrip("./"))
-                names = [n for n in ordered if n in name_set] or names
+                        cand = (opf_prefix + href).replace("\\", "/").lstrip("./")
+                        if cand in name_set and cand not in seen_sp:
+                            seen_sp.add(cand)
+                            ordered.append(cand)
+                if ordered:
+                    names = ordered
         except ValueError:
             raise
         except Exception:
             pass
-        for n in sorted(names):
-            remaining = _MAX_ZIP_TOTAL_BYTES - total_read
-            if remaining <= 0:
-                raise ValueError("EPUB exceeded maximum cumulative decompressed size")
+
+        def _iter_chapter_texts():
+            nonlocal total_read
+            tot_ch = max(1, len(names))
+            for idx, n in enumerate(names, 1):
+                _report_subprogress(idx, tot_ch, f"Chapter {idx} of {tot_ch}")
+                remaining = _MAX_ZIP_TOTAL_BYTES - total_read
+                if remaining <= 0:
+                    raise ValueError("EPUB exceeded maximum cumulative decompressed size")
+                try:
+                    raw_entry = _zip_read_bounded(z, n, min(_MAX_ZIP_ENTRY_BYTES, remaining))
+                    total_read += len(raw_entry)
+                    html = raw_entry.decode("utf-8", errors="replace")
+                except KeyError:
+                    continue
+                html = _EPUB_SCRIPT_RE.sub(" ", html)
+                html = _EPUB_BREAK_RE.sub("\n", html)
+                text = _EPUB_TAG_RE.sub(" ", html)
+                text = _EPUB_WS_RE.sub(" ", text)
+                text = _EPUB_NL_RE.sub("\n\n", text).strip()
+                if text:
+                    yield text
+
+        if ext in ("html", "htm"):
+            with open(dst, "w", encoding="utf-8") as wfh:
+                wfh.write("<!DOCTYPE html><html><head><meta charset='utf-8'></head><body><pre>")
+                first = True
+                for ch_txt in _iter_chapter_texts():
+                    if not first:
+                        wfh.write("\n\n\n")
+                    first = False
+                    wfh.write(_html_mod.escape(ch_txt))
+                wfh.write("\n</pre></body></html>")
+            return
+
+        if ext == "docx":
+            tmp_txt = dst.parent / f".~clickshift-epub-{uuid.uuid4().hex[:8]}.txt"
             try:
-                raw_entry = _zip_read_bounded(z, n, min(_MAX_ZIP_ENTRY_BYTES, remaining))
-                total_read += len(raw_entry)
-                html = raw_entry.decode("utf-8", errors="replace")
-            except KeyError:
-                continue
-            html = _EPUB_SCRIPT_RE.sub(" ", html)
-            # crude but robust text extraction w/ paragraph breaks
-            html = _EPUB_BREAK_RE.sub("\n", html)
-            text = _EPUB_TAG_RE.sub(" ", html)
-            text = _EPUB_WS_RE.sub(" ", text)
-            text = _EPUB_NL_RE.sub("\n\n", text).strip()
-            if text:
-                texts.append(text)
-    joined = "\n\n\n".join(texts) + "\n"
-    ext = dst.suffix.lstrip(".").lower()
-    if ext in ("docx",):
-        _write_text_to_docx(joined, dst, md=bool(_MD_HEURISTIC.search(joined[:4000])))
-    elif ext in ("html", "htm"):
-        body = _html_mod.escape(joined)
-        dst.write_text(f"<!DOCTYPE html><html><head><meta charset='utf-8'></head>"
-                       f"<body><pre>{body}</pre></body></html>", encoding="utf-8")
-    else:
-        dst.write_text(joined, encoding="utf-8-sig")
+                with open(tmp_txt, "w", encoding="utf-8") as tfh:
+                    first = True
+                    for ch_txt in _iter_chapter_texts():
+                        if not first:
+                            tfh.write("\n\n\n")
+                        first = False
+                        tfh.write(ch_txt)
+                    tfh.write("\n")
+                conv_text_to_docx(tmp_txt, dst)
+            finally:
+                tmp_txt.unlink(missing_ok=True)
+            return
+
+        with open(dst, "w", encoding="utf-8-sig") as wfh:
+            first = True
+            for ch_txt in _iter_chapter_texts():
+                if not first:
+                    wfh.write("\n\n\n")
+                first = False
+                wfh.write(ch_txt)
+            wfh.write("\n")
 
 
 def conv_docx_to_text(src: Path, dst: Path) -> None:
     docx: Any = importlib.import_module("docx")
     d = docx.Document(str(src))
-    lines = [p.text for p in d.paragraphs]
-    for t in d.tables:
-        for row in t.rows:
-            lines.append("\t".join(c.text for c in row.cells))
-    dst.write_text("\n".join(lines), encoding="utf-8-sig")
+    w_p = f"{{{_W_NS}}}p"
+    w_tbl = f"{{{_W_NS}}}tbl"
+    w_t = f"{{{_W_NS}}}t"
+    with open(dst, "w", encoding="utf-8-sig") as wfh:
+        first = True
+        for child in d.element.body:
+            if child.tag == w_p:
+                if not first:
+                    wfh.write("\n")
+                first = False
+                wfh.write("".join(t.text for t in child.iter(w_t) if t.text))
+            elif child.tag == w_tbl:
+                for row_cells in _iter_docx_table_rows_text(child):
+                    if not first:
+                        wfh.write("\n")
+                    first = False
+                    wfh.write("\t".join(c.replace("\n", " ") for c in row_cells))
 
 
 def _load_transposed_rgb(src: Path) -> Any:
     """Open an image with EXIF orientation applied and alpha composited onto white."""
     Image: Any = importlib.import_module("PIL.Image")
-    with Image.open(src) as raw:
+    with _allow_large_images(Image), Image.open(src) as raw:
         if _exif_orientation(raw) != 1:
             ImageOps: Any = importlib.import_module("PIL.ImageOps")
             im = ImageOps.exif_transpose(raw)
@@ -1466,33 +2105,46 @@ def _load_transposed_rgb(src: Path) -> Any:
         return im.convert("RGB")
 
 
-def _image_to_embed_stream(src: Path) -> tuple[io.BytesIO, int, int]:
+def _image_to_embed_stream(src: Path, max_side: int = 6000) -> tuple[io.BytesIO, int, int]:
     """Return (JPEG/PNG BytesIO, width_px, height_px) for embedding into DOCX/PPTX."""
     Image: Any = importlib.import_module("PIL.Image")
-    with Image.open(src) as raw:
+    with _allow_large_images(Image), Image.open(src) as raw:
         fmt = (raw.format or "").upper()
         orient = _exif_orientation(raw)
-        if fmt == "JPEG" and orient == 1 and raw.mode in ("RGB", "L"):
-            w, h = raw.size
-            return io.BytesIO(src.read_bytes()), w, h
+        orig_mode = raw.mode
+        w0, h0 = raw.size
+        # Zero-reencode fast path for compatible JPEG and PNG files within embed bounds
+        if orient == 1 and max(w0, h0) <= max_side:
+            if fmt == "JPEG" and orig_mode in ("RGB", "L"):
+                return io.BytesIO(src.read_bytes()), w0, h0
+            if fmt == "PNG" and orig_mode in ("RGB", "RGBA", "L", "LA", "P"):
+                return io.BytesIO(src.read_bytes()), w0, h0
         if orient != 1:
             ImageOps: Any = importlib.import_module("PIL.ImageOps")
             im = ImageOps.exif_transpose(raw)
         else:
             im = raw
-        if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
-            rgba = im.convert("RGBA") if im.mode != "RGBA" else im
-            bg = Image.new("RGB", rgba.size, (255, 255, 255))
-            bg.paste(rgba, mask=rgba.getchannel("A"))
-            im = bg
-        elif im.mode not in ("RGB", "L"):
-            im = im.convert("RGB")
+        has_alpha = im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info)
+        if max(im.width, im.height) > max_side:
+            scale = max_side / float(max(im.width, im.height))
+            im = im.resize(
+                (max(1, int(round(im.width * scale))), max(1, int(round(im.height * scale)))),
+                Image.LANCZOS,
+            )
         w, h = im.size
         buf = io.BytesIO()
-        if fmt == "JPEG":
-            im.save(buf, format="JPEG", quality=95, subsampling=0)
-        else:
+        if has_alpha:
+            if im.mode not in ("RGBA", "LA"):
+                im = im.convert("RGBA")
             im.save(buf, format="PNG")
+        elif orig_mode in ("1", "P") or (fmt in ("PNG", "GIF", "BMP") and (w * h) <= 2_000_000):
+            if im.mode not in ("RGB", "L"):
+                im = im.convert("RGB")
+            im.save(buf, format="PNG")
+        else:
+            if im.mode not in ("RGB", "L"):
+                im = im.convert("RGB")
+            im.save(buf, format="JPEG", quality=90)
         buf.seek(0)
         return buf, w, h
 
@@ -1506,14 +2158,16 @@ def conv_images_to_pdf(srcs: list[Path], dst: Path) -> None:
             lo_convert(srcs[0], dst)
             return
         raise RuntimeError("Pillow is required to combine images into PDF")
+    Image: Any = importlib.import_module("PIL.Image")
+    total_imgs = len(srcs)
     if BACKENDS.pymupdf:
         fitz: Any = _import_fitz()
-        Image: Any = importlib.import_module("PIL.Image")
         doc = fitz.open()
         try:
-            for p in srcs:
+            for idx, p in enumerate(srcs, 1):
+                _report_subprogress(idx, total_imgs, f"Image {idx} of {total_imgs}")
                 raw_inserted = False
-                with Image.open(p) as hdr:
+                with _allow_large_images(Image), Image.open(p) as hdr:
                     fmt = (hdr.format or "").upper()
                     orient = _exif_orientation(hdr)
                     w_px, h_px = hdr.size
@@ -1534,10 +2188,10 @@ def conv_images_to_pdf(srcs: list[Path], dst: Path) -> None:
                         w_px, h_px = im.size
                         w_pt = max(1.0, float(w_px) * 72.0 / 200.0)
                         h_pt = max(1.0, float(h_px) * 72.0 / 200.0)
-                        if p.suffix.lower() in (".jpg", ".jpeg"):
-                            im.save(buf, format="JPEG", quality=95, subsampling=0)
-                        else:
+                        if mode in ("1", "P") and (w_px * h_px) <= 4_000_000:
                             im.save(buf, format="PNG")
+                        else:
+                            im.save(buf, format="JPEG", quality=92)
                         page = doc.new_page(width=w_pt, height=h_pt)
                         page.insert_image(page.rect, stream=buf.getvalue())
                     finally:
@@ -1548,18 +2202,28 @@ def conv_images_to_pdf(srcs: list[Path], dst: Path) -> None:
             doc.close()
         return
 
-    pages = [_load_transposed_rgb(p) for p in srcs]
+    first_im = _load_transposed_rgb(srcs[0])
+    _report_subprogress(1, total_imgs, f"Image 1 of {total_imgs}")
+
+    def _iter_rest():
+        for idx, p in enumerate(srcs[1:], 2):
+            _report_subprogress(idx, total_imgs, f"Image {idx} of {total_imgs}")
+            nxt = _load_transposed_rgb(p)
+            try:
+                yield nxt
+            finally:
+                nxt.close()
+
     try:
-        pages[0].save(
+        first_im.save(
             dst,
             "PDF",
             resolution=200.0,
             save_all=True,
-            append_images=pages[1:],
+            append_images=_iter_rest(),
         )
     finally:
-        for pg in pages:
-            pg.close()
+        first_im.close()
 
 
 def conv_image_to_pdf(src: Path, dst: Path) -> None:
@@ -1674,9 +2338,15 @@ def conv_pdf_to_html_fidelity(src: Path, dst: Path) -> None:
                 ".page{box-shadow:none;max-width:none!important;page-break-after:always}}"
                 "</style></head><body>\n"
             )
+            use_text_paths = len(doc) <= 60
+            if use_text_paths:
+                try:
+                    use_text_paths = src.stat().st_size <= 25 * 1024 * 1024
+                except OSError:
+                    pass
             for i, page in enumerate(doc, start=1):
                 _report_subprogress(i, len(doc), f"Page {i} of {len(doc)}")
-                svg = page.get_svg_image(matrix=fitz.Identity, text_as_path=True)
+                svg = page.get_svg_image(matrix=fitz.Identity, text_as_path=use_text_paths)
                 head = _SVG_HDR_RE.sub("", svg[:512], count=1)
                 svg = head + svg[512:] if len(svg) > 512 else head
                 prefix = f"p{i}_"
@@ -1848,15 +2518,20 @@ def _md_heading_level(size: float, body_size: float, tiers: list[float],
     return 0
 
 
-def _md_diagram_boxes(page: Any) -> list[tuple[float, float, float, float]]:
+def _md_diagram_boxes(page: Any, drawings: Optional[list[Any]] = None) -> list[tuple[float, float, float, float]]:
     """Cluster dense non-frame vector drawings into diagram regions via sweep-line."""
     pw, ph = page.rect.width, page.rect.height
+    raw_drawings = drawings if drawings is not None else page.get_drawings()
+    if len(raw_drawings) > 2500:
+        return []
     rects = []
-    for d in page.get_drawings():
+    for d in raw_drawings:
         r = d.get("rect")
         if not r or (r.width > pw * 0.88 and r.height > ph * 0.85) or (r.width < 1 and r.height < 1):
             continue
         rects.append((r.x0, r.y0, r.x1, r.y1))
+        if len(rects) >= 1500:
+            break
     if len(rects) < 4:
         return []
     pad = 14.0
@@ -2026,8 +2701,12 @@ def conv_pdf_to_md_structured(src: Path, dst: Path) -> None:
         for page_idx, page in enumerate(doc):
             _report_subprogress(n_analyze_done + page_idx + 1, total_md_steps, f"Page {page_idx + 1} of {len(doc)}")
             ph = page.rect.height
-            diag_boxes = _md_diagram_boxes(page)
-            tables = _md_real_tables(page)
+            try:
+                page_drawings = page.get_drawings()
+            except Exception:
+                page_drawings = []
+            diag_boxes = _md_diagram_boxes(page, drawings=page_drawings)
+            tables = _md_real_tables(page) if len(page_drawings) <= 2500 else []
             tbl_boxes = [tb for tb, _ in tables]
             blocks = cached_blocks.pop(page_idx, None)
             if blocks is None:
@@ -2119,14 +2798,27 @@ def conv_pdf_to_md_structured(src: Path, dst: Path) -> None:
             page_items.sort(key=lambda it: it[0])
             for _y0, kind, md in page_items:
                 if (
-                    kind == "code" and items_all and items_all[-1][0] == "code"
-                    and items_all[-1][1].startswith("```\n") and md.startswith("```\n")
+                    kind == "code" and items_all and items_all[-1][0] == "code_parts"
+                    and md.startswith("```\n")
                 ):
-                    items_all[-1] = ("code", f"```\n{items_all[-1][1][4:-4]}\n\n{md[4:-4]}\n```")
+                    items_all[-1][1].append(md[4:-4])  # type: ignore[attr-defined]
+                elif kind == "code" and md.startswith("```\n"):
+                    items_all.append(("code_parts", [md[4:-4]]))  # type: ignore[arg-type]
                 else:
                     items_all.append((kind, md))
 
-        dst.write_text("\n\n".join(md for _k, md in items_all).strip() + "\n", encoding="utf-8")
+        with open(dst, "w", encoding="utf-8") as wfh:
+            first_item = True
+            for k, val in items_all:
+                piece = ("```\n" + "\n\n".join(val) + "\n```") if k == "code_parts" else str(val)
+                piece = piece.strip()
+                if not piece:
+                    continue
+                if not first_item:
+                    wfh.write("\n\n")
+                first_item = False
+                wfh.write(piece)
+            wfh.write("\n")
     finally:
         doc.close()
 
@@ -2158,26 +2850,53 @@ def _rgb_int_to_tuple(color_int: int) -> tuple[int, int, int]:
     return ((color_int >> 16) & 0xFF, (color_int >> 8) & 0xFF, color_int & 0xFF)
 
 
-def _normalize_image_stream(blob: bytes) -> Optional[io.BytesIO]:
-    """Ensure image bytes are in a universally accepted raster format (PNG/JPEG)."""
+def _normalize_image_bytes(blob: bytes, max_side: int = 6000) -> Optional[tuple[bytes, str]]:
+    """Return ``(normalized_bytes, mime_type)`` preserving PNG/JPEG directly and using JPEG for opaque photos."""
     if not blob:
         return None
     if BACKENDS.pillow:
         try:
             Image: Any = importlib.import_module("PIL.Image")
-            with Image.open(io.BytesIO(blob)) as im:
+            with _allow_large_images(Image), Image.open(io.BytesIO(blob)) as im:
                 fmt = (im.format or "").upper()
-                if fmt in ("PNG", "JPEG") and im.mode in ("RGB", "RGBA", "L"):
-                    return io.BytesIO(blob)
+                orig_mode = im.mode
+                if max(im.width, im.height) <= max_side:
+                    if fmt == "PNG" and orig_mode in ("RGB", "RGBA", "L", "LA", "P"):
+                        return blob, "image/png"
+                    if fmt == "JPEG" and orig_mode in ("RGB", "L"):
+                        return blob, "image/jpeg"
+                has_alpha = orig_mode in ("RGBA", "LA") or (orig_mode == "P" and "transparency" in im.info)
+                if max(im.width, im.height) > max_side:
+                    scale = max_side / float(max(im.width, im.height))
+                    im = im.resize(
+                        (max(1, int(round(im.width * scale))), max(1, int(round(im.height * scale)))),
+                        Image.LANCZOS,
+                    )
                 out = io.BytesIO()
-                if im.mode not in ("RGB", "RGBA", "L"):
-                    im = im.convert("RGBA" if "A" in im.getbands() else "RGB")
-                im.save(out, format="PNG")
-                out.seek(0)
-                return out
+                if has_alpha:
+                    if im.mode not in ("RGBA", "LA"):
+                        im = im.convert("RGBA")
+                    im.save(out, format="PNG")
+                    return out.getvalue(), "image/png"
+                if orig_mode in ("1", "P") or (fmt in ("PNG", "GIF", "BMP") and (im.width * im.height) <= 2_000_000):
+                    if im.mode not in ("RGB", "L"):
+                        im = im.convert("RGB")
+                    im.save(out, format="PNG")
+                    return out.getvalue(), "image/png"
+                if im.mode not in ("RGB", "L"):
+                    im = im.convert("RGB")
+                im.save(out, format="JPEG", quality=90)
+                return out.getvalue(), "image/jpeg"
         except Exception:
             return None
-    return io.BytesIO(blob)
+    mime = "image/jpeg" if blob[:3] == b"\xff\xd8\xff" else "image/png"
+    return blob, mime
+
+
+def _normalize_image_stream(blob: bytes) -> Optional[io.BytesIO]:
+    """Ensure image bytes are in a universally accepted raster format (PNG/JPEG)."""
+    res = _normalize_image_bytes(blob)
+    return io.BytesIO(res[0]) if res is not None else None
 
 
 _DML_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
@@ -2485,6 +3204,8 @@ def conv_pdf_to_pptx(src: Path, dst: Path) -> None:
         prs.slide_height = Pt(sh)
         blank_layout = prs.slide_layouts[min(6, len(prs.slide_layouts) - 1)]
         xref_cache: dict[int, Optional[bytes]] = {}
+        xref_cache_bytes = 0
+        MAX_XREF_CACHE_BYTES = 64 * 1024 * 1024
 
         for p_idx, page in enumerate(pdf, 1):
             _report_subprogress(p_idx, len(pdf), f"Page {p_idx} of {len(pdf)}")
@@ -2505,8 +3226,13 @@ def conv_pdf_to_pptx(src: Path, dst: Path) -> None:
             )
 
             if not has_text:
-                pix = page.get_pixmap(dpi=200, alpha=False)
-                with io.BytesIO(pix.tobytes("png")) as stream:
+                scan_dpi = _adaptive_scan_dpi(page, target_dpi=200, max_pixels=20_000_000)
+                pix = page.get_pixmap(dpi=scan_dpi, alpha=False)
+                try:
+                    scan_bytes = pix.tobytes("jpeg", jpg_quality=90)
+                except TypeError:
+                    scan_bytes = pix.tobytes("jpeg")
+                with io.BytesIO(scan_bytes) as stream:
                     slide.shapes.add_picture(
                         stream, Pt(ox), Pt(oy), Pt(pw * scale), Pt(ph * scale)
                     )
@@ -2525,11 +3251,20 @@ def conv_pdf_to_pptx(src: Path, dst: Path) -> None:
                     except Exception:
                         extracted = None
                     if extracted and extracted.get("image"):
-                        s_norm = _normalize_image_stream(extracted["image"])
-                        if s_norm is not None:
-                            raw_norm = s_norm.getvalue()
-                            s_norm.close()
-                    xref_cache[xref] = raw_norm
+                        norm_pair = _normalize_image_bytes(extracted["image"])
+                        if norm_pair is not None:
+                            raw_norm = norm_pair[0]
+                    if raw_norm is not None:
+                        while xref_cache and (xref_cache_bytes + len(raw_norm)) > MAX_XREF_CACHE_BYTES:
+                            oldest_k = next(iter(xref_cache))
+                            old_v = xref_cache.pop(oldest_k)
+                            if old_v is not None:
+                                xref_cache_bytes = max(0, xref_cache_bytes - len(old_v))
+                        if len(raw_norm) <= MAX_XREF_CACHE_BYTES:
+                            xref_cache[xref] = raw_norm
+                            xref_cache_bytes += len(raw_norm)
+                    else:
+                        xref_cache[xref] = None
                 if raw_norm is None:
                     continue
                 try:
@@ -2739,10 +3474,13 @@ def conv_docx_to_pptx(src: Path, dst: Path) -> None:
 
     related_parts = getattr(doc.part, "related_parts", {}) or {}
     children = list(doc.element.body)
+    total_body_nodes = max(1, len(children))
     idx = 0
     while idx < len(children):
         child = children[idx]
         idx += 1
+        if idx == 1 or idx == total_body_nodes or (idx % 25 == 0):
+            _report_subprogress(idx, total_body_nodes, f"Block {idx} of {total_body_nodes}")
         tag = child.tag.rsplit("}", 1)[-1]
 
         if tag == "p":
@@ -2858,33 +3596,45 @@ def conv_docx_to_pptx(src: Path, dst: Path) -> None:
                     pass
 
         elif tag == "tbl":
-            tbl = docx_tbl_mod.Table(child, doc)
-            nrows = len(tbl.rows)
-            ncols = len(tbl.columns) if nrows else 0
+            rows_txt = _iter_docx_table_rows_text(child)
+            nrows = len(rows_txt)
+            ncols = max((len(r) for r in rows_txt), default=0)
             if nrows == 0 or ncols == 0:
                 continue
-            est_h = min(5.4, max(0.8, nrows * 0.44))
-            if current_slide is None or (y_cursor + est_h > BODY_BOTTOM and slide_has_content):
-                cont = f"{current_title} (cont.)" if current_title and not current_title.endswith("(cont.)") else current_title
-                slide_target = _new_slide(cont)
+            MAX_ROWS_PER_SLIDE = 22
+            header_row = rows_txt[0]
+            data_rows = rows_txt[1:] if nrows > 1 else []
+            chunks_rows: list[list[list[str]]] = []
+            if nrows <= MAX_ROWS_PER_SLIDE:
+                chunks_rows.append(rows_txt)
             else:
-                slide_target = current_slide
-            tbl_shape = slide_target.shapes.add_table(
-                nrows, ncols, Inches(MARGIN_X), Inches(y_cursor), Inches(BODY_W), Inches(est_h)
-            )
-            ptbl = tbl_shape.table
-            for r_idx, row in enumerate(tbl.rows):
-                for c_idx in range(min(ncols, len(row.cells))):
-                    cell = ptbl.cell(r_idx, c_idx)
-                    cell.text = row.cells[c_idx].text.strip()
-                    for p in cell.text_frame.paragraphs:
-                        for rr in p.runs:
-                            rr.font.size = Pt(12)
-                            if r_idx == 0:
-                                rr.font.bold = True
-            y_cursor += est_h + 0.22
-            current_tf = None
-            slide_has_content = True
+                step_r = MAX_ROWS_PER_SLIDE - 1
+                for off in range(0, len(data_rows), step_r):
+                    chunks_rows.append([header_row] + data_rows[off : off + step_r])
+            for chunk_idx, sub_rows in enumerate(chunks_rows):
+                sub_n = len(sub_rows)
+                est_h = min(5.4, max(0.8, sub_n * 0.44))
+                if chunk_idx > 0 or current_slide is None or (y_cursor + est_h > BODY_BOTTOM and slide_has_content):
+                    cont = f"{current_title} (cont.)" if current_title and not current_title.endswith("(cont.)") else current_title
+                    slide_target = _new_slide(cont)
+                else:
+                    slide_target = current_slide
+                tbl_shape = slide_target.shapes.add_table(
+                    sub_n, ncols, Inches(MARGIN_X), Inches(y_cursor), Inches(BODY_W), Inches(est_h)
+                )
+                ptbl = tbl_shape.table
+                for r_idx, row_vals in enumerate(sub_rows):
+                    for c_idx in range(min(ncols, len(row_vals))):
+                        cell = ptbl.cell(r_idx, c_idx)
+                        cell.text = row_vals[c_idx].strip()
+                        for p in cell.text_frame.paragraphs:
+                            for rr in p.runs:
+                                rr.font.size = Pt(12)
+                                if r_idx == 0:
+                                    rr.font.bold = True
+                y_cursor += est_h + 0.22
+                current_tf = None
+                slide_has_content = True
 
     if len(prs.slides) == 0:
         _new_slide(src.stem)
@@ -2953,15 +3703,45 @@ def conv_pptx_to_docx(src: Path, dst: Path) -> None:
                         dtbl.style = "Table Grid"
                     except Exception:
                         pass
-                    for r_idx, row in enumerate(stbl.rows):
-                        for c_idx in range(min(ncols, len(row.cells))):
-                            txt = row.cells[c_idx].text.strip()
-                            dcell = dtbl.cell(r_idx, c_idx)
-                            dcell.text = ""
-                            dp = dcell.paragraphs[0]
-                            dr = dp.add_run(txt)
-                            if r_idx == 0:
-                                dr.bold = True
+                    if nrows * ncols <= 400:
+                        for r_idx, row in enumerate(stbl.rows):
+                            for c_idx in range(min(ncols, len(row.cells))):
+                                txt = row.cells[c_idx].text.strip()
+                                dcell = dtbl.cell(r_idx, c_idx)
+                                dcell.text = ""
+                                dp = dcell.paragraphs[0]
+                                dr = dp.add_run(txt)
+                                if r_idx == 0:
+                                    dr.bold = True
+                    else:
+                        # Linear XML population avoids O(R^2 * C^2) python-docx dtbl.cell() lookup on huge tables
+                        w_tr = f"{{{_W_NS}}}tr"
+                        w_tc = f"{{{_W_NS}}}tc"
+                        w_p = f"{{{_W_NS}}}p"
+                        oxml_ns: Any = importlib.import_module("docx.oxml")
+                        OxmlElement = oxml_ns.OxmlElement
+                        qn = importlib.import_module("docx.oxml.ns").qn
+                        xml_trs = dtbl._tbl.findall(w_tr)
+                        for r_idx, (row, tr_el) in enumerate(zip(stbl.rows, xml_trs)):
+                            xml_tcs = tr_el.findall(w_tc)
+                            for c_idx in range(min(ncols, len(row.cells), len(xml_tcs))):
+                                txt = row.cells[c_idx].text.strip()
+                                if not txt:
+                                    continue
+                                p_el = xml_tcs[c_idx].find(w_p)
+                                if p_el is None:
+                                    p_el = OxmlElement("w:p")
+                                    xml_tcs[c_idx].append(p_el)
+                                r_el = OxmlElement("w:r")
+                                if r_idx == 0:
+                                    rpr = OxmlElement("w:rPr")
+                                    rpr.append(OxmlElement("w:b"))
+                                    r_el.append(rpr)
+                                t_el = OxmlElement("w:t")
+                                t_el.set(qn("xml:space"), "preserve")
+                                t_el.text = txt
+                                r_el.append(t_el)
+                                p_el.append(r_el)
                     doc.add_paragraph("")
                 continue
 
@@ -3283,16 +4063,21 @@ def conv_pptx_to_pdf(src: Path, dst: Path) -> None:
     sh = float(prs.slide_height or int(914400 * 5.625)) / _PPTX_EMU_PER_PT
     pdf = fitz.open()
     probe_state: dict[str, Any] = {"doc": None, "page": None, "sw": sw, "sh": sh}
-    norm_cache: dict[int, Optional[bytes]] = {}
+    xref_by_digest: dict[bytes, Optional[int]] = {}
 
-    def _cached_image(blob: bytes) -> Optional[bytes]:
-        bkey = hash(blob)
-        if bkey not in norm_cache:
-            stream = _normalize_image_stream(blob)
-            norm_cache[bkey] = stream.getvalue() if stream is not None else None
-            if stream is not None:
-                stream.close()
-        return norm_cache[bkey]
+    def _insert_dedup_image(target_page: Any, target_rect: Any, blob: bytes) -> None:
+        digest = hashlib.sha256(blob).digest()
+        if digest in xref_by_digest:
+            existing_xref = xref_by_digest[digest]
+            if existing_xref:
+                target_page.insert_image(target_rect, xref=existing_xref)
+            return
+        norm_pair = _normalize_image_bytes(blob)
+        if norm_pair is None:
+            xref_by_digest[digest] = None
+            return
+        new_xref = target_page.insert_image(target_rect, stream=norm_pair[0])
+        xref_by_digest[digest] = int(new_xref) if new_xref else None
 
     align_map = {
         pptx_align.PP_ALIGN.CENTER: (fitz.TEXT_ALIGN_CENTER, "center"),
@@ -3310,12 +4095,10 @@ def conv_pptx_to_pdf(src: Path, dst: Path) -> None:
             if bg_rgb is not None:
                 page.draw_rect(page.rect, color=None, fill=bg_rgb)
             if bg_blob:
-                bg_norm = _cached_image(bg_blob)
-                if bg_norm is not None:
-                    try:
-                        page.insert_image(page.rect, stream=bg_norm)
-                    except Exception:
-                        pass
+                try:
+                    _insert_dedup_image(page, page.rect, bg_blob)
+                except Exception:
+                    pass
             eff_slide_bg: Optional[tuple[float, float, float]] = (
                 bg_rgb if bg_rgb is not None else (None if bg_blob else (1.0, 1.0, 1.0))
             )
@@ -3348,9 +4131,7 @@ def conv_pptx_to_pdf(src: Path, dst: Path) -> None:
                 if img_blob or stype == pptx_shapes_enum.MSO_SHAPE_TYPE.PICTURE:
                     if img_blob:
                         try:
-                            cached = _cached_image(img_blob)
-                            if cached is not None:
-                                page.insert_image(rect, stream=cached)
+                            _insert_dedup_image(page, rect, img_blob)
                         except Exception:
                             pass
                     continue
@@ -3463,15 +4244,107 @@ def conv_pptx_to_pdf(src: Path, dst: Path) -> None:
 
 
 def conv_pptx_to_text(src: Path, dst: Path) -> None:
-    """Extract PPTX slides cleanly into plain text (.txt), Markdown (.md), or HTML (.html)."""
+    """Extract PPTX slides cleanly into plain text (.txt), Markdown (.md), or HTML (.html) with streaming I/O."""
     pptx_mod: Any = importlib.import_module("pptx")
     prs = pptx_mod.Presentation(str(src))
     ext = dst.suffix.lstrip(".").lower()
+    total_slides = max(1, len(prs.slides))
 
     if ext in ("html", "htm"):
         sw_px = int(round((float(prs.slide_width or 914400 * 10) / _PPTX_EMU_PER_PT) * 1.15))
-        cards: list[str] = []
+        MAX_B64_TOTAL = 96 * 1024 * 1024  # cap cumulative inline base64 to keep browser-openable HTML
+        b64_used = 0
+        with open(dst, "w", encoding="utf-8") as wfh:
+            wfh.write(
+                "<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\"/>"
+                f"<title>{_html_mod.escape(src.stem)}</title>"
+                "<style>body{font-family:system-ui,Segoe UI,Arial,sans-serif;background:#f1f5f9;"
+                "color:#0f172a;margin:24px auto;max-width:"
+                f"{max(640, min(1100, sw_px))}px;padding:0 16px;}}"
+                ".slide{background:#fff;border:1px solid #cbd5e1;border-radius:8px;"
+                "padding:24px 28px;margin-bottom:20px;box-shadow:0 1px 3px rgba(0,0,0,.06);}"
+                "h2{margin:0 0 12px 0;color:#1e293b;border-bottom:1px solid #e2e8f0;padding-bottom:8px;}"
+                "table{border-collapse:collapse;width:100%;margin:12px 0;}"
+                "th,td{border:1px solid #cbd5e1;padding:6px 10px;text-align:left;}"
+                "th{background:#f8fafc;}"
+                ".notes{margin-top:14px;padding:8px 12px;background:#f8fafc;"
+                "border-left:3px solid #94a3b8;color:#475569;font-size:0.92em;}"
+                "</style></head><body>\n"
+            )
+            if len(prs.slides) == 0:
+                wfh.write(f"<p>{_html_mod.escape(src.stem)}</p>\n")
+            for s_idx, slide in enumerate(prs.slides, 1):
+                _report_subprogress(s_idx, total_slides, f"Slide {s_idx} of {total_slides}")
+                title_shape = None
+                try:
+                    title_shape = slide.shapes.title
+                except Exception:
+                    title_shape = None
+                title_txt = (
+                    title_shape.text_frame.text.strip()
+                    if title_shape is not None and getattr(title_shape, "has_text_frame", False)
+                    else ""
+                ) or f"Slide {s_idx}"
+                wfh.write(f'<section class="slide">\n<h2>{_html_mod.escape(title_txt)}</h2>\n')
+                for _top, _left, sh in _flatten_pptx_shapes(slide.shapes):
+                    if title_shape is not None and sh == title_shape:
+                        continue
+                    if getattr(sh, "has_table", False):
+                        stbl = sh.table
+                        wfh.write("<table>")
+                        for r_idx, row in enumerate(stbl.rows):
+                            tag = "th" if r_idx == 0 else "td"
+                            cells = "".join(
+                                f"<{tag}>{_html_mod.escape(c.text.strip())}</{tag}>" for c in row.cells
+                            )
+                            wfh.write(f"<tr>{cells}</tr>")
+                        wfh.write("</table>\n")
+                        continue
+                    blob = _pptx_shape_image_blob(sh)
+                    if blob and b64_used < MAX_B64_TOTAL:
+                        norm_pair = _normalize_image_bytes(blob, max_side=2400)
+                        if norm_pair is not None:
+                            b64 = base64.b64encode(norm_pair[0]).decode("ascii")
+                            b64_used += len(b64)
+                            wfh.write(
+                                f'<p><img src="data:{norm_pair[1]};base64,{b64}" alt="Slide image" '
+                                'style="max-width:100%;height:auto;border-radius:4px;"/></p>\n'
+                            )
+                        continue
+                    if getattr(sh, "has_text_frame", False):
+                        for p in sh.text_frame.paragraphs:
+                            ptxt = p.text.strip()
+                            if not ptxt:
+                                continue
+                            lvl = int(getattr(p, "level", 0) or 0)
+                            pad_px = lvl * 18
+                            style = f' style="margin-left:{pad_px}px"' if pad_px else ""
+                            prefix = "&bull; " if lvl > 0 else ""
+                            wfh.write(f"<p{style}>{prefix}{_html_mod.escape(ptxt)}</p>\n")
+                try:
+                    if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
+                        notes = slide.notes_slide.notes_text_frame.text.strip()
+                        if notes:
+                            wfh.write(
+                                f'<div class="notes"><strong>Notes:</strong> {_html_mod.escape(notes)}</div>\n'
+                            )
+                except Exception:
+                    pass
+                wfh.write("</section>\n")
+            wfh.write("</body></html>\n")
+        return
+
+    is_md = ext in ("md", "markdown")
+    with open(dst, "w", encoding="utf-8" if is_md else "utf-8-sig") as wfh:
+        wrote_any = False
         for s_idx, slide in enumerate(prs.slides, 1):
+            _report_subprogress(s_idx, total_slides, f"Slide {s_idx} of {total_slides}")
+            slide_lines: list[str] = []
+            if s_idx > 1:
+                slide_lines.append("")
+                if is_md:
+                    slide_lines.append("---")
+                    slide_lines.append("")
             title_shape = None
             try:
                 title_shape = slide.shapes.title
@@ -3481,32 +4354,27 @@ def conv_pptx_to_text(src: Path, dst: Path) -> None:
                 title_shape.text_frame.text.strip()
                 if title_shape is not None and getattr(title_shape, "has_text_frame", False)
                 else ""
-            ) or f"Slide {s_idx}"
-            body_html: list[str] = [f"<h2>{_html_mod.escape(title_txt)}</h2>"]
+            )
+            heading = title_txt or f"Slide {s_idx}"
+            slide_lines.append(f"## {heading}" if is_md else f"=== {heading} ===")
+
             for _top, _left, sh in _flatten_pptx_shapes(slide.shapes):
                 if title_shape is not None and sh == title_shape:
                     continue
                 if getattr(sh, "has_table", False):
                     stbl = sh.table
-                    rows_html: list[str] = []
-                    for r_idx, row in enumerate(stbl.rows):
-                        tag = "th" if r_idx == 0 else "td"
-                        cells = "".join(
-                            f"<{tag}>{_html_mod.escape(c.text.strip())}</{tag}>" for c in row.cells
-                        )
-                        rows_html.append(f"<tr>{cells}</tr>")
-                    body_html.append("<table>" + "".join(rows_html) + "</table>")
-                    continue
-                blob = _pptx_shape_image_blob(sh)
-                if blob:
-                    stream = _normalize_image_stream(blob)
-                    if stream is not None:
-                        b64 = base64.b64encode(stream.getvalue()).decode("ascii")
-                        stream.close()
-                        body_html.append(
-                            f'<p><img src="data:image/png;base64,{b64}" alt="Slide image" '
-                            'style="max-width:100%;height:auto;border-radius:4px;"/></p>'
-                        )
+                    nrows = len(stbl.rows)
+                    if nrows > 0:
+                        if is_md:
+                            slide_lines.append("")
+                        for r_idx, row in enumerate(stbl.rows):
+                            cells = [c.text.replace("\n", " ").strip() for c in row.cells]
+                            if is_md:
+                                slide_lines.append("| " + " | ".join(cells) + " |")
+                                if r_idx == 0:
+                                    slide_lines.append("| " + " | ".join("---" for _ in cells) + " |")
+                            else:
+                                slide_lines.append("\t".join(cells))
                     continue
                 if getattr(sh, "has_text_frame", False):
                     for p in sh.text_frame.paragraphs:
@@ -3514,103 +4382,27 @@ def conv_pptx_to_text(src: Path, dst: Path) -> None:
                         if not ptxt:
                             continue
                         lvl = int(getattr(p, "level", 0) or 0)
-                        pad_px = lvl * 18
-                        style = f' style="margin-left:{pad_px}px"' if pad_px else ""
-                        prefix = "&bull; " if lvl > 0 else ""
-                        body_html.append(f"<p{style}>{prefix}{_html_mod.escape(ptxt)}</p>")
+                        if is_md and lvl > 0:
+                            slide_lines.append(f"{'  ' * (lvl - 1)}- {ptxt}")
+                        elif lvl > 0:
+                            slide_lines.append(f"{'  ' * lvl}* {ptxt}")
+                        else:
+                            slide_lines.append(ptxt)
             try:
                 if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
                     notes = slide.notes_slide.notes_text_frame.text.strip()
                     if notes:
-                        body_html.append(
-                            f'<div class="notes"><strong>Notes:</strong> {_html_mod.escape(notes)}</div>'
-                        )
+                        slide_lines.append(f"\n> Notes: {notes}" if is_md else f"\n[Notes] {notes}")
             except Exception:
                 pass
-            cards.append('<section class="slide">\n' + "\n".join(body_html) + "\n</section>")
-
-        doc_html = (
-            "<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\"/>"
-            f"<title>{_html_mod.escape(src.stem)}</title>"
-            "<style>body{font-family:system-ui,Segoe UI,Arial,sans-serif;background:#f1f5f9;"
-            "color:#0f172a;margin:24px auto;max-width:"
-            f"{max(640, min(1100, sw_px))}px;padding:0 16px;}}"
-            ".slide{background:#fff;border:1px solid #cbd5e1;border-radius:8px;"
-            "padding:24px 28px;margin-bottom:20px;box-shadow:0 1px 3px rgba(0,0,0,.06);}"
-            "h2{margin:0 0 12px 0;color:#1e293b;border-bottom:1px solid #e2e8f0;padding-bottom:8px;}"
-            "table{border-collapse:collapse;width:100%;margin:12px 0;}"
-            "th,td{border:1px solid #cbd5e1;padding:6px 10px;text-align:left;}"
-            "th{background:#f8fafc;}"
-            ".notes{margin-top:14px;padding:8px 12px;background:#f8fafc;"
-            "border-left:3px solid #94a3b8;color:#475569;font-size:0.92em;}"
-            "</style></head><body>\n"
-            + ("\n".join(cards) if cards else f"<p>{_html_mod.escape(src.stem)}</p>")
-            + "\n</body></html>\n"
-        )
-        dst.write_text(doc_html, encoding="utf-8")
-        return
-
-    is_md = ext in ("md", "markdown")
-    out_lines: list[str] = []
-    for s_idx, slide in enumerate(prs.slides, 1):
-        if s_idx > 1:
-            out_lines.append("")
-            if is_md:
-                out_lines.append("---")
-                out_lines.append("")
-        title_shape = None
-        try:
-            title_shape = slide.shapes.title
-        except Exception:
-            title_shape = None
-        title_txt = (
-            title_shape.text_frame.text.strip()
-            if title_shape is not None and getattr(title_shape, "has_text_frame", False)
-            else ""
-        )
-        heading = title_txt or f"Slide {s_idx}"
-        out_lines.append(f"## {heading}" if is_md else f"=== {heading} ===")
-
-        for _top, _left, sh in _flatten_pptx_shapes(slide.shapes):
-            if title_shape is not None and sh == title_shape:
-                continue
-            if getattr(sh, "has_table", False):
-                stbl = sh.table
-                nrows = len(stbl.rows)
-                if nrows > 0:
-                    if is_md:
-                        out_lines.append("")
-                    for r_idx, row in enumerate(stbl.rows):
-                        cells = [c.text.replace("\n", " ").strip() for c in row.cells]
-                        if is_md:
-                            out_lines.append("| " + " | ".join(cells) + " |")
-                            if r_idx == 0:
-                                out_lines.append("| " + " | ".join("---" for _ in cells) + " |")
-                        else:
-                            out_lines.append("\t".join(cells))
-                continue
-            if getattr(sh, "has_text_frame", False):
-                for p in sh.text_frame.paragraphs:
-                    ptxt = p.text.strip()
-                    if not ptxt:
-                        continue
-                    lvl = int(getattr(p, "level", 0) or 0)
-                    if is_md and lvl > 0:
-                        out_lines.append(f"{'  ' * (lvl - 1)}- {ptxt}")
-                    elif lvl > 0:
-                        out_lines.append(f"{'  ' * lvl}* {ptxt}")
-                    else:
-                        out_lines.append(ptxt)
-        try:
-            if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
-                notes = slide.notes_slide.notes_text_frame.text.strip()
-                if notes:
-                    out_lines.append(f"\n> Notes: {notes}" if is_md else f"\n[Notes] {notes}")
-        except Exception:
-            pass
-
-    text_out = "\n".join(out_lines).strip() + "\n"
-    dst.write_text(text_out, encoding="utf-8" if is_md else "utf-8-sig")
+            block_txt = "\n".join(slide_lines)
+            if wrote_any:
+                wfh.write("\n")
+            else:
+                block_txt = block_txt.lstrip("\n")
+                wrote_any = True
+            wfh.write(block_txt)
+        wfh.write("\n")
 
 
 def conv_via_pptx_to_text(src: Path, dst: Path) -> None:
@@ -3627,7 +4419,7 @@ def conv_via_pptx_to_text(src: Path, dst: Path) -> None:
 
 
 def conv_pptx_to_odp(src: Path, dst: Path) -> None:
-    """Pure-Python PPTX -> OpenDocument Presentation (.odp) converter."""
+    """Pure-Python PPTX -> OpenDocument Presentation (.odp) converter with streaming media writes."""
     pptx_mod: Any = importlib.import_module("pptx")
     pptx_shapes_enum: Any = importlib.import_module("pptx.enum.shapes")
     pptx_dml: Any = importlib.import_module("pptx.enum.dml")
@@ -3636,169 +4428,179 @@ def conv_pptx_to_odp(src: Path, dst: Path) -> None:
     theme_map = _pptx_extract_theme_colors(prs)
     sw_in = float(prs.slide_width or 914400 * 10) / _PPTX_EMU_PER_IN
     sh_in = float(prs.slide_height or int(914400 * 5.625)) / _PPTX_EMU_PER_IN
+    total_slides = max(1, len(prs.slides))
 
     manifest_entries: list[tuple[str, str]] = [
         ("/", "application/vnd.oasis.opendocument.presentation"),
         ("styles.xml", "text/xml"),
         ("content.xml", "text/xml"),
     ]
-    pictures: dict[str, bytes] = {}
+    pic_by_digest: dict[bytes, Optional[str]] = {}
     pic_idx = 0
     bg_styles: list[str] = []
     pages_xml: list[str] = []
 
-    for s_idx, slide in enumerate(prs.slides, 1):
-        bg_rgb, _bg_blob = _pptx_slide_bg(slide, pptx_dml, theme_map)
-        dp_style_name = f"dp{s_idx}"
-        if bg_rgb is not None:
-            rr, gg, bb = _rgb01_to_bytes(bg_rgb)
-            bg_styles.append(
-                f'<style:style style:name="{dp_style_name}" style:family="drawing-page">'
-                f'<style:drawing-page-properties draw:fill="solid" '
-                f'draw:fill-color="#{rr:02x}{gg:02x}{bb:02x}"/></style:style>'
-            )
-        else:
-            bg_styles.append(
-                f'<style:style style:name="{dp_style_name}" style:family="drawing-page"/>'
-            )
-
-        frames: list[str] = []
-        for x_emu, y_emu, w_emu, h_emu, sh in _iter_pptx_shapes_transformed(slide.shapes):
-            x_in = max(0.0, x_emu / _PPTX_EMU_PER_IN)
-            y_in = max(0.0, y_emu / _PPTX_EMU_PER_IN)
-            w_in = max(0.1, w_emu / _PPTX_EMU_PER_IN)
-            h_in = max(0.1, h_emu / _PPTX_EMU_PER_IN)
-            pos = (
-                f'svg:x="{x_in:.3f}in" svg:y="{y_in:.3f}in" '
-                f'svg:width="{w_in:.3f}in" svg:height="{h_in:.3f}in"'
-            )
-
-            img_blob = _pptx_shape_image_blob(sh)
-            if img_blob or getattr(sh, "shape_type", None) == pptx_shapes_enum.MSO_SHAPE_TYPE.PICTURE:
-                if img_blob:
-                    stream = _normalize_image_stream(img_blob)
-                    if stream is not None:
-                        pic_idx += 1
-                        href = f"Pictures/img_{pic_idx}.png"
-                        pictures[href] = stream.getvalue()
-                        stream.close()
-                        manifest_entries.append((href, "image/png"))
-                        frames.append(
-                            f'<draw:frame draw:style-name="gr1" {pos}>'
-                            f'<draw:image xlink:href="{href}" xlink:type="simple" '
-                            'xlink:show="embed" xlink:actuate="onLoad"/></draw:frame>'
-                        )
-                continue
-
-            if getattr(sh, "has_table", False):
-                stbl = sh.table
-                ncols = len(stbl.columns)
-                if ncols > 0 and len(stbl.rows) > 0:
-                    cols_xml = "".join("<table:table-column/>" for _ in range(ncols))
-                    rows_xml: list[str] = []
-                    for row in stbl.rows:
-                        cells_xml = "".join(
-                            f'<table:table-cell><text:p>{_xml_escape(c.text.strip())}</text:p></table:table-cell>'
-                            for c in row.cells
-                        )
-                        rows_xml.append(f"<table:table-row>{cells_xml}</table:table-row>")
-                    frames.append(
-                        f'<draw:frame draw:style-name="gr1" {pos}>'
-                        f"<table:table>{cols_xml}{''.join(rows_xml)}</table:table></draw:frame>"
-                    )
-                continue
-
-            if getattr(sh, "has_text_frame", False):
-                paras_xml: list[str] = []
-                for p in sh.text_frame.paragraphs:
-                    ptxt = p.text
-                    if ptxt.strip():
-                        paras_xml.append(f"<text:p>{_xml_escape(ptxt)}</text:p>")
-                if paras_xml:
-                    frames.append(
-                        f'<draw:frame draw:style-name="gr1" {pos}>'
-                        f"<draw:text-box>{''.join(paras_xml)}</draw:text-box></draw:frame>"
-                    )
-
-        notes_xml = ""
-        try:
-            if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
-                notes = slide.notes_slide.notes_text_frame.text.strip()
-                if notes:
-                    notes_xml = (
-                        '<presentation:notes draw:style-name="dp1">'
-                        '<draw:frame draw:style-name="gr1" svg:x="0.5in" svg:y="1.0in" '
-                        'svg:width="7.0in" svg:height="5.0in"><draw:text-box>'
-                        f"<text:p>{_xml_escape(notes)}</text:p>"
-                        "</draw:text-box></draw:frame></presentation:notes>"
-                    )
-        except Exception:
-            pass
-
-        pages_xml.append(
-            f'<draw:page draw:name="Slide {s_idx}" draw:style-name="{dp_style_name}" '
-            f'draw:master-page-name="Default">{"".join(frames)}{notes_xml}</draw:page>'
-        )
-
-    styles_xml = (
-        '<?xml version="1.0" encoding="UTF-8"?>\n'
-        '<office:document-styles '
-        'xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" '
-        'xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" '
-        'xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" '
-        'xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0" '
-        'office:version="1.2">\n'
-        "<office:automatic-styles>"
-        '<style:page-layout style:name="PM1">'
-        f'<style:page-layout-properties fo:page-width="{sw_in:.3f}in" '
-        f'fo:page-height="{sh_in:.3f}in" style:print-orientation="landscape"/>'
-        "</style:page-layout>"
-        '<style:style style:name="dp1" style:family="drawing-page"/>'
-        "</office:automatic-styles>\n"
-        "<office:master-styles>"
-        '<style:master-page style:name="Default" style:page-layout-name="PM1" draw:style-name="dp1"/>'
-        "</office:master-styles>\n"
-        "</office:document-styles>"
-    )
-    content_xml = (
-        '<?xml version="1.0" encoding="UTF-8"?>\n'
-        '<office:document-content '
-        'xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" '
-        'xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" '
-        'xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" '
-        'xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" '
-        'xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0" '
-        'xmlns:presentation="urn:oasis:names:tc:opendocument:xmlns:presentation:1.0" '
-        'xmlns:xlink="http://www.w3.org/1999/xlink" '
-        'xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0" '
-        'office:version="1.2">\n'
-        "<office:automatic-styles>"
-        '<style:style style:name="gr1" style:family="graphic"/>'
-        + "".join(bg_styles)
-        + "</office:automatic-styles>\n"
-        "<office:body><office:presentation>"
-        + ("".join(pages_xml) if pages_xml else '<draw:page draw:name="Slide 1" draw:master-page-name="Default"/>')
-        + "</office:presentation></office:body>\n"
-        "</office:document-content>"
-    )
-    manifest_xml = (
-        '<?xml version="1.0" encoding="UTF-8"?>\n'
-        '<manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.2">\n'
-        + "".join(
-            f'  <manifest:file-entry manifest:media-type="{m}" manifest:full-path="{p}"/>\n'
-            for p, m in manifest_entries
-        )
-        + "</manifest:manifest>"
-    )
-
-    with zipfile.ZipFile(dst, "w") as zout:
+    with zipfile.ZipFile(dst, "w", allowZip64=True) as zout:
         # Per OASIS ODF 1.2, `mimetype` MUST be the first entry and stored uncompressed
         zout.writestr("mimetype", b"application/vnd.oasis.opendocument.presentation", compress_type=zipfile.ZIP_STORED)
+
+        for s_idx, slide in enumerate(prs.slides, 1):
+            _report_subprogress(s_idx, total_slides, f"Slide {s_idx} of {total_slides}")
+            bg_rgb, _bg_blob = _pptx_slide_bg(slide, pptx_dml, theme_map)
+            dp_style_name = f"dp{s_idx}"
+            if bg_rgb is not None:
+                rr, gg, bb = _rgb01_to_bytes(bg_rgb)
+                bg_styles.append(
+                    f'<style:style style:name="{dp_style_name}" style:family="drawing-page">'
+                    f'<style:drawing-page-properties draw:fill="solid" '
+                    f'draw:fill-color="#{rr:02x}{gg:02x}{bb:02x}"/></style:style>'
+                )
+            else:
+                bg_styles.append(
+                    f'<style:style style:name="{dp_style_name}" style:family="drawing-page"/>'
+                )
+
+            frames: list[str] = []
+            for x_emu, y_emu, w_emu, h_emu, sh in _iter_pptx_shapes_transformed(slide.shapes):
+                x_in = max(0.0, x_emu / _PPTX_EMU_PER_IN)
+                y_in = max(0.0, y_emu / _PPTX_EMU_PER_IN)
+                w_in = max(0.1, w_emu / _PPTX_EMU_PER_IN)
+                h_in = max(0.1, h_emu / _PPTX_EMU_PER_IN)
+                pos = (
+                    f'svg:x="{x_in:.3f}in" svg:y="{y_in:.3f}in" '
+                    f'svg:width="{w_in:.3f}in" svg:height="{h_in:.3f}in"'
+                )
+
+                img_blob = _pptx_shape_image_blob(sh)
+                if img_blob or getattr(sh, "shape_type", None) == pptx_shapes_enum.MSO_SHAPE_TYPE.PICTURE:
+                    if img_blob:
+                        digest = hashlib.sha256(img_blob).digest()
+                        if digest in pic_by_digest:
+                            href = pic_by_digest[digest]
+                        else:
+                            norm_pair = _normalize_image_bytes(img_blob)
+                            if norm_pair is not None:
+                                pic_idx += 1
+                                ext_img = "jpg" if norm_pair[1] == "image/jpeg" else "png"
+                                href = f"Pictures/img_{pic_idx}.{ext_img}"
+                                zout.writestr(href, norm_pair[0], compress_type=zipfile.ZIP_STORED)
+                                manifest_entries.append((href, norm_pair[1]))
+                                pic_by_digest[digest] = href
+                            else:
+                                href = None
+                                pic_by_digest[digest] = None
+                        if href:
+                            frames.append(
+                                f'<draw:frame draw:style-name="gr1" {pos}>'
+                                f'<draw:image xlink:href="{href}" xlink:type="simple" '
+                                'xlink:show="embed" xlink:actuate="onLoad"/></draw:frame>'
+                            )
+                    continue
+
+                if getattr(sh, "has_table", False):
+                    stbl = sh.table
+                    ncols = len(stbl.columns)
+                    if ncols > 0 and len(stbl.rows) > 0:
+                        cols_xml = "".join("<table:table-column/>" for _ in range(ncols))
+                        rows_xml: list[str] = []
+                        for row in stbl.rows:
+                            cells_xml = "".join(
+                                f'<table:table-cell><text:p>{_xml_escape(c.text.strip())}</text:p></table:table-cell>'
+                                for c in row.cells
+                            )
+                            rows_xml.append(f"<table:table-row>{cells_xml}</table:table-row>")
+                        frames.append(
+                            f'<draw:frame draw:style-name="gr1" {pos}>'
+                            f"<table:table>{cols_xml}{''.join(rows_xml)}</table:table></draw:frame>"
+                        )
+                    continue
+
+                if getattr(sh, "has_text_frame", False):
+                    paras_xml: list[str] = []
+                    for p in sh.text_frame.paragraphs:
+                        ptxt = p.text
+                        if ptxt.strip():
+                            paras_xml.append(f"<text:p>{_xml_escape(ptxt)}</text:p>")
+                    if paras_xml:
+                        frames.append(
+                            f'<draw:frame draw:style-name="gr1" {pos}>'
+                            f"<draw:text-box>{''.join(paras_xml)}</draw:text-box></draw:frame>"
+                        )
+
+            notes_xml = ""
+            try:
+                if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
+                    notes = slide.notes_slide.notes_text_frame.text.strip()
+                    if notes:
+                        notes_xml = (
+                            '<presentation:notes draw:style-name="dp1">'
+                            '<draw:frame draw:style-name="gr1" svg:x="0.5in" svg:y="1.0in" '
+                            'svg:width="7.0in" svg:height="5.0in"><draw:text-box>'
+                            f"<text:p>{_xml_escape(notes)}</text:p>"
+                            "</draw:text-box></draw:frame></presentation:notes>"
+                        )
+            except Exception:
+                pass
+
+            pages_xml.append(
+                f'<draw:page draw:name="Slide {s_idx}" draw:style-name="{dp_style_name}" '
+                f'draw:master-page-name="Default">{"".join(frames)}{notes_xml}</draw:page>'
+            )
+
+        styles_xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<office:document-styles '
+            'xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" '
+            'xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" '
+            'xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" '
+            'xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0" '
+            'office:version="1.2">\n'
+            "<office:automatic-styles>"
+            '<style:page-layout style:name="PM1">'
+            f'<style:page-layout-properties fo:page-width="{sw_in:.3f}in" '
+            f'fo:page-height="{sh_in:.3f}in" style:print-orientation="landscape"/>'
+            "</style:page-layout>"
+            '<style:style style:name="dp1" style:family="drawing-page"/>'
+            "</office:automatic-styles>\n"
+            "<office:master-styles>"
+            '<style:master-page style:name="Default" style:page-layout-name="PM1" draw:style-name="dp1"/>'
+            "</office:master-styles>\n"
+            "</office:document-styles>"
+        )
+        content_xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<office:document-content '
+            'xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" '
+            'xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" '
+            'xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" '
+            'xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" '
+            'xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0" '
+            'xmlns:presentation="urn:oasis:names:tc:opendocument:xmlns:presentation:1.0" '
+            'xmlns:xlink="http://www.w3.org/1999/xlink" '
+            'xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0" '
+            'office:version="1.2">\n'
+            "<office:automatic-styles>"
+            '<style:style style:name="gr1" style:family="graphic"/>'
+            + "".join(bg_styles)
+            + "</office:automatic-styles>\n"
+            "<office:body><office:presentation>"
+            + ("".join(pages_xml) if pages_xml else '<draw:page draw:name="Slide 1" draw:master-page-name="Default"/>')
+            + "</office:presentation></office:body>\n"
+            "</office:document-content>"
+        )
+        manifest_xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.2">\n'
+            + "".join(
+                f'  <manifest:file-entry manifest:media-type="{m}" manifest:full-path="{p}"/>\n'
+                for p, m in manifest_entries
+            )
+            + "</manifest:manifest>"
+        )
+
         zout.writestr("META-INF/manifest.xml", manifest_xml.encode("utf-8"), compress_type=zipfile.ZIP_DEFLATED)
         zout.writestr("styles.xml", styles_xml.encode("utf-8"), compress_type=zipfile.ZIP_DEFLATED)
         zout.writestr("content.xml", content_xml.encode("utf-8"), compress_type=zipfile.ZIP_DEFLATED)
-        for href, data in pictures.items():
-            zout.writestr(href, data, compress_type=zipfile.ZIP_DEFLATED)
 
 
 def conv_via_docx_to_pptx(src: Path, dst: Path) -> None:
@@ -3838,7 +4640,7 @@ def conv_docx_to_pdf(src: Path, dst: Path) -> None:
     docx_mod: Any = importlib.import_module("docx")
     docx_para_mod: Any = importlib.import_module("docx.text.paragraph")
     docx_tbl_mod: Any = importlib.import_module("docx.table")
-    fitz: Any = importlib.import_module("fitz")
+    fitz: Any = _import_fitz()
 
     doc = docx_mod.Document(str(src))
     pdf = fitz.open()
@@ -3856,7 +4658,12 @@ def conv_docx_to_pdf(src: Path, dst: Path) -> None:
         y = MARGIN_Y
 
     try:
-        for child in doc.element.body:
+        xref_by_rid: dict[str, Optional[int]] = {}
+        body_children = list(doc.element.body)
+        total_nodes = max(1, len(body_children))
+        for b_idx, child in enumerate(body_children, 1):
+            if b_idx == 1 or b_idx == total_nodes or (b_idx % 25 == 0):
+                _report_subprogress(b_idx, total_nodes, f"Block {b_idx} of {total_nodes}")
             tag = child.tag.rsplit("}", 1)[-1]
             if tag == "p":
                 para = docx_para_mod.Paragraph(child, doc)
@@ -3887,39 +4694,53 @@ def conv_docx_to_pdf(src: Path, dst: Path) -> None:
                     y += needed
 
                 for rid in rids:
-                    part = doc.part.related_parts.get(str(rid))
+                    rid_s = str(rid)
+                    img_h = 180.0
+                    if rid_s in xref_by_rid:
+                        cached_xref = xref_by_rid[rid_s]
+                        if cached_xref:
+                            if y + img_h > BOTTOM_Y and y > MARGIN_Y + 4.0:
+                                _next_page()
+                            rect = fitz.Rect(MARGIN_X, y, MARGIN_X + min(BODY_W, 360.0), min(BOTTOM_Y, y + img_h))
+                            try:
+                                page.insert_image(rect, xref=cached_xref)
+                                y += img_h + 8.0
+                            except Exception:
+                                pass
+                        continue
+                    part = doc.part.related_parts.get(rid_s)
                     blob = getattr(part, "blob", None)
                     if not isinstance(blob, (bytes, bytearray)) or not blob:
+                        xref_by_rid[rid_s] = None
                         continue
-                    stream = _normalize_image_stream(bytes(blob))
-                    if stream is None:
+                    norm_pair = _normalize_image_bytes(bytes(blob))
+                    if norm_pair is None:
+                        xref_by_rid[rid_s] = None
                         continue
-                    img_h = 180.0
                     if y + img_h > BOTTOM_Y and y > MARGIN_Y + 4.0:
                         _next_page()
                     rect = fitz.Rect(MARGIN_X, y, MARGIN_X + min(BODY_W, 360.0), min(BOTTOM_Y, y + img_h))
                     try:
-                        page.insert_image(rect, stream=stream.getvalue())
+                        ins_xref = page.insert_image(rect, stream=norm_pair[0])
+                        xref_by_rid[rid_s] = int(ins_xref) if ins_xref else None
                         y += img_h + 8.0
                     except Exception:
-                        pass
-                    finally:
-                        stream.close()
+                        xref_by_rid[rid_s] = None
 
             elif tag == "tbl":
-                tbl = docx_tbl_mod.Table(child, doc)
-                nrows = len(tbl.rows)
-                ncols = len(tbl.columns) if nrows else 0
+                rows_txt = _iter_docx_table_rows_text(child)
+                nrows = len(rows_txt)
+                ncols = max((len(r) for r in rows_txt), default=0)
                 if nrows == 0 or ncols == 0:
                     continue
                 cw = BODY_W / ncols
                 rh = 22.0
                 if y + rh * min(nrows, 2) > BOTTOM_Y and y > MARGIN_Y + 4.0:
                     _next_page()
-                for r_idx, row in enumerate(tbl.rows):
+                for r_idx, row_vals in enumerate(rows_txt):
                     if y + rh > BOTTOM_Y:
                         _next_page()
-                    for c_idx in range(min(ncols, len(row.cells))):
+                    for c_idx in range(ncols):
                         crect = fitz.Rect(MARGIN_X + c_idx * cw, y, MARGIN_X + (c_idx + 1) * cw, y + rh)
                         page.draw_rect(
                             crect,
@@ -3927,7 +4748,7 @@ def conv_docx_to_pdf(src: Path, dst: Path) -> None:
                             width=0.6,
                             fill=(0.94, 0.96, 0.98) if r_idx == 0 else None,
                         )
-                        ctext = row.cells[c_idx].text.strip()
+                        ctext = row_vals[c_idx].strip() if c_idx < len(row_vals) else ""
                         if ctext:
                             inner = fitz.Rect(crect.x0 + 3, crect.y0 + 2, crect.x1 - 3, crect.y1 - 2)
                             page.insert_textbox(
@@ -3998,41 +4819,62 @@ def _render_pdf_pages(pdf_path: Path, out_dir: Path, ext: str) -> int:
             raise RuntimeError("Document has 0 pages")
         width = max(3, len(str(n)))
         out_dir.mkdir(parents=True, exist_ok=True)
-        if ext == "png":
+        # 64 MP ceiling (~8000x8000 px) preserves full 200 DPI on A4..A1 blueprints while bounding per-page RAM
+        max_page_px = 64_000_000
+        if ext in ("png", "jpg", "jpeg"):
             for i, page in enumerate(doc, start=1):
                 _report_subprogress(i, n, f"Rendering page {i} of {n}")
-                pix = page.get_pixmap(dpi=PAGE_RENDER_DPI, alpha=False)
-                pix.save(str(out_dir / f"page_{i:0{width}d}.{ext}"))
+                dpi = _adaptive_scan_dpi(page, target_dpi=PAGE_RENDER_DPI, max_pixels=max_page_px)
+                pix = page.get_pixmap(dpi=dpi, alpha=False)
+                out_file = str(out_dir / f"page_{i:0{width}d}.{ext}")
+                if ext == "png":
+                    pix.save(out_file)
+                else:
+                    try:
+                        pix.save(out_file, jpg_quality=92)
+                    except TypeError:
+                        pix.save(out_file)
             return n
         if not BACKENDS.pillow:
             raise RuntimeError(f"Pillow is required to write .{ext} pages")
         Image: Any = importlib.import_module("PIL.Image")
         kwargs: dict[str, Any] = {}
-        if pil_fmt == "JPEG":
-            kwargs = {"quality": 92, "optimize": True}
-        elif pil_fmt == "WEBP":
+        if pil_fmt == "WEBP":
             kwargs = {"quality": 90}
+        elif pil_fmt == "TIFF":
+            kwargs = {"compression": "tiff_adobe_deflate"}
 
         def _encode_one(pw: int, ph: int, samples: bytes, target_str: str) -> None:
             im = Image.frombytes("RGB", (pw, ph), samples)
             try:
-                if pil_fmt == "GIF":
+                if pil_fmt == "WEBP" and (im.width > _WEBP_MAX_SIDE or im.height > _WEBP_MAX_SIDE):
+                    scale = _WEBP_MAX_SIDE / float(max(im.width, im.height))
+                    im = im.resize(
+                        (max(1, int(round(im.width * scale))), max(1, int(round(im.height * scale)))),
+                        Image.LANCZOS,
+                    )
+                elif pil_fmt == "GIF":
                     im = im.convert("P", palette=Image.ADAPTIVE)
                 im.save(target_str, format=pil_fmt, **kwargs)
             finally:
                 im.close()
 
-        if n == 1:
-            pix = doc[0].get_pixmap(dpi=PAGE_RENDER_DPI, alpha=False)
-            _encode_one(pix.width, pix.height, pix.samples, str(out_dir / f"page_{1:0{width}d}.{ext}"))
-            return 1
+        in_worker_pool = threading.current_thread().name.startswith("ThreadPoolExecutor")
+        if n == 1 or in_worker_pool:
+            for i, page in enumerate(doc, start=1):
+                _report_subprogress(i, n, f"Rendering page {i} of {n}")
+                dpi = _adaptive_scan_dpi(page, target_dpi=PAGE_RENDER_DPI, max_pixels=max_page_px)
+                pix = page.get_pixmap(dpi=dpi, alpha=False)
+                _encode_one(pix.width, pix.height, pix.samples, str(out_dir / f"page_{i:0{width}d}.{ext}"))
+            return n
 
         max_workers = max(2, min(4, os.cpu_count() or 2))
         pending: list[Any] = []
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="clickshift-imgenc") as pool:
             for i, page in enumerate(doc, start=1):
                 _report_subprogress(i, n, f"Rendering page {i} of {n}")
-                pix = page.get_pixmap(dpi=PAGE_RENDER_DPI, alpha=False)
+                dpi = _adaptive_scan_dpi(page, target_dpi=PAGE_RENDER_DPI, max_pixels=max_page_px)
+                pix = page.get_pixmap(dpi=dpi, alpha=False)
                 target = str(out_dir / f"page_{i:0{width}d}.{ext}")
                 pending.append(pool.submit(_encode_one, pix.width, pix.height, pix.samples, target))
                 if len(pending) >= max_workers * 2:
@@ -4241,7 +5083,7 @@ def _routes_for(src_ext: str, dst_ext: str) -> list[Route]:
         if d in _WORD_ONLY_FMTS and _has_word():
             add("office-com", conv_office_com, 45)
         add("libreoffice", conv_libreoffice, 50)
-    elif s in TEXT_EXTS and d == "pdf":
+    elif s in (TEXT_EXTS - {"csv", "tsv"}) and d == "pdf":
         if _has_word():
             # Word opens txt/md/html and exports a perfect PDF
             add("office-com", conv_office_com, 85)
@@ -4333,6 +5175,85 @@ def _routes_for(src_ext: str, dst_ext: str) -> list[Route]:
 #  Engine
 # --------------------------------------------------------------------------- #
 
+_MEM_GATE_TLS = threading.local()
+
+
+class _MemoryBudgetGate:
+    """Reentrant weighted memory budget so parallel 150 MB jobs never OOM while small files stay lock-free."""
+
+    def __init__(self, budget_mb: int = 1024) -> None:
+        self.budget_mb = max(256, int(budget_mb))
+        self._in_use_mb = 0
+        self._cond = threading.Condition()
+
+    def _cost_mb(self, size_bytes: int) -> int:
+        if size_bytes < 32 * 1024 * 1024:
+            return 0
+        mb = size_bytes / (1024.0 * 1024.0)
+        return min(self.budget_mb, max(256, int(round(mb * 4.5))))
+
+    @contextlib.contextmanager
+    def acquire(self, size_bytes: int):
+        depth = int(getattr(_MEM_GATE_TLS, "depth", 0) or 0)
+        if depth > 0:
+            _MEM_GATE_TLS.depth = depth + 1
+            try:
+                yield
+            finally:
+                _MEM_GATE_TLS.depth = depth
+            return
+
+        cost = self._cost_mb(size_bytes)
+        if cost <= 0:
+            _MEM_GATE_TLS.depth = 1
+            try:
+                yield
+            finally:
+                _MEM_GATE_TLS.depth = 0
+            return
+
+        with self._cond:
+            while self._in_use_mb > 0 and (self._in_use_mb + cost) > self.budget_mb:
+                self._cond.wait()
+            self._in_use_mb += cost
+        _MEM_GATE_TLS.depth = 1
+        try:
+            yield
+        finally:
+            _MEM_GATE_TLS.depth = 0
+            with self._cond:
+                self._in_use_mb = max(0, self._in_use_mb - cost)
+                self._cond.notify_all()
+
+
+_GLOBAL_MEMORY_GATE = _MemoryBudgetGate(budget_mb=1024)
+
+
+def _adjust_routes_for_scale(src: Path, src_size: int, dst_ext: str, routes: list[Route]) -> list[Route]:
+    """Demote high-memory Python layout reconstructors ONLY on huge-page-count documents (>250 pages)."""
+    if len(routes) <= 1:
+        return routes
+    s = src.suffix.lstrip(".").lower()
+    d = dst_ext.lstrip(".").lower()
+    if s == "pdf" and d == "docx" and src_size >= 20 * 1024 * 1024 and BACKENDS.pymupdf:
+        try:
+            fitz: Any = _import_fitz()
+            with fitz.open(str(src)) as doc:
+                n_pages = len(doc)
+        except Exception:
+            n_pages = 0
+        if n_pages > 250:
+            adjusted: list[Route] = []
+            for r in routes:
+                if r.name == "pdf2docx":
+                    adjusted.append(Route(r.name, r.fn, 55))
+                else:
+                    adjusted.append(r)
+            adjusted.sort(key=lambda rt: -rt.weight)
+            return adjusted
+    return routes
+
+
 class ConversionEngine:
     """Thread-safe orchestrator with optional ML backend selection."""
 
@@ -4358,6 +5279,7 @@ class ConversionEngine:
                     self.cloud = None
         self._pool = ThreadPoolExecutor(max_workers=max(2, (os.cpu_count() or 4)))
         self._lock = threading.Lock()
+        self._mem_gate = _GLOBAL_MEMORY_GATE
 
     # -- single ------------------------------------------------------------- #
     def convert(self, src: str | Path, dst_ext: str, out_dir: Optional[str | Path] = None,
@@ -4396,7 +5318,7 @@ class ConversionEngine:
             sess["planned_out"] = str(base)
             sess["dst_ext"] = dst_ext
             sess["bytes_in"] = src_size
-        routes = _routes_for(src.suffix, dst_ext)
+        routes = _adjust_routes_for_scale(src, src_size, dst_ext, _routes_for(src.suffix, dst_ext))
         if sess is not None:
             sess["routes_static"] = [r.name for r in routes]
         sel = self._selector
@@ -4430,80 +5352,112 @@ class ConversionEngine:
         err = ""
         attempts: Optional[list[dict]] = [] if sess is not None else None
         mkdir_done = False
-        for r in routes:
-            ta = time.perf_counter()
-            try:
-                if not mkdir_done:
-                    base.parent.mkdir(parents=True, exist_ok=True)
-                    mkdir_done = True
-                if (
-                    pages_mode
-                    and r.name == "pages-to-images"
-                    and sel is not None
-                    and src.suffix.lstrip(".").lower() not in ("pdf", "xps", "epub")
-                ):
-                    pdf_candidates = _routes_for(src.suffix, "pdf")
-                    pdf_ml_vec = sel.extract_features(src, ".pdf", src_size=src_size) if sel_feat else None
-                    ranked_pdf = (
-                        sel.rank(src, ".pdf", pdf_candidates, features=pdf_ml_vec, src_size=src_size)
-                        if sel_feat else sel.rank(src, ".pdf", pdf_candidates)
-                    )
-                    def _record_pdf_sub(bname: str, sub_ms: float, sub_ok: bool) -> None:
+        with self._mem_gate.acquire(src_size):
+            for r in routes:
+                ta = time.perf_counter()
+                stage_file: Optional[Path] = None
+                try:
+                    if not mkdir_done:
+                        base.parent.mkdir(parents=True, exist_ok=True)
+                        mkdir_done = True
+                    if (
+                        pages_mode
+                        and r.name == "pages-to-images"
+                        and sel is not None
+                        and src.suffix.lstrip(".").lower() not in ("pdf", "xps", "epub")
+                    ):
+                        pdf_candidates = _routes_for(src.suffix, "pdf")
+                        pdf_ml_vec = sel.extract_features(src, ".pdf", src_size=src_size) if sel_feat else None
+                        ranked_pdf = (
+                            sel.rank(src, ".pdf", pdf_candidates, features=pdf_ml_vec, src_size=src_size)
+                            if sel_feat else sel.rank(src, ".pdf", pdf_candidates)
+                        )
+                        def _record_pdf_sub(bname: str, sub_ms: float, sub_ok: bool) -> None:
+                            if sel_feat:
+                                sel.record(src, ".pdf", bname, sub_ms, sub_ok,
+                                           features=pdf_ml_vec, src_size=src_size)
+                            else:
+                                sel.record(src, ".pdf", bname, sub_ms, sub_ok)
+                        conv_pages_to_image_folder(
+                            src,
+                            base,
+                            dst_ext.lstrip(".").lower(),
+                            pdf_routes=ranked_pdf,
+                            on_pdf_attempt=_record_pdf_sub,
+                        )
+                    elif pages_mode:
+                        r.fn(src, base)
+                    else:
+                        # Stage to a hidden same-volume .tmp file and atomically replace base on completion
+                        try:
+                            stage_cand = base.parent / f".~clickshift-{uuid.uuid4().hex[:10]}{base.suffix}"
+                            stage_file = stage_cand
+                            r.fn(src, stage_cand)
+                            if stage_cand.exists():
+                                os.replace(str(stage_cand), str(base))
+                                stage_file = None
+                        except OSError as os_exc:
+                            if stage_file is not None and not stage_file.exists() and not base.exists():
+                                stage_file = None
+                                r.fn(src, base)
+                            else:
+                                raise os_exc
+                    now = time.perf_counter()
+                    ms = (now - t0) * 1000
+                    att_ms = (now - ta) * 1000
+                    if attempts is not None:
+                        attempts.append({"backend": r.name, "ok": True, "ms": att_ms,
+                                         "error": "", "traceback": ""})
+                    if sel is not None:
                         if sel_feat:
-                            sel.record(src, ".pdf", bname, sub_ms, sub_ok,
-                                       features=pdf_ml_vec, src_size=src_size)
+                            sel.record(src, dst_ext, r.name, att_ms, True,
+                                       features=ml_vec, src_size=src_size)
                         else:
-                            sel.record(src, ".pdf", bname, sub_ms, sub_ok)
-                    conv_pages_to_image_folder(
-                        src,
-                        base,
-                        dst_ext.lstrip(".").lower(),
-                        pdf_routes=ranked_pdf,
-                        on_pdf_attempt=_record_pdf_sub,
-                    )
-                else:
-                    r.fn(src, base)
-                now = time.perf_counter()
-                ms = (now - t0) * 1000
-                att_ms = (now - ta) * 1000
-                if attempts is not None:
-                    attempts.append({"backend": r.name, "ok": True, "ms": att_ms,
-                                     "error": "", "traceback": ""})
-                if sel is not None:
-                    if sel_feat:
-                        sel.record(src, dst_ext, r.name, att_ms, True,
-                                   features=ml_vec, src_size=src_size)
+                            sel.record(src, dst_ext, r.name, att_ms, True)
+                    if pages_mode:
+                        out_bytes = _dir_size(base) if base.is_dir() else 0
                     else:
-                        sel.record(src, dst_ext, r.name, att_ms, True)
-                if pages_mode:
-                    out_bytes = _dir_size(base) if base.is_dir() else 0
-                else:
-                    try:
-                        out_bytes = base.stat().st_size
-                    except OSError:
-                        out_bytes = 0
-                res = ConversionResult(str(src), str(base), r.name, ms, True,
-                                       bytes_in=src_size, bytes_out=out_bytes)
-                if sess is not None:
-                    sess.update(ok=True, winning_backend=r.name, total_ms=ms,
-                                attempts=attempts, out_path=str(base),
-                                bytes_out=out_bytes)
-                    debuglog.finalize(sess, res)
-                return res
-            except Exception as exc:  # try next backend
-                att_ms = (time.perf_counter() - ta) * 1000
-                if sel is not None:
-                    if sel_feat:
-                        sel.record(src, dst_ext, r.name, att_ms, False,
-                                   features=ml_vec, src_size=src_size)
+                        try:
+                            out_bytes = base.stat().st_size
+                        except OSError:
+                            out_bytes = 0
+                    res = ConversionResult(str(src), str(base), r.name, ms, True,
+                                           bytes_in=src_size, bytes_out=out_bytes)
+                    if sess is not None:
+                        sess.update(ok=True, winning_backend=r.name, total_ms=ms,
+                                    attempts=attempts, out_path=str(base),
+                                    bytes_out=out_bytes)
+                        debuglog.finalize(sess, res)
+                    return res
+                except Exception as exc:  # try next backend
+                    att_ms = (time.perf_counter() - ta) * 1000
+                    if stage_file is not None:
+                        try:
+                            stage_file.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                    if pages_mode:
+                        shutil.rmtree(base, ignore_errors=True)
                     else:
-                        sel.record(src, dst_ext, r.name, att_ms, False)
-                err = f"{type(exc).__name__}: {exc}"
-                if attempts is not None:
-                    attempts.append({"backend": r.name, "ok": False, "ms": att_ms,
-                                     "error": err, "exc": exc})
-                if dbg_mode != debuglog.MODE_OFF:
-                    traceback.print_exc()
+                        try:
+                            base.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                    if sel is not None:
+                        if sel_feat:
+                            sel.record(src, dst_ext, r.name, att_ms, False,
+                                       features=ml_vec, src_size=src_size)
+                        else:
+                            sel.record(src, dst_ext, r.name, att_ms, False)
+                    err = f"{type(exc).__name__}: {exc}"
+                    if attempts is not None:
+                        tb_str = debuglog._fmt_exc(exc)
+                        attempts.append({"backend": r.name, "ok": False, "ms": att_ms,
+                                         "error": err, "traceback": tb_str})
+                    if dbg_mode != debuglog.MODE_OFF:
+                        traceback.print_exc()
+                    if src_size >= 20 * 1024 * 1024:
+                        gc.collect()
         ms = (time.perf_counter() - t0) * 1000
         res = ConversionResult(str(src), str(base), routes[0].name, ms, False, err)
         if sess is not None:
@@ -4576,7 +5530,7 @@ class ConversionEngine:
             if sess is not None:
                 sess.update(ok=False, final_error=err, total_ms=ms, out_path=str(base),
                             attempts=[{"backend": backend_name, "ok": False, "ms": ms,
-                                       "error": err, "exc": exc}])
+                                       "error": err, "traceback": debuglog._fmt_exc(exc)}])
                 debuglog.finalize(sess, res)
             return res
 
@@ -4680,6 +5634,10 @@ class ConversionEngine:
                     remaining.append((idx, s, e))
                     continue
                 src_size = src_st.st_size
+                if src_size > 32 * 1024 * 1024:
+                    # Large files run individually so they get same-volume staging and dedicated timeouts
+                    remaining.append((idx, s, e))
+                    continue
                 ml_vec = None
                 if sel is not None:
                     if sel_feat:
@@ -4712,11 +5670,17 @@ class ConversionEngine:
                     # Split into sub-batches with distinct file stems so LibreOffice
                     # --outdir filenames never collide inside the staging directory.
                     sub_batches: list[list[tuple[int, str, str, Path, Path, str, int, Any]]] = []
+                    MAX_BATCH_BYTES = 96 * 1024 * 1024
                     for item in items:
                         stem_key = item[3].stem.lower()
+                        item_sz = item[6]
                         placed = False
                         for sb in sub_batches:
-                            if stem_key not in {it[3].stem.lower() for it in sb}:
+                            sb_bytes = sum(it[6] for it in sb)
+                            if (
+                                stem_key not in {it[3].stem.lower() for it in sb}
+                                and (sb_bytes + item_sz) <= MAX_BATCH_BYTES
+                            ):
                                 sb.append(item)
                                 placed = True
                                 break

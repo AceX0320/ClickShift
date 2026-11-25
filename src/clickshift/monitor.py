@@ -27,6 +27,7 @@ are still importable there for development & CI testing).
 from __future__ import annotations
 
 import base64
+import contextlib
 import ctypes
 import hashlib
 import hmac
@@ -1352,11 +1353,73 @@ def refresh_explorer() -> None:
 #  Watch folder daemon
 # --------------------------------------------------------------------------- #
 
+_WATCH_IGNORE_PREFIXES = ("~$", ".~", "~wrl")
+_WATCH_IGNORE_SUFFIXES = (
+    ".crdownload",
+    ".part",
+    ".partial",
+    ".tmp",
+    ".temp",
+    ".stage",
+    ".filelist",
+    ".old",
+    ".clickshift-debug.txt",
+    ".confas-debug.txt",
+)
+
+
+def _is_watch_file_unlocked(path_str: str, unchanged_s: float) -> bool:
+    """Return True once no writer holds an active write handle (with a 15s cloud/indexer escape hatch)."""
+    if IS_WINDOWS and getattr(ctypes, "WinDLL", None) is not None:
+        try:
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.CreateFileW.argtypes = [
+                ctypes.c_wchar_p,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+            ]
+            k32.CreateFileW.restype = ctypes.c_void_p
+            k32.CloseHandle.argtypes = [ctypes.c_void_p]
+            GENERIC_READ = 0x80000000
+            FILE_SHARE_READ = 0x00000001
+            OPEN_EXISTING = 3
+            FILE_ATTRIBUTE_NORMAL = 0x00000080
+            INVALID_HANDLE = ctypes.c_void_p(-1).value
+            h = k32.CreateFileW(
+                path_str,
+                GENERIC_READ,
+                FILE_SHARE_READ,
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                None,
+            )
+            if h and h != INVALID_HANDLE:
+                k32.CloseHandle(h)
+                return True
+            err = ctypes.get_last_error()
+            ERROR_SHARING_VIOLATION = 32
+            if err == ERROR_SHARING_VIOLATION and unchanged_s < 15.0:
+                return False
+        except Exception:
+            pass
+    try:
+        with open(path_str, "rb") as fh:
+            fh.read(1)
+        return True
+    except OSError:
+        return False
+
+
 class WatchFolder(threading.Thread):
     """Poll-based watcher (dependency-free, works from frozen EXE reliably)."""
 
     POLL_SECONDS = 0.5
-    STABLE_CHECKS = 2   # file size must be unchanged N polls before we convert
+    STABLE_CHECKS = 2   # file size & mtime must be unchanged N polls before we convert
 
     def __init__(self, folder: Path, cfg: dict, on_done=None) -> None:
         super().__init__(daemon=True, name="clickshift-watch")
@@ -1364,15 +1427,27 @@ class WatchFolder(threading.Thread):
         self.cfg = cfg
         self.on_done = on_done
         self.stop_event = threading.Event()
-        self._seen: dict[str, tuple[int, int]] = {}          # path -> (size, stable_count)
+        # path -> (mtime_ns, size, stable_count, first_stable_monotonic)
+        self._seen: dict[str, tuple[int, int, int, float]] = {}
         self._done: dict[str, tuple[int, int]] = {}          # path -> (mtime_ns, size) already processed
         self._produced: set[str] = set()                     # outputs created by watcher itself
         self._inflight: set[str] = set()
         self._state_lock = threading.Lock()
 
+    def is_busy(self) -> bool:
+        with self._state_lock:
+            return bool(self._inflight)
+
+    def _required_stable_checks(self, size: int) -> int:
+        if self.POLL_SECONDS < 0.1 or size < 10 * 1024 * 1024:
+            return self.STABLE_CHECKS
+        if size < 50 * 1024 * 1024:
+            return max(self.STABLE_CHECKS, 4)
+        return max(self.STABLE_CHECKS, 6)
+
     def run(self) -> None:
         from concurrent.futures import ThreadPoolExecutor
-        from .formats import newest_target_for
+        from .formats import SUPPORTED_INPUT_EXTS, newest_target_for
         from .engine import get_engine
 
         self.folder.mkdir(parents=True, exist_ok=True)
@@ -1384,12 +1459,18 @@ class WatchFolder(threading.Thread):
                     with os.scandir(self.folder) as it:
                         for entry in it:
                             nm = entry.name
-                            if nm.startswith("~$") or nm.endswith((".clickshift-debug.txt", ".confas-debug.txt")):
+                            nm_low = nm.lower()
+                            if nm_low.startswith(_WATCH_IGNORE_PREFIXES) or nm_low.endswith(_WATCH_IGNORE_SUFFIXES):
+                                continue
+                            ext_low = Path(nm_low).suffix.lstrip(".")
+                            if not ext_low or ext_low not in SUPPORTED_INPUT_EXTS:
                                 continue
                             try:
                                 if not entry.is_file(follow_symlinks=False):
                                     continue
                                 st = entry.stat(follow_symlinks=False)
+                                if st.st_size <= 0:
+                                    continue
                                 now[entry.path] = (st.st_mtime_ns, st.st_size)
                             except OSError:
                                 continue
@@ -1397,6 +1478,7 @@ class WatchFolder(threading.Thread):
                         produced = set(self._produced)
                         inflight = set(self._inflight)
                         done_map = dict(self._done)
+                    mono_now = time.monotonic()
                     for path_str, (mtime_ns, size) in now.items():
                         if path_str in produced or path_str in inflight:
                             continue
@@ -1404,16 +1486,20 @@ class WatchFolder(threading.Thread):
                             continue
                         prev = self._seen.get(path_str)
                         if prev is None:
-                            self._seen[path_str] = (size, 0)
+                            self._seen[path_str] = (mtime_ns, size, 0, mono_now)
                             continue
-                        old_size, stable = prev
-                        if size != old_size:
-                            self._seen[path_str] = (size, 0)      # still being written
+                        old_mtime, old_size, stable, first_mono = prev
+                        if size != old_size or mtime_ns != old_mtime:
+                            self._seen[path_str] = (mtime_ns, size, 0, mono_now)
                             continue
-                        if stable < self.STABLE_CHECKS:
-                            self._seen[path_str] = (size, stable + 1)
+                        need_checks = self._required_stable_checks(size)
+                        if stable < need_checks:
+                            self._seen[path_str] = (mtime_ns, size, stable + 1, first_mono)
                             continue
-                        # file is complete -> dispatch once (skip our own outputs)
+                        if self.POLL_SECONDS >= 0.1 and not _is_watch_file_unlocked(path_str, mono_now - first_mono):
+                            # Still locked by copier/browser/downloader -> wait without resetting first_mono
+                            continue
+                        # file is complete and unlocked -> dispatch once (skip our own outputs)
                         del self._seen[path_str]
                         src = Path(path_str)
                         out_ext = (self.cfg.get("auto_target") or "").lower()
@@ -1461,9 +1547,34 @@ class WatchFolder(threading.Thread):
             popup = ConversionProgressPopup([(str(src), target)]).start()
         except Exception:
             popup = None
+
+        def _watch_sub_cb(done_u: int, tot_u: int, det: str) -> None:
+            if popup is not None and tot_u > 0:
+                try:
+                    popup.on_step(
+                        file_path=src.name,
+                        dst_ext=target,
+                        file_idx=0,
+                        total_files=1,
+                        sub_frac=done_u / float(tot_u),
+                        detail=det,
+                    )
+                except Exception:
+                    pass
+
         try:
             eng = engine_getter(enable_ml=bool(self.cfg.get("ml_enabled", True)))
-            res = eng.convert(src, target)
+            try:
+                from .engine import subprogress_scope
+                scope_cm: Any = subprogress_scope(_watch_sub_cb if popup is not None else None)
+            except Exception:
+                scope_cm = contextlib.nullcontext()
+            with scope_cm:
+                res = eng.convert(src, target)
+            # Record produced output BEFORE popup.complete() delay so the poll loop never re-ingests it
+            if res.ok and res.target:
+                with self._state_lock:
+                    self._produced.add(str(Path(res.target)))
             if popup is not None:
                 popup.on_file_done(res)
                 if res.ok:
@@ -1474,9 +1585,6 @@ class WatchFolder(threading.Thread):
             if popup is not None:
                 popup.error(str(exc), delay_s=1.2)
             raise
-        if res.ok and res.target:
-            with self._state_lock:
-                self._produced.add(str(Path(res.target)))
         _log(f"watch-converted {src.name} -> {res.target} via {res.backend} "
              f"({res.elapsed_ms:.0f} ms, ok={res.ok}{', err=' + res.error if res.error else ''})")
         if self.on_done:
@@ -1579,12 +1687,12 @@ def ipc_file() -> Path:
     return data_dir() / "daemon_ipc.json"
 
 
-def _recv_line_bounded(conn, max_bytes: int = 65536) -> str:
+def _recv_line_bounded(conn, max_bytes: int = 1_048_576) -> str:
     """Read a single newline-delimited UTF-8 request capped at ``max_bytes``."""
     chunks: list[bytes] = []
     total = 0
     while True:
-        chunk = conn.recv(min(4096, max_bytes - total))
+        chunk = conn.recv(min(16384, max_bytes - total))
         if not chunk:
             break
         nl = chunk.find(b"\n")
@@ -1601,8 +1709,9 @@ def _recv_line_bounded(conn, max_bytes: int = 65536) -> str:
 class DaemonIPCServer(threading.Thread):
     """Loopback IPC server so CLI/right-click conversions run inside the warm daemon."""
 
-    MAX_REQUEST_BYTES = 65536
+    MAX_REQUEST_BYTES = 1_048_576
     MAX_CONCURRENT_CONNS = 16
+    HEARTBEAT_INTERVAL_S = 10.0
 
     def __init__(self, cfg: dict) -> None:
         super().__init__(daemon=True, name="clickshift-ipc")
@@ -1610,11 +1719,18 @@ class DaemonIPCServer(threading.Thread):
         self.token = uuid.uuid4().hex
         self.stop_event = threading.Event()
         self._conn_sem = threading.BoundedSemaphore(self.MAX_CONCURRENT_CONNS)
+        self._jobs_lock = threading.Lock()
+        self._active_jobs = 0
+        self._job_registry: dict[str, dict[str, Any]] = {}
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.bind(("127.0.0.1", 0))
         self._sock.listen(16)
         self._sock.settimeout(1.0)
         self.port = int(self._sock.getsockname()[1])
+
+    def active_count(self) -> int:
+        with self._jobs_lock:
+            return self._active_jobs
 
     def start_and_publish(self) -> None:
         f = ipc_file()
@@ -1669,10 +1785,63 @@ class DaemonIPCServer(threading.Thread):
         finally:
             self._conn_sem.release()
 
+    def _prune_jobs_unlocked(self, now_t: float) -> None:
+        stale = [
+            jid
+            for jid, st in self._job_registry.items()
+            if st.get("done") and (now_t - float(st.get("finished_ts", 0.0))) > 120.0
+        ]
+        for jid in stale:
+            self._job_registry.pop(jid, None)
+
+    def _stream_job_to_socket(self, job_state: dict[str, Any], wfile: Any) -> None:
+        """Stream an active or completed job's buffered & live events + 10s heartbeats to ``wfile``."""
+        cond: threading.Condition = job_state["cond"]
+        job_id = str(job_state["job_id"])
+        wfile.write(json.dumps({"type": "ack", "job_id": job_id, "pid": os.getpid()}) + "\n")
+        wfile.flush()
+        sent_idx = 0
+        last_step_seq = -1
+        while True:
+            to_send: list[dict[str, Any]] = []
+            step_frame: Optional[dict[str, Any]] = None
+            is_done = False
+            with cond:
+                events: list[dict[str, Any]] = job_state["events"]
+                while (
+                    sent_idx >= len(events)
+                    and int(job_state["step_seq"]) == last_step_seq
+                    and not job_state["done"]
+                ):
+                    cond.wait(timeout=self.HEARTBEAT_INTERVAL_S)
+                    if (
+                        sent_idx >= len(events)
+                        and int(job_state["step_seq"]) == last_step_seq
+                        and not job_state["done"]
+                    ):
+                        to_send.append({"type": "heartbeat", "job_id": job_id, "ts": time.time()})
+                        break
+                if int(job_state["step_seq"]) != last_step_seq and job_state.get("last_step") is not None:
+                    last_step_seq = int(job_state["step_seq"])
+                    step_frame = dict(job_state["last_step"])
+                if sent_idx < len(events):
+                    to_send.extend(events[sent_idx:])
+                    sent_idx = len(events)
+                is_done = bool(job_state["done"]) and sent_idx >= len(events)
+            if step_frame is not None:
+                wfile.write(json.dumps(step_frame) + "\n")
+            for ev in to_send:
+                wfile.write(json.dumps(ev) + "\n")
+            if step_frame is not None or to_send:
+                wfile.flush()
+            if is_done:
+                break
+
     def _handle(self, conn) -> None:
         from .engine import get_engine
+        from .formats import ConversionResult
         try:
-            conn.settimeout(2.0)
+            conn.settimeout(10.0)
             with conn:
                 line = _recv_line_bounded(conn, max_bytes=self.MAX_REQUEST_BYTES)
                 if not line:
@@ -1683,42 +1852,106 @@ class DaemonIPCServer(threading.Thread):
                 tok = str(req.get("token") or "")
                 if not hmac.compare_digest(tok, self.token):
                     return
-                conn.settimeout(300.0)
+                conn.settimeout(3600.0)
                 wfile = conn.makefile("w", encoding="utf-8")
+                action = str(req.get("action") or "convert")
+                job_id = str(req.get("job_id") or uuid.uuid4().hex)
+
+                if action == "attach":
+                    with self._jobs_lock:
+                        existing = self._job_registry.get(job_id)
+                    if existing is None:
+                        wfile.write(json.dumps({"type": "not_found", "job_id": job_id}) + "\n")
+                        wfile.flush()
+                        return
+                    self._stream_job_to_socket(existing, wfile)
+                    return
+
+                cond = threading.Condition()
+                job_state: dict[str, Any] = {
+                    "job_id": job_id,
+                    "cond": cond,
+                    "events": [],
+                    "last_step": None,
+                    "step_seq": 0,
+                    "done": False,
+                    "finished_ts": 0.0,
+                }
+                with self._jobs_lock:
+                    self._prune_jobs_unlocked(time.time())
+                    existing = self._job_registry.get(job_id)
+                    if existing is None:
+                        self._job_registry[job_id] = job_state
+                        self._active_jobs += 1
+                    else:
+                        job_state = existing
+
+                if existing is not None:
+                    self._stream_job_to_socket(job_state, wfile)
+                    return
+
                 enable_ml = bool(req.get("enable_ml", True))
-                eng = get_engine(enable_ml=enable_ml)
-                write_lock = threading.Lock()
 
-                def on_done(res):
-                    with write_lock:
-                        wfile.write(json.dumps(res.as_dict()) + "\n")
-                        wfile.flush()
-
-                def on_step(info: dict):
-                    with write_lock:
-                        wfile.write(json.dumps({"type": "progress", **info}) + "\n")
-                        wfile.flush()
-
-                if req.get("action") == "combine_images":
-                    files = [str(p) for p in (req.get("files") or [])]
-                    target = str(req.get("target") or "pdf")
-                    if hasattr(eng, "combine_images"):
-                        try:
-                            on_done(eng.combine_images(files, target, step_progress=on_step))
-                        except TypeError:
-                            on_done(eng.combine_images(files, target))
-                else:
-                    jobs = [(str(s), str(t)) for s, t in (req.get("jobs") or [])]
+                def _worker() -> None:
+                    expected_total = 1 if action == "combine_images" else len(req.get("jobs") or [])
                     try:
-                        eng.convert_many(jobs, progress=on_done, step_progress=on_step)
-                    except TypeError:
-                        eng.convert_many(jobs, progress=on_done)
+                        eng = get_engine(enable_ml=enable_ml)
+
+                        def on_done(res):
+                            with cond:
+                                job_state["events"].append(res.as_dict())
+                                cond.notify_all()
+
+                        def on_step(info: dict):
+                            with cond:
+                                job_state["last_step"] = {"type": "progress", **info}
+                                job_state["step_seq"] = int(job_state["step_seq"]) + 1
+                                cond.notify_all()
+
+                        if action == "combine_images":
+                            files = [str(p) for p in (req.get("files") or [])]
+                            target = str(req.get("target") or "pdf")
+                            if hasattr(eng, "combine_images"):
+                                try:
+                                    on_done(eng.combine_images(files, target, step_progress=on_step))
+                                except TypeError:
+                                    on_done(eng.combine_images(files, target))
+                        else:
+                            jobs = [(str(s), str(t)) for s, t in (req.get("jobs") or [])]
+                            try:
+                                eng.convert_many(jobs, progress=on_done, step_progress=on_step)
+                            except TypeError:
+                                eng.convert_many(jobs, progress=on_done)
+                    except Exception as w_exc:
+                        _log(f"ipc job worker error: {w_exc}")
+                        with cond:
+                            missing = max(0, expected_total - len(job_state["events"]))
+                            for _ in range(missing):
+                                err_res = ConversionResult(
+                                    source="",
+                                    target="",
+                                    backend="-",
+                                    elapsed_ms=0.0,
+                                    ok=False,
+                                    error=f"{type(w_exc).__name__}: {w_exc}",
+                                )
+                                job_state["events"].append(err_res.as_dict())
+                    finally:
+                        with self._jobs_lock:
+                            self._active_jobs = max(0, self._active_jobs - 1)
+                        with cond:
+                            job_state["done"] = True
+                            job_state["finished_ts"] = time.time()
+                            cond.notify_all()
+
+                threading.Thread(target=_worker, daemon=True, name=f"clickshift-job-{job_id[:8]}").start()
+                self._stream_job_to_socket(job_state, wfile)
         except Exception as exc:
             _log(f"ipc handler error: {exc}")
 
 
 def _ipc_request(payload_fields: dict, progress=None, step_progress=None) -> Optional[list]:
-    """Send an authenticated JSON request to the running warm daemon."""
+    """Send an authenticated JSON request to the running warm daemon (with 10s heartbeats & job re-attach)."""
     if os.environ.get("CLICKSHIFT_NO_IPC") == "1":
         return None
     f = ipc_file()
@@ -1736,31 +1969,55 @@ def _ipc_request(payload_fields: dict, progress=None, step_progress=None) -> Opt
             return None
         port = int(meta["port"])
         token = str(meta["token"])
-        results = []
+    except Exception:
+        return None
+
+    job_id = str(payload_fields.get("job_id") or uuid.uuid4().hex)
+    expected_count = 1 if payload_fields.get("action") == "combine_images" else len(payload_fields.get("jobs") or [])
+    results: list[Any] = []
+    accepted = False
+
+    def _consume_stream(req_body: dict) -> bool:
+        nonlocal accepted
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(0.4)
+        sock.settimeout(2.0)
         with sock:
             sock.connect(("127.0.0.1", port))
             try:
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             except OSError:
                 pass
-            sock.settimeout(300.0)
+            # Server sends a heartbeat every 10s; 60s of total silence means broken socket
+            sock.settimeout(60.0)
             rfile = sock.makefile("r", encoding="utf-8")
             wfile = sock.makefile("w", encoding="utf-8")
-            body = {"token": token, **payload_fields}
-            wfile.write(json.dumps(body) + "\n")
+            wfile.write(json.dumps(req_body) + "\n")
             wfile.flush()
+            seen_in_stream = 0
             for line in rfile:
                 if not line.strip():
                     continue
                 d = json.loads(line)
-                if isinstance(d, dict) and d.get("type") == "progress":
+                if not isinstance(d, dict):
+                    continue
+                mtype = d.get("type")
+                if mtype in ("ack", "heartbeat"):
+                    accepted = True
+                    continue
+                if mtype == "not_found":
+                    return False
+                if mtype == "progress":
+                    accepted = True
                     if step_progress is not None:
                         try:
                             step_progress(d)
                         except Exception:
                             pass
+                    continue
+                accepted = True
+                seen_in_stream += 1
+                if seen_in_stream <= len(results):
+                    # Already processed before reconnect
                     continue
                 res = ConversionResult(
                     source=d["source"],
@@ -1778,9 +2035,50 @@ def _ipc_request(payload_fields: dict, progress=None, step_progress=None) -> Opt
                         progress(res)
                     except Exception:
                         pass
+        return True
+
+    initial_body = {"token": token, "job_id": job_id, **payload_fields}
+    for attempt in range(3):
+        body = initial_body if attempt == 0 else {"token": token, "action": "attach", "job_id": job_id}
+        try:
+            ok_stream = _consume_stream(body)
+            if ok_stream and (expected_count == 0 or len(results) >= expected_count):
+                return results
+            if not accepted:
+                return None
+            if pid and not _pid_alive(pid):
+                break
+        except Exception:
+            if not accepted:
+                return None
+            if pid and not _pid_alive(pid):
+                break
+            time.sleep(0.25)
+
+    if accepted and expected_count > len(results):
+        # Daemon accepted the job and is either still working or crashed mid-batch:
+        # synthesize failure entries for unfinished items instead of returning None (prevents duplicate 150 MB runs!).
+        from .formats import ConversionResult
+        raw_jobs = payload_fields.get("jobs") or []
+        for idx in range(len(results), expected_count):
+            src_s = str(raw_jobs[idx][0]) if idx < len(raw_jobs) else ""
+            dst_s = str(raw_jobs[idx][1]) if idx < len(raw_jobs) else ""
+            err_res = ConversionResult(
+                source=src_s,
+                target=dst_s,
+                backend="-",
+                elapsed_ms=0.0,
+                ok=False,
+                error="Lost IPC connection to warm daemon during conversion",
+            )
+            results.append(err_res)
+            if progress:
+                try:
+                    progress(err_res)
+                except Exception:
+                    pass
         return results
-    except Exception:
-        return None
+    return results if accepted else None
 
 
 def try_daemon_convert(jobs: list[tuple[str, str]], enable_ml: bool = True,
@@ -1989,8 +2287,16 @@ def run_daemon(headless: bool = False) -> int:
                 if cur_cfg.get("auto_update_check", True):
                     due, wait_s = update_check_due_in(cur_cfg)
                     if due:
-                        _check_for_update(manual=False)
-                        wait_s = max(300, int(load_config().get("update_check_interval_s", DEFAULT_UPDATE_INTERVAL_S)))
+                        active_w = globals().get("_ACTIVE_WATCH") or watch
+                        busy = (ipc is not None and ipc.active_count() > 0) or (
+                            active_w is not None and hasattr(active_w, "is_busy") and active_w.is_busy()
+                        )
+                        if busy:
+                            _log("deferring background update check while conversions are active")
+                            wait_s = 120.0
+                        else:
+                            _check_for_update(manual=False)
+                            wait_s = max(300, int(load_config().get("update_check_interval_s", DEFAULT_UPDATE_INTERVAL_S)))
                 else:
                     wait_s = max(300, int(cur_cfg.get("update_check_interval_s", DEFAULT_UPDATE_INTERVAL_S)))
                 if update_stop.wait(wait_s):

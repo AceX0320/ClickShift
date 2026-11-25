@@ -1509,12 +1509,44 @@ def _load_learned_medians() -> dict[str, float]:
     return {}
 
 
+_EST_IMAGE_EXTS = {
+    "png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff",
+    "avif", "jxl", "heic", "heif", "ico", "ppm", "pgm", "pbm", "jp2", "wmf", "emf",
+}
+_MAX_EST_JOB_MS = 1_800_000.0  # 30 min ceiling for heavy 150 MB jobs
+
+
+def _ellipsize_middle(text: str, max_len: int = 44) -> str:
+    if len(text) <= max_len or max_len < 10:
+        return text
+    keep_left = (max_len - 3) // 2 + 2
+    keep_right = max_len - 3 - keep_left
+    return f"{text[:keep_left]}...{text[-keep_right:]}"
+
+
+def _cold_start_heuristic_ms(src_ext: str, target: str, mb: float) -> float:
+    if src_ext in ("txt", "md", "markdown", "csv", "tsv", "json", "xml", "log", "html", "htm") and target in (
+        "txt", "md", "html", "csv",
+    ):
+        return max(120.0, 120.0 + mb * 90.0)
+    if src_ext in ("txt", "md", "markdown", "csv", "tsv", "html", "htm") and target in (
+        "docx", "rtf", "odt", "pdf",
+    ):
+        slope = 220.0 if mb <= 15.0 else 420.0
+        return max(140.0, 160.0 + mb * slope)
+    if src_ext in _EST_IMAGE_EXTS:
+        return max(260.0, 320.0 + mb * 380.0)
+    if src_ext == "pdf" or target == "pdf":
+        return max(900.0, 1100.0 + mb * 1500.0)
+    return max(750.0, 900.0 + mb * 1100.0)
+
+
 def estimate_job_duration_ms(
     src_path: str | Path,
     dst_ext: str,
     median_map: Optional[dict[str, float]] = None,
 ) -> float:
-    """Estimate duration (in ms) for converting ``src_path`` to ``dst_ext``."""
+    """Estimate duration (in ms) for converting ``src_path`` to ``dst_ext`` (accurate up to 150+ MB)."""
     p = Path(src_path)
     src_ext = p.suffix.lstrip(".").lower()
     target = str(dst_ext or "").lstrip(".").lower()
@@ -1523,26 +1555,23 @@ def estimate_job_duration_ms(
         size_bytes = p.stat().st_size
     except OSError:
         size_bytes = 0
-    mb = size_bytes / (1024.0 * 1024.0)
+    mb = max(0.0, size_bytes / (1024.0 * 1024.0))
+    heuristic = _cold_start_heuristic_ms(src_ext, target, mb)
 
     meds = median_map if median_map is not None else _load_learned_medians()
     learned = meds.get(pair)
     if learned is not None and learned > 0:
         base_ms = float(learned)
-        if mb > 2.0:
-            scale = 1.0 + min(25.0, (mb - 1.0) * 0.35)
-            return max(120.0, min(base_ms * scale, 600_000.0))
-        return max(80.0, min(base_ms, 600_000.0))
+        if mb > 1.5:
+            scale = max(1.0, mb ** 0.80)
+            scaled = base_ms * scale
+            if mb > 5.0:
+                # Guard against tiny-file (~150 ms) medians under-predicting 50..150 MB files
+                scaled = max(scaled, heuristic * 0.45)
+            return max(120.0, min(scaled, _MAX_EST_JOB_MS))
+        return max(80.0, min(base_ms, _MAX_EST_JOB_MS))
 
-    if src_ext in ("txt", "md", "markdown", "csv", "tsv", "html", "htm") and target in (
-        "txt", "md", "html", "docx", "rtf", "odt", "csv",
-    ):
-        return max(120.0, 140.0 + mb * 220.0)
-    if src_ext in ("png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff", "avif", "jxl", "heic", "heif", "ico"):
-        return max(260.0, 320.0 + mb * 380.0)
-    if src_ext == "pdf" or target == "pdf":
-        return max(900.0, 1100.0 + mb * 1500.0)
-    return max(750.0, 900.0 + mb * 1100.0)
+    return min(heuristic, _MAX_EST_JOB_MS)
 
 
 def estimate_jobs_duration_ms(
@@ -1613,16 +1642,17 @@ class ConversionProgressPopup:
             done = self._done_count
             idx = min(self._active_idx + 1, total)
 
+        cur_disp = _ellipsize_middle(cur_name, 42)
         if self.combine_target and total > 1:
-            names = [Path(s).name for s, _ in self.jobs[:2]]
+            names = [_ellipsize_middle(Path(s).name, 22) for s, _ in self.jobs[:2]]
             more = f" (+{total - 2} more)" if total > 2 else ""
             return f"Combining {total} files ({', '.join(names)}{more}) -> .{self.combine_target.upper()}"
         if total == 1:
-            return f"{cur_name}  ->  .{cur_dst}"
-        remaining_names = [Path(s).name for s, _ in self.jobs[done:done + 2]]
+            return f"{cur_disp}  ->  .{cur_dst}"
+        remaining_names = [_ellipsize_middle(Path(s).name, 20) for s, _ in self.jobs[done:done + 2]]
         extra = max(0, (total - done) - len(remaining_names))
         tail = f" (+{extra} more)" if extra > 0 else ""
-        return f"[{idx}/{total}] {cur_name} -> .{cur_dst}  ({', '.join(remaining_names)}{tail})"
+        return f"[{idx}/{total}] {cur_disp} -> .{cur_dst}  ({', '.join(remaining_names)}{tail})"
 
     def compute_snapshot(self, now: Optional[float] = None) -> dict[str, Any]:
         """Compute current (pct, remaining_s, elapsed_s, files_text, status_text, detail_text)."""
@@ -1658,10 +1688,14 @@ class ConversionProgressPopup:
             }
 
         if sub_frac is not None and sub_frac > 0.0:
-            in_flight = min(0.98, max(0.01, float(sub_frac)))
+            in_flight = min(0.985, max(0.01, float(sub_frac)))
         else:
             ratio = file_elapsed_ms / max(cur_est_ms, 80.0)
-            in_flight = min(0.95, 0.95 * (1.0 - math.exp(-1.35 * ratio)))
+            # Two-component C1-smooth curve: brisk early rise + gentle tail toward 98% (never freezes at 95%)
+            in_flight = min(
+                0.98,
+                0.80 * (1.0 - math.exp(-1.5 * ratio)) + 0.18 * (1.0 - 1.0 / (1.0 + 0.35 * ratio)),
+            )
 
         if self.combine_target and total > 1:
             overall_frac = min(0.99, in_flight)
@@ -1674,6 +1708,7 @@ class ConversionProgressPopup:
         pct = max(1.0, min(99.0, overall_frac * 100.0))
 
         prior_rem_s = max(0.0, est_total_s - elapsed_s)
+        overrun = False
         if sub_frac is not None and sub_frac >= 0.03 and elapsed_s >= 0.15:
             rate_rem_s = elapsed_s * (1.0 - overall_frac) / max(overall_frac, 0.02)
             w = min(1.0, overall_frac * 1.8)
@@ -1682,15 +1717,22 @@ class ConversionProgressPopup:
             rate_rem_s = elapsed_s * (1.0 - overall_frac) / max(overall_frac, 0.02)
             rem_s = 0.35 * prior_rem_s + 0.65 * rate_rem_s
         else:
-            if elapsed_s < est_total_s * 0.85:
+            knee_s = est_total_s * 0.90
+            if elapsed_s < knee_s:
                 rem_s = max(0.5, prior_rem_s)
             else:
-                rem_s = max(1.0, elapsed_s * 0.25)
+                # Monotonically decreasing glide (never counts upward when a heavy backend runs past estimate)
+                tail_budget = max(1.0, est_total_s * 0.10)
+                decay_scale = max(4.0, est_total_s * 0.30)
+                rem_s = max(1.0, tail_budget / (1.0 + (elapsed_s - knee_s) / decay_scale))
+                overrun = elapsed_s >= est_total_s * 1.15
 
         eta_str = format_eta_seconds(rem_s)
         el_str = format_eta_seconds(elapsed_s)
         if detail:
             det = f"{detail}  •  Time remaining: ~{eta_str}  (Elapsed: {el_str})"
+        elif overrun:
+            det = f"Finalizing conversion...  •  Elapsed: {el_str}"
         else:
             det = f"Time remaining: ~{eta_str}  •  Elapsed: {el_str}"
 

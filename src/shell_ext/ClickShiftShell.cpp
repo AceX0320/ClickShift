@@ -75,7 +75,18 @@ static const ExtRule kRules[] = {
     {L"ico",  L"png",  {L"png", L"webp", L"jpg", L"pdf", L"docx", L"pptx", L"bmp", nullptr}},
     {L"avif", L"png",  {L"png", L"jpg", L"webp", L"pdf", L"docx", L"pptx", L"jxl", L"tiff", L"bmp", L"ico", L"gif", nullptr}},
     {L"heic", L"jpg",  {L"jpg", L"png", L"webp", L"pdf", L"docx", L"pptx", L"avif", L"jxl", L"tiff", L"bmp", nullptr}},
+    {L"heif", L"jpg",  {L"jpg", L"png", L"webp", L"pdf", L"docx", L"pptx", L"avif", L"jxl", L"tiff", L"bmp", nullptr}},
     {L"jxl",  L"png",  {L"png", L"jpg", L"webp", L"pdf", L"docx", L"pptx", L"avif", L"tiff", L"bmp", L"ico", nullptr}},
+    {L"jp2",  L"png",  {L"png", L"jpg", L"webp", L"pdf", L"docx", L"pptx", L"tiff", L"bmp", nullptr}},
+    {L"ppm",  L"png",  {L"png", L"webp", L"jpg", L"pdf", L"docx", L"pptx", L"tiff", L"bmp", nullptr}},
+    {L"pgm",  L"png",  {L"png", L"webp", L"jpg", L"pdf", L"docx", L"pptx", L"tiff", L"bmp", nullptr}},
+    {L"pbm",  L"png",  {L"png", L"webp", L"jpg", L"pdf", L"docx", L"pptx", L"tiff", L"bmp", nullptr}},
+    {L"wmf",  L"png",  {L"png", L"webp", L"jpg", L"pdf", L"docx", L"pptx", nullptr}},
+    {L"emf",  L"png",  {L"png", L"webp", L"jpg", L"pdf", L"docx", L"pptx", nullptr}},
+    {L"xps",  L"pdf",  {L"pdf", L"docx", L"png", L"jpg", nullptr}},
+    {L"mht",  L"docx", {L"docx", L"pdf", L"html", L"txt", L"md", nullptr}},
+    {L"wpd",  L"docx", {L"docx", L"pdf", L"txt", L"rtf", L"odt", nullptr}},
+    {L"srt",  L"txt",  {L"txt", L"docx", L"pdf", L"html", L"md", nullptr}},
 };
 
 static const wchar_t* kAllTargets[] = {
@@ -233,8 +244,10 @@ static std::wstring WriteFilelistFallback(const std::vector<std::wstring>& files
         wchar_t tmp[MAX_PATH] = {0};
         DWORD nTmp = GetTempPathW(MAX_PATH, tmp);
         if (nTmp == 0 || nTmp >= MAX_PATH) return L"";
-        dir = tmp;
-        while (!dir.empty() && dir.back() == L'\\') dir.pop_back();
+        std::wstring baseTmp = tmp;
+        while (!baseTmp.empty() && baseTmp.back() == L'\\') baseTmp.pop_back();
+        dir = baseTmp + L"\\ClickShift";
+        CreateDirectoryW(dir.c_str(), nullptr);
     }
     std::wstring path = dir + L"\\batch_" + std::to_wstring(GetCurrentProcessId()) +
                         L"_" + std::to_wstring(GetTickCount64()) + L".filelist";
@@ -445,8 +458,9 @@ static void LaunchClickShift(IShellItemArray* psiArray, const std::wstring& targ
     }
     cmdLine += targetSuffix;
 
+    std::wstring flPath;
     if (cmdLine.size() > 16000) {
-        std::wstring flPath = WriteFilelistFallback(files);
+        flPath = WriteFilelistFallback(files);
         if (!flPath.empty()) {
             cmdLine = baseCmd + L" --filelist " + QuoteWindowsArg(flPath) + targetSuffix;
         }
@@ -463,6 +477,9 @@ static void LaunchClickShift(IShellItemArray* psiArray, const std::wstring& targ
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
     } else {
+        if (!flPath.empty()) {
+            DeleteFileW(flPath.c_str());
+        }
         InvalidatePathCache();
         MessageBoxW(nullptr, L"ClickShift could not start the conversion process. Try reinstalling ClickShift.",
                     L"ClickShift", MB_OK | MB_ICONERROR);
