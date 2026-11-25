@@ -698,3 +698,140 @@ def test_audit_regressions_ipc_zero_step_heartbeats_oserror_single_try_csv_pdf_a
     assert prog_fracs and prog_fracs[-1] >= 0.98
 
 
+def test_pdf_ocr_fallback_vector_tables_margin_strip_and_empty_guard(tmp_path, monkeypatch):
+    """Scanned / Print-to-PDF vector-outlined PDFs extract Markdown headings, lists, and tables via OCR and never emit empty files."""
+    import pymupdf as fitz
+    from clickshift import engine
+
+    # 1. Truly blank / textless PDF must raise RuntimeError instead of writing an empty .md or .txt file
+    blank_pdf = tmp_path / "blank_only.pdf"
+    bdoc = fitz.open()
+    bdoc.new_page(width=612, height=792)
+    bdoc.save(str(blank_pdf))
+    bdoc.close()
+
+    empty_md = tmp_path / "should_not_exist.md"
+    with pytest.raises(RuntimeError, match="no extractable"):
+        engine.conv_pdf_to_md_structured(blank_pdf, empty_md)
+    assert not empty_md.exists()
+
+    empty_txt = tmp_path / "should_not_exist.txt"
+    with pytest.raises(RuntimeError, match="no extractable"):
+        engine.conv_pdf_to_text(blank_pdf, empty_txt)
+    assert not empty_txt.exists()
+
+    # 2. Cross-platform deterministic test of vector-outlined PDF + OCR layout, grid tables, and margin stripping
+    vec_pdf = tmp_path / "outlined_print.pdf"
+    vdoc = fitz.open()
+    for p_i in range(3):
+        pg = vdoc.new_page(width=612, height=792)
+        # Draw a glyph-like stroke on every page so _pdf_page_has_visual_content is True
+        pg.draw_rect(fitz.Rect(72, 90, 80, 98), color=(0, 0, 0), width=1.0)
+        if p_i == 1:
+            # Draw a 2x2 bordered grid table at x=[70, 220, 520], y=[200, 230, 270]
+            for xv in (70.0, 220.0, 520.0):
+                pg.draw_line((xv, 200.0), (xv, 270.0), color=(0.2, 0.2, 0.2), width=1.0)
+            for yv in (200.0, 230.0, 270.0):
+                pg.draw_line((70.0, yv), (520.0, yv), color=(0.2, 0.2, 0.2), width=1.0)
+    vdoc.save(str(vec_pdf))
+    vdoc.close()
+
+    call_idx = {"n": 0}
+
+    def _fake_ocr_page(_self, _page, target_dpi=180):
+        idx = call_idx["n"]
+        call_idx["n"] += 1
+        common_margins = [
+            {"t": "11/24/26, 11:16 AM", "w": [("11/24/26,", 24.0, 16.0, 75.0, 22.4), ("11:16", 78.0, 16.0, 102.0, 22.4), ("AM", 105.0, 16.0, 120.0, 22.4)]},
+            {"t": f"{idx + 1}/3", "w": [(f"{idx + 1}/3", 550.0, 760.0, 575.0, 766.4)]},
+        ]
+        if idx == 0:
+            return common_margins + [
+                {"t": "System Architecture Overview", "w": [
+                    ("System", 72.0, 60.0, 145.0, 73.5),
+                    ("Architecture", 152.0, 60.0, 268.0, 73.5),
+                    ("Overview", 275.0, 60.0, 365.0, 73.5),
+                ]},
+                {"t": "This pipeline processes forensic artifacts deterministically across isolated stages.", "w": [
+                    ("This", 72.0, 105.0, 96.0, 111.5),
+                    ("pipeline", 100.0, 105.0, 142.0, 111.5),
+                    ("processes", 146.0, 105.0, 198.0, 111.5),
+                    ("forensic", 202.0, 105.0, 245.0, 111.5),
+                    ("artifacts", 249.0, 105.0, 294.0, 111.5),
+                    ("deterministically.", 298.0, 105.0, 385.0, 111.5),
+                ]},
+                {"t": "• Zero-install collector binary.", "w": [
+                    ("•", 72.0, 135.0, 77.0, 141.5),
+                    ("Zero-install", 82.0, 135.0, 145.0, 141.5),
+                    ("collector", 149.0, 135.0, 195.0, 141.5),
+                    ("binary.", 199.0, 135.0, 238.0, 141.5),
+                ]},
+            ]
+        if idx == 1:
+            return common_margins + [
+                {"t": "Stage Metric", "w": [("Stage", 80.0, 210.0, 120.0, 216.5), ("Metric", 235.0, 210.0, 280.0, 216.5)]},
+                {"t": "Phase 1 99.2% Recall", "w": [
+                    ("Phase", 80.0, 244.0, 115.0, 250.5),
+                    ("1", 118.0, 244.0, 126.0, 250.5),
+                    ("99.2%", 235.0, 244.0, 272.0, 250.5),
+                    ("Recall", 276.0, 244.0, 315.0, 250.5),
+                ]},
+            ]
+        return common_margins + [
+            {"t": "Final validation passed across all nodes.", "w": [
+                ("Final", 72.0, 100.0, 100.0, 106.5),
+                ("validation", 104.0, 100.0, 158.0, 106.5),
+                ("passed", 162.0, 100.0, 202.0, 106.5),
+                ("across", 206.0, 100.0, 242.0, 106.5),
+                ("all", 246.0, 100.0, 260.0, 106.5),
+                ("nodes.", 264.0, 100.0, 302.0, 106.5),
+            ]},
+        ]
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(engine._PdfOcrSession, "ocr_page", _fake_ocr_page)
+        out_md = tmp_path / "outlined_print.md"
+        engine.conv_pdf_to_md_structured(vec_pdf, out_md)
+        md_content = out_md.read_text(encoding="utf-8")
+        assert "# System Architecture Overview" in md_content
+        assert "- Zero-install collector binary." in md_content
+        assert "| Stage | Metric |" in md_content
+        assert "| Phase 1 | 99.2% Recall |" in md_content
+        assert "11/24/26" not in md_content
+        assert "1/3" not in md_content
+
+        call_idx["n"] = 0
+        out_txt = tmp_path / "outlined_print.txt"
+        engine.conv_pdf_to_text(vec_pdf, out_txt)
+        txt_content = out_txt.read_text(encoding="utf-8-sig")
+        assert "System Architecture Overview" in txt_content
+        assert "Final validation passed" in txt_content
+
+    # 3. Live end-to-end Windows OCR test on a rasterized (0-font, image-only) PDF
+    if sys.platform == "win32":
+        src_orig = fitz.open()
+        spg = src_orig.new_page(width=612, height=400)
+        spg.insert_text((60, 80), "ClickShift Live OCR Heading", fontsize=22, fontname="helv")
+        spg.insert_text((60, 130), "Scanned document body text verification 2026.", fontsize=13, fontname="helv")
+        pix = spg.get_pixmap(dpi=200, alpha=False)
+        img_bytes = pix.tobytes("png")
+        src_orig.close()
+
+        scan_pdf = tmp_path / "scanned_live.pdf"
+        sdoc = fitz.open()
+        ipg = sdoc.new_page(width=612, height=400)
+        ipg.insert_image(fitz.Rect(0, 0, 612, 400), stream=img_bytes)
+        sdoc.save(str(scan_pdf))
+        sdoc.close()
+
+        eng_live = engine.ConversionEngine(enable_ml=False)
+        try:
+            res_md = eng_live.convert(scan_pdf, "md")
+            assert res_md.ok, res_md.error
+            live_md = Path(res_md.target).read_text(encoding="utf-8")
+            assert "ClickShift" in live_md and "Scanned document" in live_md
+        finally:
+            eng_live.shutdown()
+
+
+

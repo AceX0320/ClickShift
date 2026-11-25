@@ -2390,26 +2390,407 @@ def conv_pdf_to_html_fidelity(src: Path, dst: Path) -> None:
         doc.close()
 
 
+_WIN_OCR_STREAM_PS = r"""
+$ErrorActionPreference = 'Stop'
+[Console]::InputEncoding  = [System.Text.Encoding]::UTF8
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+try {
+    Add-Type -AssemblyName System.Runtime.WindowsRuntime
+    $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+        $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
+    })[0]
+    function Await($WinRtTask, $ResultType) {
+        $asTask = $asTaskGeneric.MakeGenericMethod($ResultType)
+        $netTask = $asTask.Invoke($null, @($WinRtTask))
+        $netTask.Wait(-1) | Out-Null
+        return $netTask.Result
+    }
+    function Escape-Json([string]$s) {
+        if ($null -eq $s) { return "" }
+        $sbEsc = New-Object System.Text.StringBuilder ($s.Length + 8)
+        for ($i = 0; $i -lt $s.Length; $i++) {
+            $ch = $s[$i]
+            $code = [int][char]$ch
+            if ($ch -eq '\') { [void]$sbEsc.Append('\\') }
+            elseif ($ch -eq '"') { [void]$sbEsc.Append('\"') }
+            elseif ($code -eq 13) { [void]$sbEsc.Append('\r') }
+            elseif ($code -eq 10) { [void]$sbEsc.Append('\n') }
+            elseif ($code -eq 9)  { [void]$sbEsc.Append('\t') }
+            elseif ($code -lt 32) { [void]$sbEsc.Append(' ') }
+            else { [void]$sbEsc.Append($ch) }
+        }
+        return $sbEsc.ToString()
+    }
+    $null = [Windows.Storage.StorageFile, Windows.Storage, ContentType = WindowsRuntime]
+    $null = [Windows.Graphics.Imaging.BitmapDecoder, Windows.Graphics.Imaging, ContentType = WindowsRuntime]
+    $null = [Windows.Graphics.Imaging.SoftwareBitmap, Windows.Graphics.Imaging, ContentType = WindowsRuntime]
+    $null = [Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType = WindowsRuntime]
+
+    $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
+    if ($null -eq $engine) {
+        $langs = [Windows.Media.Ocr.OcrEngine]::AvailableRecognizerLanguages
+        if ($langs.Count -gt 0) {
+            $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage($langs[0])
+        }
+    }
+    if ($null -eq $engine) {
+        [Console]::Out.WriteLine('{"ready":false,"error":"No Windows OCR recognizer languages available"}')
+        [Console]::Out.Flush()
+        exit 0
+    }
+    [Console]::Out.WriteLine('{"ready":true}')
+    [Console]::Out.Flush()
+} catch {
+    [Console]::Out.WriteLine('{"ready":false,"error":"init failed"}')
+    [Console]::Out.Flush()
+    exit 0
+}
+
+while ($true) {
+    $lineIn = [Console]::In.ReadLine()
+    if ($null -eq $lineIn) { break }
+    $imgPath = $lineIn.Trim()
+    if ([string]::IsNullOrEmpty($imgPath)) { continue }
+    if ($imgPath -eq '__QUIT__') { break }
+    try {
+        $file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($imgPath)) ([Windows.Storage.StorageFile])
+        $stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
+        try {
+            $decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
+            $bitmap = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+            try {
+                $res = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
+                $sb = New-Object System.Text.StringBuilder 4096
+                [void]$sb.Append('{"ok":true,"lines":[')
+                $firstLn = $true
+                foreach ($ln in $res.Lines) {
+                    if (-not $firstLn) { [void]$sb.Append(',') }
+                    $firstLn = $false
+                    [void]$sb.Append('{"t":"').Append((Escape-Json $ln.Text)).Append('","w":[')
+                    $firstW = $true
+                    foreach ($w in $ln.Words) {
+                        if (-not $firstW) { [void]$sb.Append(',') }
+                        $firstW = $false
+                        $r = $w.BoundingRect
+                        [void]$sb.Append('["').Append((Escape-Json $w.Text)).Append('",')
+                        [void]$sb.Append([math]::Round($r.X, 1)).Append(',')
+                        [void]$sb.Append([math]::Round($r.Y, 1)).Append(',')
+                        [void]$sb.Append([math]::Round($r.Width, 1)).Append(',')
+                        [void]$sb.Append([math]::Round($r.Height, 1)).Append(']')
+                    }
+                    [void]$sb.Append(']}')
+                }
+                [void]$sb.Append(']}')
+                [Console]::Out.WriteLine($sb.ToString())
+                [Console]::Out.Flush()
+            } finally {
+                if ($null -ne $bitmap) { $bitmap.Dispose() }
+            }
+        } finally {
+            if ($null -ne $stream) { $stream.Dispose() }
+        }
+    } catch {
+        [Console]::Out.WriteLine('{"ok":false,"lines":[]}')
+        [Console]::Out.Flush()
+    }
+}
+"""
+
+
+class _PdfOcrSession:
+    """Streaming, bounded-disk OCR session for scanned or vector-outlined PDF pages.
+
+    Uses Windows 10/11 built-in ``Windows.Media.Ocr.OcrEngine`` via a single
+    Job-Object-governed worker process (zero external binary dependencies) and
+    falls back to ``tesseract`` TSV output when available on other platforms.
+    """
+
+    def __init__(self) -> None:
+        self._tmp_obj: Optional[tempfile.TemporaryDirectory[str]] = None
+        self._tmp_dir: Optional[Path] = None
+        self._proc: Optional[subprocess.Popen[str]] = None
+        self._out_q: "queue.Queue[Optional[str]]" = queue.Queue()
+        self._hjob: Any = None
+        self._k32: Any = None
+        self._job_attached = False
+        self._mode: str = "uninitialized"
+        self._tesseract_bin: Optional[str] = None
+
+    def _ensure_started(self) -> bool:
+        if self._mode != "uninitialized":
+            return self._mode in ("winrt", "tesseract")
+        if os.environ.get("CLICKSHIFT_DISABLE_OCR") == "1":
+            self._mode = "disabled"
+            return False
+        self._tmp_obj = tempfile.TemporaryDirectory(prefix="clickshift_ocr_")
+        self._tmp_dir = Path(self._tmp_obj.name)
+
+        if IS_WINDOWS:
+            ps_exe = os.path.join(
+                os.environ.get("SystemRoot", r"C:\Windows"),
+                "System32", "WindowsPowerShell", "v1.0", "powershell.exe",
+            )
+            if not os.path.isfile(ps_exe):
+                ps_exe = shutil.which("powershell.exe") or shutil.which("powershell") or ""
+            if ps_exe:
+                try:
+                    script_path = self._tmp_dir / "ocr_worker.ps1"
+                    script_path.write_text(_WIN_OCR_STREAM_PS, encoding="utf-8")
+                    ctypes_mod: Any = _opt_import("ctypes")
+                    if ctypes_mod is not None and hasattr(ctypes_mod, "WinDLL"):
+                        try:
+                            k32 = ctypes_mod.WinDLL("kernel32", use_last_error=True)
+                            k32.CreateJobObjectW.argtypes = [ctypes_mod.c_void_p, ctypes_mod.c_wchar_p]
+                            k32.CreateJobObjectW.restype = ctypes_mod.c_void_p
+                            k32.AssignProcessToJobObject.argtypes = [ctypes_mod.c_void_p, ctypes_mod.c_void_p]
+                            k32.AssignProcessToJobObject.restype = ctypes_mod.c_int
+                            k32.TerminateJobObject.argtypes = [ctypes_mod.c_void_p, ctypes_mod.c_uint]
+                            k32.TerminateJobObject.restype = ctypes_mod.c_int
+                            k32.CloseHandle.argtypes = [ctypes_mod.c_void_p]
+                            k32.CloseHandle.restype = ctypes_mod.c_int
+                            self._hjob = k32.CreateJobObjectW(None, None)
+                            self._k32 = k32
+                        except Exception:
+                            self._hjob = None
+                            self._k32 = None
+                    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+                    proc = subprocess.Popen(
+                        [ps_exe, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(script_path)],
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        bufsize=1,
+                        creationflags=creationflags,
+                    )
+                    self._proc = proc
+                    if self._hjob and self._k32 is not None and ctypes_mod is not None:
+                        try:
+                            ph = int(getattr(proc, "_handle", 0) or 0)
+                            if ph:
+                                self._job_attached = bool(
+                                    self._k32.AssignProcessToJobObject(self._hjob, ctypes_mod.c_void_p(ph))
+                                )
+                        except Exception:
+                            self._job_attached = False
+
+                    def _reader(stdout_pipe: Any, q: "queue.Queue[Optional[str]]") -> None:
+                        try:
+                            for raw_ln in stdout_pipe:
+                                q.put(raw_ln)
+                        except Exception:
+                            pass
+                        finally:
+                            q.put(None)
+
+                    threading.Thread(target=_reader, args=(proc.stdout, self._out_q), daemon=True).start()
+                    ready_line = self._out_q.get(timeout=15.0)
+                    if ready_line:
+                        info = json.loads(ready_line.strip())
+                        if info.get("ready"):
+                            self._mode = "winrt"
+                            return True
+                except Exception:
+                    pass
+                self._stop_proc()
+
+        tess = shutil.which("tesseract")
+        if tess:
+            self._tesseract_bin = tess
+            self._mode = "tesseract"
+            return True
+
+        self._mode = "unavailable"
+        return False
+
+    def ocr_page(self, page: Any, target_dpi: int = 180) -> list[dict[str, Any]]:
+        """Render ``page`` once and return OCR lines in PDF-point coordinates:
+        ``[{"t": line_str, "w": [(word_str, x0_pt, y0_pt, x1_pt, y1_pt), ...]}, ...]``.
+        """
+        if not self._ensure_started() or self._tmp_dir is None:
+            return []
+        dpi = _adaptive_scan_dpi(page, target_dpi=target_dpi, max_pixels=16_000_000)
+        pt_scale = 72.0 / float(dpi)
+        img_path = self._tmp_dir / "page_ocr.png"
+        try:
+            pix = page.get_pixmap(dpi=dpi, alpha=False)
+            pix.save(str(img_path))
+            del pix
+        except Exception:
+            return []
+
+        try:
+            if self._mode == "winrt" and self._proc is not None and self._proc.stdin is not None:
+                try:
+                    self._proc.stdin.write(str(img_path) + "\n")
+                    self._proc.stdin.flush()
+                    resp_line = self._out_q.get(timeout=30.0)
+                except Exception:
+                    self._stop_proc()
+                    self._mode = "unavailable"
+                    return []
+                if not resp_line:
+                    self._stop_proc()
+                    self._mode = "unavailable"
+                    return []
+                payload = json.loads(resp_line)
+                if not payload.get("ok"):
+                    return []
+                out_lines: list[dict[str, Any]] = []
+                for ln in payload.get("lines", ()):
+                    txt = (ln.get("t") or "").strip()
+                    if not txt:
+                        continue
+                    words_pt: list[tuple[str, float, float, float, float]] = []
+                    for w in ln.get("w", ()):
+                        if len(w) >= 5 and str(w[0]).strip():
+                            wx0 = float(w[1]) * pt_scale
+                            wy0 = float(w[2]) * pt_scale
+                            wx1 = (float(w[1]) + max(0.5, float(w[3]))) * pt_scale
+                            wy1 = (float(w[2]) + max(0.5, float(w[4]))) * pt_scale
+                            words_pt.append((str(w[0]), wx0, wy0, wx1, wy1))
+                    if words_pt:
+                        out_lines.append({"t": txt, "w": words_pt})
+                return out_lines
+
+            if self._mode == "tesseract" and self._tesseract_bin:
+                proc_t = _run_subprocess_job_tree(
+                    [self._tesseract_bin, str(img_path), "stdout", "--dpi", str(dpi), "tsv"],
+                    timeout=30.0,
+                )
+                if proc_t.returncode != 0:
+                    return []
+                tsv_text = proc_t.stdout.decode("utf-8", errors="replace")
+                grouped: dict[tuple[int, int, int], list[tuple[str, float, float, float, float]]] = {}
+                for row_idx, row in enumerate(tsv_text.splitlines()):
+                    if row_idx == 0 or not row.strip():
+                        continue
+                    cols = row.split("\t")
+                    if len(cols) < 12 or cols[0] != "5":
+                        continue
+                    w_str = cols[11].strip()
+                    if not w_str:
+                        continue
+                    try:
+                        conf = float(cols[10])
+                        if conf < 0:
+                            continue
+                        key = (int(cols[2]), int(cols[3]), int(cols[4]))
+                        lx = float(cols[6]) * pt_scale
+                        ly = float(cols[7]) * pt_scale
+                        lw = max(0.5, float(cols[8])) * pt_scale
+                        lh = max(0.5, float(cols[9])) * pt_scale
+                    except ValueError:
+                        continue
+                    grouped.setdefault(key, []).append((w_str, lx, ly, lx + lw, ly + lh))
+                return [
+                    {"t": " ".join(w[0] for w in ws), "w": ws}
+                    for ws in grouped.values()
+                    if ws
+                ]
+        except Exception:
+            return []
+        finally:
+            with contextlib.suppress(OSError):
+                img_path.unlink(missing_ok=True)
+        return []
+
+    def _stop_proc(self) -> None:
+        proc = self._proc
+        self._proc = None
+        if proc is not None:
+            with contextlib.suppress(Exception):
+                if proc.stdin is not None:
+                    proc.stdin.write("__QUIT__\n")
+                    proc.stdin.flush()
+                    proc.stdin.close()
+            if self._job_attached and self._hjob and self._k32 is not None:
+                with contextlib.suppress(Exception):
+                    self._k32.TerminateJobObject(self._hjob, 0)
+            with contextlib.suppress(Exception):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=2.0)
+        if self._hjob and self._k32 is not None:
+            with contextlib.suppress(Exception):
+                self._k32.CloseHandle(self._hjob)
+        self._hjob = None
+        self._k32 = None
+        self._job_attached = False
+
+    def close(self) -> None:
+        self._stop_proc()
+        if self._tmp_obj is not None:
+            with contextlib.suppress(Exception):
+                self._tmp_obj.cleanup()
+            self._tmp_obj = None
+            self._tmp_dir = None
+
+    def __enter__(self) -> "_PdfOcrSession":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.close()
+
+
+def _pdf_page_has_visual_content(page: Any, drawings: Optional[list[Any]] = None) -> bool:
+    """Return True if ``page`` has embedded images or vector paths that could depict text."""
+    try:
+        if page.get_images():
+            return True
+    except Exception:
+        pass
+    if drawings is not None:
+        return len(drawings) > 0
+    try:
+        return len(page.get_drawings()) > 0
+    except Exception:
+        return False
+
+
 def conv_pdf_to_text(src: Path, dst: Path) -> None:
     ext = dst.suffix.lstrip(".").lower()
     if BACKENDS.pymupdf:
         fitz: Any = _import_fitz()
         doc = fitz.open(str(src))
         try:
+            if getattr(doc, "needs_pass", False):
+                raise RuntimeError("PDF is password protected")
+            if len(doc) == 0:
+                raise RuntimeError("PDF has 0 pages")
             if ext in ("html", "htm"):
                 with open(dst, "w", encoding="utf-8") as out_fh:
                     out_fh.write("<!DOCTYPE html><html><head><meta charset='utf-8'></head><body>\n")
                     for idx, page in enumerate(doc):
+                        _report_subprogress(idx + 1, len(doc), f"Page {idx + 1} of {len(doc)}")
                         if idx > 0:
                             out_fh.write("\n<hr/>\n")
                         out_fh.write(page.get_text("html"))
                     out_fh.write("\n</body></html>")
                 return
-            with open(dst, "w", encoding="utf-8-sig") as out_fh:
+            wrote_any = False
+            with _PdfOcrSession() as ocr_sess, open(dst, "w", encoding="utf-8-sig") as out_fh:
                 for idx, page in enumerate(doc):
+                    _report_subprogress(idx + 1, len(doc), f"Page {idx + 1} of {len(doc)}")
+                    page_txt = (page.get_text("text") or "").strip()
+                    if not page_txt and _pdf_page_has_visual_content(page):
+                        ocr_lines = ocr_sess.ocr_page(page)
+                        if ocr_lines:
+                            ocr_sorted = sorted(
+                                ocr_lines,
+                                key=lambda ln: (round(min(w[2] for w in ln["w"]) / 4.0), min(w[1] for w in ln["w"])),
+                            )
+                            page_txt = "\n".join(ln["t"] for ln in ocr_sorted if ln["t"].strip()).strip()
                     if idx > 0:
                         out_fh.write("\n\n")
-                    out_fh.write((page.get_text("text") or "").strip())
+                    if page_txt:
+                        wrote_any = True
+                        out_fh.write(page_txt)
+            if not wrote_any:
+                dst.unlink(missing_ok=True)
+                raise RuntimeError("PDF contains no extractable or recognizable text")
             return
         finally:
             doc.close()
@@ -2420,6 +2801,8 @@ def conv_pdf_to_text(src: Path, dst: Path) -> None:
         lo_convert(src, dst)
         return
     reader = PdfReader(str(src))
+    if len(reader.pages) == 0:
+        raise RuntimeError("PDF has 0 pages")
     text = "\n".join((page.extract_text() or "") for page in reader.pages)
     if ext in ("html", "htm"):
         body = _html_mod.escape(text)
@@ -2428,6 +2811,8 @@ def conv_pdf_to_text(src: Path, dst: Path) -> None:
             encoding="utf-8",
         )
     else:
+        if not text.strip():
+            raise RuntimeError("PDF contains no extractable text")
         dst.write_text(text, encoding="utf-8-sig")
 
 
@@ -2706,34 +3091,437 @@ def _md_merge_split_markers(raw_lines: list[str], styled_lines: list[str]) -> tu
     return p_out, s_out
 
 
+_MD_DIGITS_NORM_RE = re.compile(r"\d+")
+_MD_SLASH_PAGE_RE = re.compile(r"^\d{1,4}\s*/\s*\d{1,4}$")
+_MD_OCR_SUBBULLET_RE = re.compile(r"^o\s+(?=[A-Z0-9*\"'`(\[])")
+_MD_SECTION_START_RE = re.compile(
+    r"^(?:User prompt:|Response:|Part\s+\d+|Slide\s+\d+|Step\s+\d+|Table\s+[IVX0-9]+|Abstract\b|References\b)",
+    re.I,
+)
+
+
+def _md_blocks_have_text(blocks: Sequence[dict[str, Any]]) -> bool:
+    return any(
+        sp.get("text", "").strip()
+        for b in blocks
+        for ln in b.get("lines", ())
+        for sp in ln.get("spans", ())
+    )
+
+
+def _dedup_sorted_coords(vals: Sequence[float], tol: float = 4.0) -> list[float]:
+    if not vals:
+        return []
+    out: list[float] = []
+    cur_sum = 0.0
+    cur_cnt = 0
+    last_v = 0.0
+    for v in sorted(vals):
+        if cur_cnt == 0 or (v - last_v) <= tol:
+            cur_sum += v
+            cur_cnt += 1
+            last_v = v
+        else:
+            out.append(cur_sum / cur_cnt)
+            cur_sum = v
+            cur_cnt = 1
+            last_v = v
+    if cur_cnt:
+        out.append(cur_sum / cur_cnt)
+    return out
+
+
+def _ocr_vector_tables(
+    drawings: Sequence[dict[str, Any]],
+    pw: float,
+    ph: float,
+    ocr_lines: Sequence[dict[str, Any]],
+) -> list[tuple[tuple[float, float, float, float], str]]:
+    """Reconstruct bordered Markdown tables on vector-outlined/OCR pages in O(N) without PyMuPDF glyph stalls."""
+    if not drawings or not ocr_lines:
+        return []
+    big_rects: list[tuple[float, float, float, float]] = []
+    for d in drawings:
+        r = d.get("rect")
+        if r is None:
+            continue
+        w, h = float(r.width), float(r.height)
+        if w > pw * 0.92 and h > ph * 0.90:
+            continue
+        if w > 24.0 or h > 14.0:
+            big_rects.append((float(r.x0), float(r.y0), float(r.x1), float(r.y1)))
+            if len(big_rects) >= 4000:
+                break
+    if len(big_rects) < 4:
+        return []
+
+    pad = 4.0
+    clusters: list[tuple[list[float], list[tuple[float, float, float, float]]]] = []
+    for rx0, ry0, rx1, ry1 in sorted(big_rects, key=lambda it: (it[1], it[0])):
+        hit_idx: Optional[int] = None
+        for idx, (cb, items) in enumerate(clusters):
+            if not (rx1 + pad < cb[0] or rx0 - pad > cb[2] or ry1 + pad < cb[1] or ry0 - pad > cb[3]):
+                if hit_idx is None:
+                    cb[0], cb[1] = min(cb[0], rx0), min(cb[1], ry0)
+                    cb[2], cb[3] = max(cb[2], rx1), max(cb[3], ry1)
+                    items.append((rx0, ry0, rx1, ry1))
+                    hit_idx = idx
+                else:
+                    hb, hitems = clusters[hit_idx]
+                    hb[0], hb[1] = min(hb[0], cb[0]), min(hb[1], cb[1])
+                    hb[2], hb[3] = max(hb[2], cb[2]), max(hb[3], cb[3])
+                    hitems.extend(items)
+                    cb[0], cb[1], cb[2], cb[3] = 1e9, 1e9, -1e9, -1e9
+                    items.clear()
+        if hit_idx is None:
+            clusters.append(([rx0, ry0, rx1, ry1], [(rx0, ry0, rx1, ry1)]))
+
+    all_words: list[tuple[str, float, float, float, float]] = [
+        w for ln in ocr_lines for w in ln.get("w", ())
+    ]
+    if not all_words:
+        return []
+
+    tables_out: list[tuple[tuple[float, float, float, float], str]] = []
+    for cb, items in clusters:
+        if len(items) < 4:
+            continue
+        cw = cb[2] - cb[0]
+        ch = cb[3] - cb[1]
+        if cw < 80.0 or ch < 24.0:
+            continue
+        raw_ys: list[float] = []
+        raw_xs: list[float] = []
+        for x0, y0, x1, y1 in items:
+            rw, rh = x1 - x0, y1 - y0
+            if rh <= 3.5 and rw >= 24.0:
+                raw_ys.append((y0 + y1) * 0.5)
+            elif rw >= max(40.0, cw * 0.45) and rh >= 12.0:
+                raw_ys.append(y0)
+                raw_ys.append(y1)
+            if rw <= 3.5 and rh >= 12.0:
+                raw_xs.append((x0 + x1) * 0.5)
+            elif 20.0 <= rw <= cw * 0.92 and rh >= 12.0:
+                raw_xs.append(x0)
+                raw_xs.append(x1)
+        ys = _dedup_sorted_coords(raw_ys, tol=4.0)
+        xs = _dedup_sorted_coords(raw_xs, tol=5.0)
+        if len(ys) < 3 or len(xs) < 3:
+            continue
+        n_rows = len(ys) - 1
+        n_cols = len(xs) - 1
+        if n_rows > 120 or n_cols > 20:
+            continue
+
+        grid: list[list[list[tuple[float, float, str]]]] = [
+            [[] for _ in range(n_cols)] for _ in range(n_rows)
+        ]
+        tx0, ty0, tx1, ty1 = xs[0], ys[0], xs[-1], ys[-1]
+        for wtxt, wx0, wy0, wx1, wy1 in all_words:
+            wmx = (wx0 + wx1) * 0.5
+            wmy = (wy0 + wy1) * 0.5
+            if wmx < tx0 - 4.0 or wmx > tx1 + 4.0 or wmy < ty0 - 4.0 or wmy > ty1 + 4.0:
+                continue
+            r_hit = -1
+            for ri in range(n_rows):
+                if (ys[ri] - (4.0 if ri == 0 else 0.5)) <= wmy <= (ys[ri + 1] + (4.0 if ri == n_rows - 1 else 0.5)):
+                    r_hit = ri
+                    break
+            c_hit = -1
+            for ci in range(n_cols):
+                if (xs[ci] - (4.0 if ci == 0 else 0.5)) <= wmx <= (xs[ci + 1] + (4.0 if ci == n_cols - 1 else 0.5)):
+                    c_hit = ci
+                    break
+            if r_hit >= 0 and c_hit >= 0:
+                grid[r_hit][c_hit].append((wy0, wx0, wtxt))
+
+        rows_str: list[list[str]] = []
+        for ri in range(n_rows):
+            row_cells: list[str] = []
+            for ci in range(n_cols):
+                cell_words = grid[ri][ci]
+                if not cell_words:
+                    row_cells.append("")
+                else:
+                    cell_words.sort(key=lambda it: (round(it[0] / 4.0), it[1]))
+                    txt = _MD_WS_COLLAPSE_RE.sub(" ", " ".join(w[2] for w in cell_words)).strip().replace("|", "\\|")
+                    row_cells.append(txt)
+            if any(row_cells):
+                rows_str.append(row_cells)
+
+        if len(rows_str) < 2:
+            continue
+        non_empty = [sum(1 for c in row if c) for row in rows_str]
+        if sum(1 for k in non_empty if k >= 2) < 2 or sum(non_empty) < (len(rows_str) * n_cols) * 0.45:
+            continue
+        hdr = "| " + " | ".join(rows_str[0]) + " |"
+        sep = "| " + " | ".join("---" for _ in rows_str[0]) + " |"
+        body = ["| " + " | ".join(r) + " |" for r in rows_str[1:]]
+        tables_out.append(((tx0, ty0, tx1, ty1), "\n".join([hdr, sep, *body])))
+
+    return tables_out
+
+
+def _ocr_margin_norm_key(text: str) -> str:
+    return _MD_DIGITS_NORM_RE.sub("#", _MD_WS_COLLAPSE_RE.sub(" ", text).strip().lower())
+
+
+def _is_extreme_margin_bbox(ly0: float, ly1: float, ph: float) -> bool:
+    return ph > 0 and (ly1 <= ph * 0.052 or ly0 >= ph * 0.935)
+
+
+def _ocr_line_geometry(ln: dict[str, Any]) -> Optional[tuple[float, float, float, float, str, float]]:
+    words = ln.get("w", ())
+    txt = (ln.get("t") or "").strip()
+    if not words or not txt:
+        return None
+    lx0 = min(w[1] for w in words)
+    ly0 = min(w[2] for w in words)
+    lx1 = max(w[3] for w in words)
+    ly1 = max(w[4] for w in words)
+    alpha_heights = sorted(
+        max(1.0, w[4] - w[2])
+        for w in words
+        if any(ch.isalnum() for ch in w[0])
+    )
+    if alpha_heights:
+        dom_sz = alpha_heights[len(alpha_heights) // 2]
+    else:
+        dom_sz = max(1.0, ly1 - ly0)
+    return (lx0, ly0, lx1, ly1, txt, round(dom_sz, 1))
+
+
+_MD_SOLO_OCR_MARKER_RE = re.compile(r"^(?:[•◦▪▫●○■□–—*-]|\d{1,3}[.)])$")
+
+
+def _ocr_lines_to_blocks(
+    ocr_lines: Sequence[dict[str, Any]],
+    tbl_boxes: Sequence[tuple[float, float, float, float]],
+    ph: float,
+    repeated_margins: set[str],
+) -> list[dict[str, Any]]:
+    """Group OCR lines into PyMuPDF-compatible text block dicts for structured Markdown formatting."""
+    raw_parsed: list[tuple[float, float, float, float, str, float]] = []
+    for ln in ocr_lines:
+        geom = _ocr_line_geometry(ln)
+        if geom is None:
+            continue
+        lx0, ly0, lx1, ly1, txt, sz = geom
+        if any(_md_overlap((lx0, ly0, lx1, ly1), tb) >= 0.5 for tb in tbl_boxes):
+            continue
+        if _is_extreme_margin_bbox(ly0, ly1, ph):
+            if _MD_SLASH_PAGE_RE.match(txt) or _ocr_margin_norm_key(txt) in repeated_margins:
+                continue
+        elif (ly0 >= ph * 0.90 or ly1 <= ph * 0.08) and _MD_SLASH_PAGE_RE.match(txt):
+            continue
+        raw_parsed.append(geom)
+
+    if not raw_parsed:
+        return []
+
+    raw_parsed.sort(key=lambda g: (round(g[1] / 5.0), g[0]))
+
+    # Merge detached solo bullets/numbers ('•', '1.') with the text line sitting to their right on the same row
+    parsed: list[tuple[float, float, float, float, str, float]] = []
+    idx_p = 0
+    while idx_p < len(raw_parsed):
+        cx0, cy0, cx1, cy1, ctxt, csz = raw_parsed[idx_p]
+        if _MD_SOLO_OCR_MARKER_RE.match(ctxt) and (idx_p + 1) < len(raw_parsed):
+            nx0, ny0, nx1, ny1, ntxt, nsz = raw_parsed[idx_p + 1]
+            nh = max(4.0, ny1 - ny0)
+            cur_ymid = (cy0 + cy1) * 0.5
+            if nx0 >= cx0 and (ny0 - nh * 0.6) <= cur_ymid <= (ny1 + nh * 0.6):
+                marker = "•" if ctxt in ("*", "-", "–", "—") else ctxt
+                parsed.append((cx0, min(cy0, ny0), nx1, max(cy1, ny1), f"{marker} {ntxt}", nsz))
+                idx_p += 2
+                continue
+        if _MD_SOLO_OCR_MARKER_RE.match(ctxt) and len(ctxt) == 1 and ctxt not in "0123456789":
+            # Drop stray isolated noise dot that had no text beside it
+            idx_p += 1
+            continue
+        parsed.append((cx0, cy0, cx1, cy1, ctxt, csz))
+        idx_p += 1
+
+    if not parsed:
+        return []
+
+    base_x0 = min(g[0] for g in parsed)
+    blocks: list[dict[str, Any]] = []
+    cur_lines: list[tuple[float, float, float, float, str, float]] = []
+
+    def _flush_cur() -> None:
+        if not cur_lines:
+            return
+        bx0 = min(x[0] for x in cur_lines)
+        by0 = min(x[1] for x in cur_lines)
+        bx1 = max(x[2] for x in cur_lines)
+        by1 = max(x[3] for x in cur_lines)
+        blocks.append({
+            "type": 0,
+            "bbox": (bx0, by0, bx1, by1),
+            "lines": [
+                {
+                    "bbox": (lx0, ly0, lx1, ly1),
+                    "spans": [{"text": ltxt, "size": lsz, "font": "OCR", "flags": 0}],
+                }
+                for lx0, ly0, lx1, ly1, ltxt, lsz in cur_lines
+            ],
+        })
+        cur_lines.clear()
+
+    for lx0, ly0, lx1, ly1, txt, sz in parsed:
+        if lx0 > base_x0 + 18.0 and _MD_OCR_SUBBULLET_RE.match(txt):
+            txt = "◦ " + txt[1:].lstrip()
+        is_list_start = bool(_MD_BULLET_RE.match(txt) or _MD_NUM_RE.match(txt) or _MD_REF_RE.match(txt))
+        if not cur_lines:
+            cur_lines.append((lx0, ly0, lx1, ly1, txt, sz))
+            continue
+        px0, py0, px1, py1, ptxt, psz = cur_lines[-1]
+        bx0 = cur_lines[0][0]
+        max_w = max(x[2] - x[0] for x in cur_lines)
+        v_gap = ly0 - py1
+        ref_h = max(py1 - py0, ly1 - ly0, 4.0)
+        size_diff = abs(sz - psz) / max(sz, psz, 1.0)
+        first_ch = txt[:1]
+        is_wrapped_continuation = (
+            not is_list_start
+            and _MD_SECTION_START_RE.match(txt) is None
+            and 0.0 <= v_gap <= ref_h * 0.80
+            and abs(lx0 - bx0) <= 34.0
+            and size_diff <= 0.32
+            and (first_ch.islower() or first_ch in "([\"'" or not ptxt.rstrip().endswith((".", ":", "?", "!")))
+        )
+        if is_wrapped_continuation:
+            new_block = False
+        else:
+            new_block = (
+                v_gap > ref_h * 0.75
+                or v_gap < -ref_h * 0.45
+                or lx0 > px1 + 18.0
+                or abs(lx0 - bx0) > 34.0
+                or size_diff > 0.30
+                or is_list_start
+                or _MD_SECTION_START_RE.match(txt) is not None
+                or (max_w > 180.0 and (px1 - bx0) < max_w * 0.65 and first_ch.isupper())
+            )
+        if new_block:
+            _flush_cur()
+        cur_lines.append((lx0, ly0, lx1, ly1, txt, sz))
+
+    _flush_cur()
+    return blocks
+
+
+def _compute_tiers_from_counts(
+    size_counts: Counter[float], default_body: float = 11.0, min_ratio: float = 1.28
+) -> tuple[float, list[float]]:
+    body_size = size_counts.most_common(1)[0][0] if size_counts else default_body
+    large = sorted((sz for sz, cnt in size_counts.items() if sz >= body_size * min_ratio and cnt >= 3), reverse=True)
+    tiers: list[float] = []
+    for sz in large:
+        if not tiers or abs(tiers[-1] - sz) > max(1.0, body_size * 0.14):
+            tiers.append(sz)
+    return body_size, tiers[:4]
+
+
 def conv_pdf_to_md_structured(src: Path, dst: Path) -> None:
-    """Convert PDF to clean structured GitHub-Flavored Markdown via PyMuPDF."""
+    """Convert PDF to clean structured GitHub-Flavored Markdown via PyMuPDF + built-in OCR fallback."""
     fitz: Any = _import_fitz()
     doc = fitz.open(str(src))
     try:
         if doc.needs_pass:
             raise RuntimeError("PDF is password protected")
+        if len(doc) == 0:
+            raise RuntimeError("PDF has 0 pages")
         text_flags = getattr(fitz, "TEXTFLAGS_DICT", 0) & ~getattr(fitz, "TEXT_PRESERVE_IMAGES", 0)
         body_size, tiers, doc_words, cached_blocks = _md_analyze_typography(doc, text_flags=text_flags)
-        items_all: list[tuple[str, str]] = []
-        pending_code: list[str] = []
+
+        ocr_pages_raw: dict[int, tuple[float, float, list[dict[str, Any]], list[tuple[tuple[float, float, float, float], str]]]] = {}
+        margin_page_hits: Counter[str] = Counter()
+        ocr_size_counts: Counter[float] = Counter()
 
         n_analyze_done = min(len(doc), 60)
         total_md_steps = max(1, n_analyze_done + len(doc))
+
+        # Pass 1 for textless visual pages (zero cost on normal digital PDFs)
+        with _PdfOcrSession() as ocr_sess:
+            for page_idx, page in enumerate(doc):
+                blocks_probe = cached_blocks.get(page_idx)
+                if blocks_probe is None:
+                    pdict_p = page.get_text("dict", flags=text_flags) if text_flags else page.get_text("dict")
+                    blocks_probe = [b for b in pdict_p.get("blocks", ()) if b.get("type") == 0]
+                    cached_blocks[page_idx] = blocks_probe
+                if _md_blocks_have_text(blocks_probe):
+                    continue
+                try:
+                    p_drawings = page.get_drawings()
+                except Exception:
+                    p_drawings = []
+                if not _pdf_page_has_visual_content(page, drawings=p_drawings):
+                    continue
+                _report_subprogress(
+                    n_analyze_done + min(page_idx + 1, max(1, len(doc) - 1)),
+                    total_md_steps,
+                    f"OCR page {page_idx + 1} of {len(doc)}",
+                )
+                ocr_lines = ocr_sess.ocr_page(page)
+                if not ocr_lines:
+                    continue
+                pw_p, ph_p = float(page.rect.width), float(page.rect.height)
+                vec_tables = _ocr_vector_tables(p_drawings, pw_p, ph_p, ocr_lines)
+                ocr_pages_raw[page_idx] = (pw_p, ph_p, ocr_lines, vec_tables)
+                seen_margin_keys: set[str] = set()
+                tbl_b_tmp = [tb for tb, _ in vec_tables]
+                for oln in ocr_lines:
+                    geom = _ocr_line_geometry(oln)
+                    if geom is None:
+                        continue
+                    lx0, ly0, lx1, ly1, ltxt, lsz = geom
+                    if _is_extreme_margin_bbox(ly0, ly1, ph_p):
+                        mkey = _ocr_margin_norm_key(ltxt)
+                        if mkey and mkey not in seen_margin_keys:
+                            seen_margin_keys.add(mkey)
+                            margin_page_hits[mkey] += 1
+                        continue
+                    if any(_md_overlap((lx0, ly0, lx1, ly1), tb) >= 0.5 for tb in tbl_b_tmp):
+                        continue
+                    if len(ocr_pages_raw) <= 60:
+                        ocr_size_counts[lsz] += len(ltxt)
+                    for w_match in _MD_WORD_RE.findall(ltxt):
+                        doc_words.add(w_match.lower())
+
+        min_repeat_pages = 3 if len(doc) >= 3 else 999999
+        repeated_margins = {k for k, cnt in margin_page_hits.items() if cnt >= min_repeat_pages}
+        ocr_body_size, ocr_tiers = _compute_tiers_from_counts(ocr_size_counts, default_body=6.4)
+
+        items_all: list[tuple[str, str]] = []
+        pending_code: list[str] = []
+
         for page_idx, page in enumerate(doc):
             _report_subprogress(n_analyze_done + page_idx + 1, total_md_steps, f"Page {page_idx + 1} of {len(doc)}")
-            ph = page.rect.height
-            try:
-                page_drawings = page.get_drawings()
-            except Exception:
-                page_drawings = []
-            diag_boxes = _md_diagram_boxes(page, drawings=page_drawings)
-            tables = _md_real_tables(page) if len(page_drawings) <= 2500 else []
-            tbl_boxes = [tb for tb, _ in tables]
-            blocks = cached_blocks.pop(page_idx, None)
-            if blocks is None:
-                pdict = page.get_text("dict", flags=text_flags) if text_flags else page.get_text("dict")
-                blocks = [b for b in pdict.get("blocks", ()) if b.get("type") == 0]
+            ph = float(page.rect.height)
+            ocr_entry = ocr_pages_raw.pop(page_idx, None)
+            if ocr_entry is not None:
+                _pw_o, ph_o, ocr_lines_p, tables = ocr_entry
+                diag_boxes: list[tuple[float, float, float, float]] = []
+                tbl_boxes = [tb for tb, _ in tables]
+                blocks = _ocr_lines_to_blocks(ocr_lines_p, tbl_boxes, ph_o, repeated_margins)
+                cur_body_size, cur_tiers = ocr_body_size, ocr_tiers
+                cached_blocks.pop(page_idx, None)
+            else:
+                try:
+                    page_drawings = page.get_drawings()
+                except Exception:
+                    page_drawings = []
+                diag_boxes = _md_diagram_boxes(page, drawings=page_drawings)
+                tables = _md_real_tables(page) if len(page_drawings) <= 2500 else []
+                tbl_boxes = [tb for tb, _ in tables]
+                blocks = cached_blocks.pop(page_idx, None)
+                if blocks is None:
+                    pdict = page.get_text("dict", flags=text_flags) if text_flags else page.get_text("dict")
+                    blocks = [b for b in pdict.get("blocks", ()) if b.get("type") == 0]
+                cur_body_size, cur_tiers = body_size, tiers
+
             blocks.sort(key=lambda b: (round(b["bbox"][1] / 5.0), b["bbox"][0]))
 
             page_items: list[tuple[float, str, str]] = [(tb[1], "table", md) for tb, md in tables]
@@ -2750,7 +3538,9 @@ def conv_pdf_to_md_structured(src: Path, dst: Path) -> None:
                 plain = " ".join(raw_lines).strip()
                 if not plain:
                     continue
-                if (bbox[1] > ph * 0.87 or bbox[3] < ph * 0.08) and _MD_PAGE_NUM_RE.fullmatch(plain):
+                if (bbox[1] > ph * 0.87 or bbox[3] < ph * 0.08) and (
+                    _MD_PAGE_NUM_RE.fullmatch(plain) or _MD_SLASH_PAGE_RE.fullmatch(plain)
+                ):
                     continue
                 size_hist: dict[float, int] = {}
                 for sp in spans:
@@ -2761,7 +3551,7 @@ def conv_pdf_to_md_structured(src: Path, dst: Path) -> None:
                 has_sym = any(_md_is_sym(sp["font"]) for sp in spans)
                 all_mono = all(_md_is_mono(sp["font"]) for sp in spans)
 
-                if dom_size < body_size * 0.85 and any(_md_overlap(bbox, db, pad=28.0) >= 0.5 for db in diag_boxes):
+                if dom_size < cur_body_size * 0.85 and any(_md_overlap(bbox, db, pad=28.0) >= 0.5 for db in diag_boxes):
                     continue
 
                 if all_mono:
@@ -2780,7 +3570,20 @@ def conv_pdf_to_md_structured(src: Path, dst: Path) -> None:
                     page_items.append((bbox[1], "code", f"```{lang}\n{body}\n```"))
                     continue
 
-                h_lvl = _md_heading_level(dom_size, body_size, tiers, dom_bold, has_sym, plain, len(raw_lines))
+                if ocr_entry is not None:
+                    first_plain_ch = plain[:1]
+                    if (
+                        dom_size < cur_body_size * 1.28
+                        or first_plain_ch.islower()
+                        or first_plain_ch in "•◦▪▫●○■□([-\"'"
+                        or (plain.endswith(".") and not _MD_NUM_PREFIX_RE.match(plain))
+                        or len(plain) > 100
+                    ):
+                        h_lvl = 0
+                    else:
+                        h_lvl = _md_heading_level(dom_size, cur_body_size, cur_tiers, dom_bold, has_sym, plain, len(raw_lines))
+                else:
+                    h_lvl = _md_heading_level(dom_size, cur_body_size, cur_tiers, dom_bold, has_sym, plain, len(raw_lines))
                 if h_lvl:
                     page_items.append((bbox[1], "h", f"{'#' * h_lvl} {_md_clean_text(_md_join_lines(raw_lines, doc_words)).strip()}"))
                     continue
@@ -2830,16 +3633,12 @@ def conv_pdf_to_md_structured(src: Path, dst: Path) -> None:
             items_all.append(("code", "```\n" + "\n\n".join(pending_code) + "\n```"))
             pending_code.clear()
 
+        non_empty_pieces = [val.strip() for _k, val in items_all if val.strip()]
+        if not non_empty_pieces:
+            raise RuntimeError("PDF contains no extractable or recognizable text")
+
         with open(dst, "w", encoding="utf-8") as wfh:
-            first_item = True
-            for _k, val in items_all:
-                piece = val.strip()
-                if not piece:
-                    continue
-                if not first_item:
-                    wfh.write("\n\n")
-                first_item = False
-                wfh.write(piece)
+            wfh.write("\n\n".join(non_empty_pieces))
             wfh.write("\n")
     finally:
         doc.close()
