@@ -716,7 +716,10 @@ def _run_subprocess_job_tree(args: list[str], timeout: float) -> subprocess.Comp
         except subprocess.TimeoutExpired:
             try:
                 import signal
-                os.killpg(posix_proc.pid, getattr(signal, "SIGKILL", 9))
+                killpg: Any = getattr(os, "killpg", None)
+                if killpg is None:
+                    raise OSError("killpg unavailable")
+                killpg(posix_proc.pid, getattr(signal, "SIGKILL", 9))
             except Exception:
                 posix_proc.kill()
             posix_proc.communicate()
