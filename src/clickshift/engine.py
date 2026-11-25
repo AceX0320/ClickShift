@@ -1252,9 +1252,13 @@ def conv_office_com(src: Path, dst: Path) -> None:
     ext = dst.suffix.lstrip(".").lower()
     if ext not in _OFFICE_ALLOWED_DST:
         raise RuntimeError(f"Unsupported Office COM target extension: .{ext}")
-    if src.suffix.lstrip(".").lower() in OFFICE_SHEET_IN and ext in ("xlsx", "pdf", "csv", "xls"):
-        app_name = "excel"
-    elif src.suffix.lstrip(".").lower() in OFFICE_SLIDE_IN and ext in ("pptx", "pdf", "ppt", "odp"):
+    s_in = src.suffix.lstrip(".").lower()
+    if s_in in ((OFFICE_SHEET_IN - {"txt"}) | {"tsv"}) and ext in ("xlsx", "pdf", "csv", "xls"):
+        if "excel" in BACKENDS.office_app or s_in not in ("csv", "tsv") or ext != "pdf":
+            app_name = "excel"
+        else:
+            app_name = "word"
+    elif s_in in OFFICE_SLIDE_IN and ext in ("pptx", "pdf", "ppt", "odp"):
         app_name = "powerpoint"
     else:
         app_name = "word"
@@ -1656,6 +1660,17 @@ def _read_text_auto(path: Path) -> tuple[str, str]:
         return raw.decode("utf-8", errors="replace"), "utf-8"
 
 
+def _stream_tell_bytes(rfh: Any, fallback_pos: int, max_bytes: int) -> int:
+    """Return accurate byte offset of a text reader (handling UTF-16 and multi-byte UTF-8)."""
+    buf = getattr(rfh, "buffer", None)
+    if buf is not None:
+        try:
+            return min(max_bytes, max(0, int(buf.tell())))
+        except Exception:
+            pass
+    return min(max_bytes, max(0, fallback_pos))
+
+
 def conv_text_generic(src: Path, dst: Path) -> None:
     ext = dst.suffix.lstrip(".").lower()
     if ext not in TEXT_EXTS:
@@ -1679,7 +1694,7 @@ def conv_text_generic(src: Path, dst: Path) -> None:
 
     enc = _detect_text_encoding(src)
     chunk_chars = 1024 * 1024
-    done_bytes = 0
+    done_chars = 0
     with open(src, "r", encoding=enc, errors="replace") as rfh:
         if ext in ("html", "htm"):
             with open(dst, "w", encoding="utf-8") as wfh:
@@ -1692,7 +1707,8 @@ def conv_text_generic(src: Path, dst: Path) -> None:
                     if not chunk:
                         break
                     wfh.write(_html_mod.escape(chunk))
-                    done_bytes = min(src_size, done_bytes + len(chunk))
+                    done_chars += len(chunk)
+                    done_bytes = _stream_tell_bytes(rfh, done_chars, src_size)
                     _report_subprogress(done_bytes, max(1, src_size), "Streaming HTML")
                 wfh.write("</pre></body></html>")
         else:
@@ -1702,7 +1718,8 @@ def conv_text_generic(src: Path, dst: Path) -> None:
                     if not chunk:
                         break
                     wfh.write(chunk)
-                    done_bytes = min(src_size, done_bytes + len(chunk))
+                    done_chars += len(chunk)
+                    done_bytes = _stream_tell_bytes(rfh, done_chars, src_size)
                     _report_subprogress(done_bytes, max(1, src_size), "Streaming text")
 
 
@@ -1841,7 +1858,8 @@ def _stream_large_text_to_docx(src: Path, dst: Path, enc: str, md: bool) -> None
                     raw_doc.write("".join(wbuf).encode("utf-8"))
                     wbuf.clear()
                     wbuf_chars = 0
-                    _report_subprogress(min(total_bytes, seen_chars), total_bytes, "Streaming DOCX")
+                    done_bytes = _stream_tell_bytes(rfh, seen_chars, total_bytes)
+                    _report_subprogress(done_bytes, total_bytes, "Streaming DOCX")
             wbuf.append("</w:body></w:document>")
             raw_doc.write("".join(wbuf).encode("utf-8"))
 
@@ -2698,6 +2716,7 @@ def conv_pdf_to_md_structured(src: Path, dst: Path) -> None:
         text_flags = getattr(fitz, "TEXTFLAGS_DICT", 0) & ~getattr(fitz, "TEXT_PRESERVE_IMAGES", 0)
         body_size, tiers, doc_words, cached_blocks = _md_analyze_typography(doc, text_flags=text_flags)
         items_all: list[tuple[str, str]] = []
+        pending_code: list[str] = []
 
         n_analyze_done = min(len(doc), 60)
         total_md_steps = max(1, n_analyze_done + len(doc))
@@ -2800,21 +2819,21 @@ def conv_pdf_to_md_structured(src: Path, dst: Path) -> None:
 
             page_items.sort(key=lambda it: it[0])
             for _y0, kind, md in page_items:
-                if (
-                    kind == "code" and items_all and items_all[-1][0] == "code_parts"
-                    and md.startswith("```\n")
-                ):
-                    items_all[-1][1].append(md[4:-4])  # type: ignore[attr-defined]
-                elif kind == "code" and md.startswith("```\n"):
-                    items_all.append(("code_parts", [md[4:-4]]))  # type: ignore[arg-type]
+                if kind == "code" and md.startswith("```\n"):
+                    pending_code.append(md[4:-4])
                 else:
+                    if pending_code:
+                        items_all.append(("code", "```\n" + "\n\n".join(pending_code) + "\n```"))
+                        pending_code.clear()
                     items_all.append((kind, md))
+        if pending_code:
+            items_all.append(("code", "```\n" + "\n\n".join(pending_code) + "\n```"))
+            pending_code.clear()
 
         with open(dst, "w", encoding="utf-8") as wfh:
             first_item = True
-            for k, val in items_all:
-                piece = ("```\n" + "\n\n".join(val) + "\n```") if k == "code_parts" else str(val)
-                piece = piece.strip()
+            for _k, val in items_all:
+                piece = val.strip()
                 if not piece:
                     continue
                 if not first_item:
@@ -4984,6 +5003,9 @@ def _routes_for(src_ext: str, dst_ext: str) -> list[Route]:
     def _has_word() -> bool:
         return IS_WINDOWS and "word" in _b("office_app")
 
+    def _has_excel() -> bool:
+        return IS_WINDOWS and "excel" in _b("office_app")
+
     def _has_ppt() -> bool:
         return IS_WINDOWS and "powerpoint" in _b("office_app")
 
@@ -5114,12 +5136,19 @@ def _routes_for(src_ext: str, dst_ext: str) -> list[Route]:
         if _has_office():
             add("office-com", conv_office_com, 100)
         add("libreoffice", conv_libreoffice, 70)
-    elif s in OFFICE_DOC_IN | OFFICE_SHEET_IN and d == "pdf":
-        if _has_office():
-            add("office-com", conv_office_com, 100)
-        add("libreoffice", conv_libreoffice, 70)
-        if s == "docx" and _b("python_docx") and _b("pymupdf"):
-            add("python-docx-pymupdf-pdf", conv_docx_to_pdf, 45)
+    elif s in (OFFICE_DOC_IN | OFFICE_SHEET_IN | {"tsv"}) and d == "pdf":
+        if s in ((OFFICE_SHEET_IN - {"txt"}) | {"tsv"}):
+            if _has_excel():
+                add("office-com", conv_office_com, 100)
+            add("libreoffice", conv_libreoffice, 70)
+            if s in ("csv", "tsv") and _has_word() and not _has_excel():
+                add("office-com", conv_office_com, 55)
+        else:
+            if _has_office():
+                add("office-com", conv_office_com, 100)
+            add("libreoffice", conv_libreoffice, 70)
+            if s == "docx" and _b("python_docx") and _b("pymupdf"):
+                add("python-docx-pymupdf-pdf", conv_docx_to_pdf, 45)
     elif s in OFFICE_DOC_IN and d in ("docx", "odt", "rtf", "html"):
         if _has_office():
             add("office-com", conv_office_com, 100)
@@ -5392,19 +5421,15 @@ class ConversionEngine:
                         r.fn(src, base)
                     else:
                         # Stage to a hidden same-volume .tmp file and atomically replace base on completion
-                        try:
-                            stage_cand = base.parent / f".~clickshift-{uuid.uuid4().hex[:10]}{base.suffix}"
-                            stage_file = stage_cand
-                            r.fn(src, stage_cand)
-                            if stage_cand.exists():
+                        stage_cand = base.parent / f".~clickshift-{uuid.uuid4().hex[:10]}{base.suffix}"
+                        stage_file = stage_cand
+                        r.fn(src, stage_cand)
+                        if stage_cand.exists():
+                            try:
                                 os.replace(str(stage_cand), str(base))
-                                stage_file = None
-                        except OSError as os_exc:
-                            if stage_file is not None and not stage_file.exists() and not base.exists():
-                                stage_file = None
-                                r.fn(src, base)
-                            else:
-                                raise os_exc
+                            except OSError:
+                                shutil.move(str(stage_cand), str(base))
+                            stage_file = None
                     now = time.perf_counter()
                     ms = (now - t0) * 1000
                     att_ms = (now - ta) * 1000

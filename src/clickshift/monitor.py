@@ -1801,7 +1801,7 @@ class DaemonIPCServer(threading.Thread):
         wfile.write(json.dumps({"type": "ack", "job_id": job_id, "pid": os.getpid()}) + "\n")
         wfile.flush()
         sent_idx = 0
-        last_step_seq = -1
+        last_step_seq = 0
         while True:
             to_send: list[dict[str, Any]] = []
             step_frame: Optional[dict[str, Any]] = None
@@ -1821,9 +1821,11 @@ class DaemonIPCServer(threading.Thread):
                     ):
                         to_send.append({"type": "heartbeat", "job_id": job_id, "ts": time.time()})
                         break
-                if int(job_state["step_seq"]) != last_step_seq and job_state.get("last_step") is not None:
-                    last_step_seq = int(job_state["step_seq"])
-                    step_frame = dict(job_state["last_step"])
+                cur_step_seq = int(job_state["step_seq"])
+                if cur_step_seq != last_step_seq:
+                    last_step_seq = cur_step_seq
+                    if job_state.get("last_step") is not None:
+                        step_frame = dict(job_state["last_step"])
                 if sent_idx < len(events):
                     to_send.extend(events[sent_idx:])
                     sent_idx = len(events)
@@ -1924,12 +1926,22 @@ class DaemonIPCServer(threading.Thread):
                                 eng.convert_many(jobs, progress=on_done)
                     except Exception as w_exc:
                         _log(f"ipc job worker error: {w_exc}")
+                        raw_jobs = req.get("jobs") or []
+                        raw_files = req.get("files") or []
                         with cond:
-                            missing = max(0, expected_total - len(job_state["events"]))
-                            for _ in range(missing):
+                            start_idx = len(job_state["events"])
+                            for m_idx in range(start_idx, expected_total):
+                                if action == "combine_images":
+                                    src_err = str(raw_files[0]) if raw_files else ""
+                                    dst_err = str(req.get("target") or "pdf")
+                                elif m_idx < len(raw_jobs):
+                                    src_err = str(raw_jobs[m_idx][0])
+                                    dst_err = str(raw_jobs[m_idx][1])
+                                else:
+                                    src_err, dst_err = "", ""
                                 err_res = ConversionResult(
-                                    source="",
-                                    target="",
+                                    source=src_err,
+                                    target=dst_err,
                                     backend="-",
                                     elapsed_ms=0.0,
                                     ok=False,

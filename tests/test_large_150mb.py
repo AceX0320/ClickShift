@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-os.environ.setdefault("CLICKSHIFT_HOME", str(Path(__file__).parent / "_tmp_home_150"))
+os.environ.setdefault("CLICKSHIFT_HOME", str(Path(__file__).parent / "_tmp_home"))
 
 from clickshift import cli, debuglog, engine, learning, monitor, updater  # noqa: E402
 from clickshift.formats import ConversionResult  # noqa: E402
@@ -604,4 +604,97 @@ def test_multipage_pdf_html_text_mode_md_streaming_and_subprocess_job_timeout(tm
     # 3. _run_subprocess_job_tree cleanly terminates timed-out child trees
     with pytest.raises(engine.subprocess.TimeoutExpired):
         engine._run_subprocess_job_tree([sys.executable, "-c", "import time; time.sleep(10)"], timeout=0.2)
+
+
+def test_audit_regressions_ipc_zero_step_heartbeats_oserror_single_try_csv_pdf_and_utf16_progress(tmp_path, monkeypatch):
+    # 1. IPC emits real heartbeat frames even when step_seq stays 0 (zero step_progress callbacks)
+    monkeypatch.setattr(monitor, "DATA_DIR", tmp_path)
+    monkeypatch.delenv("CLICKSHIFT_NO_IPC", raising=False)
+    monkeypatch.setattr(monitor.DaemonIPCServer, "HEARTBEAT_INTERVAL_S", 0.05)
+
+    class SilentBlockingEngine:
+        def combine_images(self, files, target, step_progress=None):
+            # Intentionally never calls step_progress so step_seq remains 0
+            time.sleep(0.18)
+            return ConversionResult(files[0], files[0] + ".pdf", "silent", 180.0, True)
+
+    monkeypatch.setattr(engine, "get_engine", lambda **_kw: SilentBlockingEngine())
+    srv = monitor.DaemonIPCServer({"ml_enabled": False})
+    srv.start_and_publish()
+    try:
+        s = socket.create_connection(("127.0.0.1", srv.port), timeout=2.0)
+        with s:
+            r = s.makefile("r", encoding="utf-8")
+            w = s.makefile("w", encoding="utf-8")
+            w.write(
+                json.dumps({"token": srv.token, "action": "combine_images", "files": ["img1.png"], "target": "pdf"})
+                + "\n"
+            )
+            w.flush()
+            frames = [json.loads(ln) for ln in r if ln.strip()]
+        assert frames[0]["type"] == "ack"
+        hb_frames = [f for f in frames if f.get("type") == "heartbeat"]
+        assert len(hb_frames) >= 2
+        assert any(f.get("ok") is True for f in frames)
+    finally:
+        srv.stop()
+
+    # 2. A backend raising OSError (e.g., UnidentifiedImageError / FileNotFoundError) runs ONCE, never twice!
+    oserror_calls = 0
+
+    def _failing_oserror_route(_s, _d):
+        nonlocal oserror_calls
+        oserror_calls += 1
+        raise OSError("simulated corrupt stream")
+
+    def _fallback_ok_route(_s, d):
+        Path(d).write_bytes(b"ok")
+
+    src_dummy = tmp_path / "corrupt.png"
+    src_dummy.write_bytes(b"bad")
+    monkeypatch.setattr(
+        engine,
+        "_routes_for",
+        lambda _se, _de: [
+            engine.Route("pillow", _failing_oserror_route, 100),
+            engine.Route("fallback", _fallback_ok_route, 50),
+        ],
+    )
+    eng = engine.ConversionEngine(enable_ml=False)
+    try:
+        res = eng.convert(src_dummy, "jpg")
+    finally:
+        eng.shutdown()
+    assert res.ok and res.backend == "fallback"
+    assert oserror_calls == 1
+
+    monkeypatch.undo()
+
+    # 3. csv -> pdf and tsv -> pdf route cleanly on Word-only vs Excel-installed machines
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(engine, "IS_WINDOWS", True)
+        mp.setattr(engine.BACKENDS, "office_app", {"word": "Word.Application"})
+        mp.setattr(engine.BACKENDS, "libreoffice", "soffice")
+        csv_routes_word_only = [r.name for r in engine._routes_for("csv", "pdf")]
+        tsv_routes_word_only = [r.name for r in engine._routes_for("tsv", "pdf")]
+        assert csv_routes_word_only[0] == "libreoffice"
+        assert tsv_routes_word_only[0] == "libreoffice"
+
+        mp.setattr(engine.BACKENDS, "office_app", {"word": "Word.Application", "excel": "Excel.Application"})
+        csv_routes_excel = [r.name for r in engine._routes_for("csv", "pdf")]
+        tsv_routes_excel = [r.name for r in engine._routes_for("tsv", "pdf")]
+        assert csv_routes_excel[0] == "office-com"
+        assert tsv_routes_excel[0] == "office-com"
+
+    # 4. >8 MiB UTF-16 streaming text conversion reports accurate byte progress up to 100%
+    utf16_src = tmp_path / "wide_log.txt"
+    utf16_payload = ("Line 0123456789 UTF-16 progress check\r\n" * 130_000).encode("utf-16")
+    assert len(utf16_payload) > 9 * 1024 * 1024
+    utf16_src.write_bytes(utf16_payload)
+    utf16_out = tmp_path / "wide_log.html"
+    prog_fracs: list[float] = []
+    with engine.subprogress_scope(lambda d, t, _m: prog_fracs.append(d / float(t))):
+        engine.conv_text_generic(utf16_src, utf16_out)
+    assert prog_fracs and prog_fracs[-1] >= 0.98
+
 
